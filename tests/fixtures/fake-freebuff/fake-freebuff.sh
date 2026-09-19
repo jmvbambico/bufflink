@@ -1,6 +1,6 @@
 #!/bin/sh
 # fake-freebuff.sh - Offline test double for freebuff TUI
-# POSIX-compliant; uses stty and dd for raw byte reading.
+# POSIX-compliant; uses cooked-mode read for input.
 
 set -e
 
@@ -28,11 +28,6 @@ PROJECT_NAME=$(basename "$CWD")
 
 # Chat directory
 CHATS_DIR="$MANICODE_DIR/projects/$PROJECT_NAME/chats"
-
-# Read a single byte (raw mode)
-read_byte() {
-    dd bs=1 count=1 2>/dev/null || printf '\0'
-}
 
 # Print splash screen
 print_splash() {
@@ -119,14 +114,15 @@ EOF
 # Write log.jsonl line
 write_log_line() {
     local msg="$1"
-    local data="${2:-{}}"
+    local data="$2"
+    [ -z "$data" ] && data="{}"
     local line
-    line=$(printf '{"level":30,"timestamp":"%s","pid":%d,"hostname":"test","msg":%s,"data":%s}\n' \
+    line=$(    printf '{"level":30,"timestamp":"%s","pid":%d,"hostname":"test","msg":"%s","data":%s}\n' \
         "$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")" \
         "$$" \
         "$(printf '%s' "$msg" | sed 's/"/\\"/g')" \
         "$data")
-    printf '%s' "$line" >> "$CHAT_DIR/log.jsonl"
+    printf '%s\n' "$line" >> "$CHAT_DIR/log.jsonl"
 }
 
 # Write chat-messages.json
@@ -185,12 +181,12 @@ write_chat_messages() {
 EOF
 }
 
-# Setup terminal for raw input
-stty raw -echo 2>/dev/null || true
+# Setup terminal for cooked input
+stty sane 2>/dev/null || true
 
 # Cleanup on exit
 cleanup() {
-    stty -raw echo 2>/dev/null || true
+    stty sane 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -209,157 +205,56 @@ case "${FAKE_FREEBUFF_MODE:-}" in
 esac
 
 # Normal mode: print splash and wait for Enter
+printf '\033[2J\033[H'
 print_splash
+read -r _
 
-# Wait for \r (Enter)
-while true; do
-    byte=$(read_byte)
-    case "$byte" in
-        $'\r') break ;;
-    esac
-done
-
-# Clear screen and print idle screen
-printf '\x1b[2J\x1b[H'
-print_idle
-
-# Read input loop
-input_buffer=""
-paste_buffer=""
-in_bracketed_paste=0
-
-while true; do
-    byte=$(read_byte)
-    case "$byte" in
-        $'\x1b') # Escape sequence
-            # Check for bracketed paste start ESC[200~
-            next=$(read_byte)
-            if [ "$next" = "[" ]; then
-                third=$(read_byte)
-                if [ "$third" = "2" ]; then
-                    fourth=$(read_byte)
-                    if [ "$fourth" = "0" ]; then
-                        fifth=$(read_byte)
-                        if [ "$fifth" = "0" ]; then
-                            sixth=$(read_byte)
-                            if [ "$sixth" = "~" ]; then
-                                in_bracketed_paste=1
-                                paste_buffer=""
-                                continue
-                            fi
-                        fi
-                    fi
+# Idle prompt: clear screen, print idle, position cursor in input box, read line
+idle_prompt() {
+    printf '\033[2J\033[H'
+    print_idle
+    printf '\033[2A\033[4C'
+    read -r line || return 1
+    printf '\n\n'
+    ESC=$(printf '\033')
+    line=$(printf '%s' "$line" | sed -e "s/${ESC}\[200~//g" -e "s/${ESC}\[201~//g")
+    if [ "$line" = "/exit" ]; then
+        print_exit
+        exit 0
+    fi
+    TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%S.000Z")
+    CHAT_DIR="$CHATS_DIR/$TIMESTAMP"
+    mkdir -p "$CHAT_DIR"
+    write_log_line '[send-message] Sending message with sdk run config' '{}'
+    write_chat_messages "$line" "LITE"
+    print_status_busy
+    case "$line" in
+        *slow*)
+            stty raw -echo
+            waited=0
+            while [ $waited -lt 100 ]; do
+                b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' ')
+                if [ "$b" = "1b" ]; then
+                    write_log_line 'Agent execution failed' '{"error":{"name":"Error","message":"user-interrupt"}}'
+                    write_log_line 'Main prompt finished' '{"outputType":"error"}'
+                    break
                 fi
+                sleep 0.1
+                waited=$((waited + 1))
+            done
+            stty sane
+            if [ $waited -ge 100 ]; then
+                write_log_line 'Main prompt finished' '{"outputType":"lastMessage"}'
             fi
-            # Check for bracketed paste end ESC[201~
-            if [ "$next" = "[" ]; then
-                third=$(read_byte)
-                if [ "$third" = "2" ]; then
-                    fourth=$(read_byte)
-                    if [ "$fourth" = "0" ]; then
-                        fifth=$(read_byte)
-                        if [ "$fifth" = "1" ]; then
-                            sixth=$(read_byte)
-                            if [ "$sixth" = "~" ]; then
-                                in_bracketed_paste=0
-                                # Echo the entire pasted text at once with newline to flush
-                                if [ -n "$paste_buffer" ]; then
-                                    printf '%s\n' "$paste_buffer"
-                                    input_buffer="$paste_buffer"
-                                    paste_buffer=""
-                                fi
-                                continue
-                            fi
-                        fi
-                    fi
-                fi
-            fi
-            # Handle ESC as cancel key during busy
-            if [ "$in_bracketed_paste" = "0" ]; then
-                # Echo ESC for visibility (it's the cancel key)
-                printf '\x1b'
-            fi
-            ;;
-        $'\r') # Enter
-            if [ "$in_bracketed_paste" = "1" ]; then
-                # Ignore Enter during bracketed paste
-                continue
-            fi
-            # Check if input is /exit
-            if [ "$input_buffer" = "/exit" ] || [ "$input_buffer" = "/quit" ]; then
-                print_exit
-                exit 0
-            fi
-            # If we have input, process the prompt
-            if [ -n "$input_buffer" ]; then
-                # Create chat directory with timestamp
-                TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%S.000Z")
-                CHAT_DIR="$CHATS_DIR/$TIMESTAMP"
-                mkdir -p "$CHAT_DIR"
-
-                # Write log.jsonl - TurnStarted
-                write_log_line '[send-message] Sending message with sdk run config' '{}'
-
-                # Write chat-messages.json
-                write_chat_messages "$input_buffer" "LITE"
-
-                # Print status line
-                print_status_busy
-
-                # Check for slow mode
-                case "$input_buffer" in
-                    *slow*)
-                        # Wait up to 10 seconds for ESC (cancel)
-                        waited=0
-                        while [ $waited -lt 100 ]; do
-                            # Use dd with timeout to check for ESC
-                            byte=$(dd bs=1 count=1 2>/dev/null || printf '\0')
-                            if [ "$byte" = $'\x1b' ]; then
-                                # Cancel received - write interrupted log
-                                write_log_line 'Agent execution failed' '{"error":{"name":"Error","message":"user-interrupt"}}'
-                                write_log_line 'Main prompt finished' '{"outputType":"error"}'
-                                break
-                            fi
-                            sleep 0.1
-                            waited=$((waited + 1))
-                        done
-                        if [ $waited -ge 100 ]; then
-                            # Timeout - normal completion
-                            write_log_line 'Main prompt finished' '{"outputType":"lastMessage"}'
-                        fi
-                        ;;
-                    *)
-                        # Normal quick completion
-                        sleep 2.0
-                        write_log_line 'Main prompt finished' '{"outputType":"lastMessage"}'
-                        ;;
-                esac
-
-                # Reprint idle screen
-                print_idle
-                input_buffer=""
-            fi
-            ;;
-        $'\x7f'|$'\b') # Backspace
-            if [ "$in_bracketed_paste" = "0" ] && [ -n "$input_buffer" ]; then
-                # Remove last char from buffer (simplified - just clear for test)
-                input_buffer=""
-            fi
-            ;;
-        "")
-            # EOF
-            exit 0
             ;;
         *)
-            # Printable character - accumulate
-            if [ "$in_bracketed_paste" = "1" ]; then
-                # During bracketed paste, accumulate in paste_buffer
-                paste_buffer="${paste_buffer}${byte}"
-            else
-                # Normal input - echo and accumulate
-                printf '%s' "$byte"
-                input_buffer="${input_buffer}${byte}"
-            fi
+            sleep 0.5
+            write_log_line 'Main prompt finished' '{"outputType":"lastMessage"}'
             ;;
     esac
+    print_idle
+}
+
+while true; do
+    idle_prompt || break
 done
