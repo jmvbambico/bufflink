@@ -168,3 +168,10 @@ async fn wait_for_timeout_includes_screen_text() {
         "timeout message should include screen text, got: {msg}"
     );
 }
+
+#[tokio::test]
+async fn resize_inside_runtime_does_not_panic() {
+    let pty = Pty::spawn(cfg("sleep 1", 80, 24)).await.expect("spawn");
+    pty.resize(100, 30).await.expect("resize inside runtime");
+    pty.kill().await.expect("kill");
+}
