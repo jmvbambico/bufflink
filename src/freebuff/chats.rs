@@ -15,15 +15,15 @@ pub fn manicode_dir() -> PathBuf {
 
 /// Get the chats directory for a given working directory.
 /// Path: `<manicode_dir>/projects/<cwd file_name>/chats`
-pub fn chats_dir(cwd: &Path) -> PathBuf {
+pub fn chats_dir(cwd: &Path, manicode_dir_override: Option<&Path>) -> PathBuf {
     let project_name = cwd
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
-    manicode_dir()
-        .join("projects")
-        .join(project_name)
-        .join("chats")
+    let base = manicode_dir_override
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(manicode_dir);
+    base.join("projects").join(project_name).join("chats")
 }
 
 /// Snapshot the set of entry names in a directory.
@@ -42,8 +42,14 @@ pub fn snapshot(dir: &Path) -> std::io::Result<BTreeSet<String>> {
 
 /// Find the newest chat directory not in `before`.
 /// Returns the path to the newest entry (lexicographically greatest) not in `before`.
+/// Returns Ok(None) if the directory doesn't exist yet.
 pub fn newest_new_chat(dir: &Path, before: &BTreeSet<String>) -> std::io::Result<Option<PathBuf>> {
-    let mut entries: Vec<String> = std::fs::read_dir(dir)?
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut entries: Vec<String> = entries
         .flatten()
         .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
         .collect();
@@ -131,7 +137,7 @@ mod tests {
             .join("projects")
             .join("my-project")
             .join("chats");
-        assert_eq!(chats_dir(&cwd), expected);
+        assert_eq!(chats_dir(&cwd, None), expected);
         match original {
             Some(v) => std::env::set_var("BLINK_MANICODE_DIR", v),
             None => std::env::remove_var("BLINK_MANICODE_DIR"),
