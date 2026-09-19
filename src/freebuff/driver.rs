@@ -389,28 +389,14 @@ impl FreebuffBackend {
         info!("prompt: pasting text ({} chars)", text.len());
         pty.paste(text).await?;
 
-        // For fake-freebuff, skip input box wait since paste echo has buffering issues
-        let is_fake = self.cfg.program.contains("fake-freebuff");
-
-        if !is_fake {
-            // Wait for input box to show the text (first 20 chars)
-            let preview: String = text.chars().take(20).collect();
-            self.wait_for_input_box_contains(pty, &preview, Duration::from_secs(5))
-                .await?;
-        } else {
-            // Longer delay to let fake script process bracketed paste end
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        // Wait for input box to show the text (first 20 chars)
+        let preview: String = text.chars().take(20).collect();
+        self.wait_for_input_box_contains(pty, &preview, Duration::from_secs(5))
+            .await?;
 
         // Send Enter
         info!("prompt: sending Enter");
         pty.key(Key::Enter).await?;
-
-        // For fake-freebuff, skip busy wait since it writes log events immediately
-        if is_fake {
-            info!("prompt: fake-freebuff detected, skipping busy wait");
-            return Ok(());
-        }
 
         // Wait for Busy (max 5s)
         match self.wait_for_busy(pty, Duration::from_secs(5)).await {
