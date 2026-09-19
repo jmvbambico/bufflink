@@ -1,67 +1,151 @@
 # freebuff — what the bridge can rely on (v0.0.172, probed 2026-09-19)
 
-Partial: a Codex explorer probed freebuff in tmux (120x40) before its run was
-cancelled; Hivemind read the on-disk artefacts afterwards. Items marked TODO
-were not observed yet.
+Two probes: a Codex explorer (cancelled early; on-disk artefacts read
+afterwards) and a full Cline explorer run in tmux under `script` (raw bytes).
+Full probe report: `captures/probe-report-2026-09-19.md`; screen captures
+usable as parser fixtures in `captures/`.
 
 ## Binary and options
 
 - Launcher `/opt/homebrew/bin/freebuff` (npm, MIT) downloads and execs the
   real compiled Bun binary `~/.config/manicode/freebuff` (~90 MB).
-- Options (from binary strings + `--help`): positional `[prompt...]` "Initial
-  prompt to send to the agent", `--agent <id>`, `--cwd <dir>`,
-  `--continue [conversation-id]`, `--lite` (`--free` deprecated alias),
-  `--max`, `--plan`, `--clear-logs`, `login`.
-- **No headless / JSON / print mode.** `--headless` and `--json` strings in
-  the binary belong to the bundled browser agent and to `bun`, not to the CLI.
-  This is issue CodebuffAI/freebuff#947, still open.
+- Options: positional `[prompt...]`, `--agent <id>`, `--cwd <dir>`,
+  `--continue [conversation-id]`, `--lite` (`--free` deprecated), `--max`,
+  `--plan`, `--clear-logs`, `login`.
+- **No headless / JSON / print mode** (CodebuffAI/freebuff#947, open).
+- Ignores `TERM=dumb`, `NO_COLOR=1`, `CI=1`: still starts, still emits 24-bit
+  colour.
+
+## Economy — read this before running anything
+
+- Free tier: **25 Freebucks/day**, the default model `GLM 5.3 Flash` costs
+  **5 Freebucks per hour of session** ("1h left" in the status bar).
+- Accepting the model splash starts the hour. The probe's five launches
+  (main run, three env-var checks, second instance) drained the day's 25 in
+  ten minutes; from then on the splash showed
+  `Not enough Freebucks — 5 Freebucks/hr against 0 left. Enter opens plans.`
+  with `FREE · 0/25 Freebucks daily · resets in 2h 12m`.
+- Consequence: **one freebuff process per bufflink process, kept alive across
+  prompts**; the e2e gate launches freebuff **once** and sends every prompt to
+  that instance; never launch freebuff for a smoke check.
+
+## Lifecycle (verbatim strings a parser can key on)
+
+| phase | screen | how the bridge proceeds |
+|---|---|---|
+| 0 launch | FREEBUFF block banner animates in | wait |
+| 1 model splash (1–6 s) | `Start coding for free`, box with `› GLM 5.3 Flash · Deep reasoning · Reasoning: max · Images · NEW` / `5 Freebucks/hr`, `FREE · N/25 Freebucks daily · resets in …`, `↓  See all 4 models`, `⌘ Copy invite link  Open Earn ↵` | **Enter** accepts the highlighted (default) model — the same key a human presses. Waits indefinitely otherwise. |
+| 1b Freebucks gate | inside the model box: `Not enough Freebucks — … Enter opens plans.` | **stop**: surface an ACP error; never press Enter (opens purchase). |
+| 1c already running | `Freebuff is already running` / `Only one freebuff instance is allowed at a time.` / buttons `Take over` (default, highlighted) `Exit` | **stop**: choose `Exit` (→ arrow then Enter, or just report and kill) and surface an ACP error naming the owner pid from `freebuff-instance-owner.json`. Never take over. |
+| 2 idle | `Freebuff will run commands on your behalf to help you build.`, `Directory <cwd>`, status `GLM 5.3 Flash · 59m left · 16.4K (2%)` + `✕ End session` on the right, bordered input box with `▍Enter a coding task or / for commands` | ready |
+| 3 busy | status bar becomes `thinking... <N>s  ■ Esc` (or `working... <N>s  ■ Esc`); content shows `• Thinking` (or `▸ Thinking` collapsed), tool lines like `$ echo hello` / `• Create probe.txt`, then the reply, then `⌘ • <N>s • △▽` | poll transcript on disk |
+| 4 kicked out | `Another freebuff instance took over this account.` / `Only one CLI per account can be active at a time.` / `Close the other instance, then restart freebuff here.` / `Press Ctrl+C to exit.` | surface ACP error; Ctrl-C exits it |
+
+Idle vs busy: busy **iff** the status bar matches `(thinking|working)\.\.\. \d+s`;
+idle iff it matches `· \d+[hm] left` and the input placeholder is visible.
+
+## Input handling
+
+- Sent text echoes as `[HH:MM PM]` + prompt + `⌘`.
+- **A trailing Enter inside the same burst as the text did not submit**; the
+  text sat in the box with the cursor and a second, standalone Enter
+  submitted. Bracketed paste is on (`ESC[?2004h`), so the bridge should:
+  wrap the prompt in `ESC[200~ … ESC[201~`, wait for the box to show it,
+  send CR separately, then verify the status bar went busy (re-send CR once
+  if not). Newlines inside a paste are literal (multi-line prompt), not
+  submit — not exercised live (Freebucks ran out), inferred from the paste
+  mode.
+- Slash menu on `/`: `/help /diagnostics /interview /plan /review /queue /new
+  /history /copy /export /feedback /bash /theme:toggle /byok /reasoning`;
+  `/exit` and `/quit` work but are not listed. Escape does not close the
+  menu; Backspace does.
+
+## Cancel
+
+- **Esc** while busy stops generation: screen shows `[response interrupted]`,
+  box returns to idle. Ctrl-C does the same and does **not** exit the process.
+- `log.jsonl` then has `Agent execution failed` with
+  `{'error': {'name': 'Error', 'message': 'user-interrupt'}}` followed by
+  `Main prompt finished` with `outputType: 'error'` (success turns end with
+  `outputType: 'lastMessage'`).
+- `chat-messages.json` keeps the partial AI message, truncated mid-word, with
+  **no** `isComplete`/cancelled marker.
+
+## Exit
+
+- `/exit` (or `/quit`) + Enter: prints `To continue this session later, run:`
+  / `freebuff --continue <chat-id>`, tears down (`ESC[?1049l`, mouse off,
+  paste off, `ESC[?25h`, OSC 0/12/112 resets) and the process exits.
+- Ctrl-D: no-op. Ctrl-C ×2 while idle: no exit. Single Ctrl-C: no exit.
+- `freebuff-instance-owner.json` (`{instanceId, pid}`) is written when the
+  splash is accepted, **never removed**; a stale pid does not block the next
+  start. On SIGTERM the bridge should type `/exit` and give it ~3 s before
+  killing the child (omnigent's SIGTERM→SIGKILL budget is 5 s).
+
+## Approvals — there are none in this build
+
+Three prompts (`echo`, `write_file`, `ls -la`) all executed **without any
+approval UI**; the model's own reasoning said it saw no need to ask. No
+`approval`/`permission` block or log marker exists. The bridge therefore
+cannot gate tools; it reports them (below). `session/request_permission`
+is out of scope until freebuff grows a permission gate.
 
 ## Structured transcript on disk — the output channel
 
-Per project (keyed by the cwd basename) and per chat, freebuff writes
-`~/.config/manicode/projects/<cwd-basename>/chats/<ISO-timestamp>/`:
+Per project (keyed by cwd basename) and per chat:
+`~/.config/manicode/projects/<cwd-basename>/chats/<ISO-timestamp>/`.
+A new chat dir is created per launch (bare `--continue` too — it does **not**
+resume; only `--continue <id>` does). Snapshot `chats/` before launch and
+watch the newest dir created after it. The dir appears at the first prompt,
+not at launch.
 
 | file | content |
 |---|---|
-| `chat-messages.json` | JSON array of messages. `variant: "user"` with `content`; `variant: "ai"` with `blocks[]` — `{type:"text", textType:"reasoning"|"text", content}` (tool blocks TODO: not yet observed) — plus `isComplete: true`, `completionTime`, `credits`, `metadata`. A leading `{type:"mode-divider", mode:"LITE"}` ai message opens the chat. |
-| `chat-meta.json` | `{messageCount, firstPrompt, messagesSize, messagesMtimeMs}` |
+| `chat-messages.json` | JSON array (~1 MB: includes tool definitions). `variant:"user"` `{content}`; `variant:"ai"` `{blocks[], isComplete, completionTime, credits, metadata}`. Blocks: `{type:"text", textType:"reasoning"\|"text", content}` and `{type:"tool", toolCallId, toolName, input{…}, output:"…", agentId:"main-agent", includeToolCall, isCollapsed?}`. Observed toolNames: `run_terminal_command` (`input{command, process_type:"SYNC", timeout_seconds}`), `write_file` (`input{path, instructions, content}`). A leading `{type:"mode-divider", mode:"LITE"}` ai message opens the chat. |
+| `chat-meta.json` | `{messageCount, firstPrompt, messagesSize, messagesMtimeMs}` — cheap change detector. |
 | `run-state.json` | `{sessionState, traceSessionId, output, inference}` |
-| `log.jsonl` | pino-style lines `{level, timestamp, pid, hostname, msg, data?}`. Turn lifecycle: `[send-message] Sending message with sdk run config` → `Start agent <model> step N` → `End agent ... step N` → **`Main prompt finished`**. |
+| `log.jsonl` | pino lines `{level, timestamp, pid, hostname, msg, data?}`. Turn: `[send-message] Sending message with sdk run config` → `Start agent <model> step N` → `End agent … step N` → **`Main prompt finished`** `{outputType: 'lastMessage' \| 'error'}`. Also `[ads] Web API returned error` noise. |
 
-Observed reply for the probe prompt "Reply with exactly the single word
-PONG": one reasoning block, one text block `PONG`, `isComplete: true`.
-Model shown in the TUI header: `GLM 5.3 Flash · 1h left` (LITE mode).
+Also in `~/.config/manicode/`: `message-history.json`, `freebuff-instance-owner.json`,
+`credentials.json` (never read by bufflink).
 
-**Consequence for bufflink:** the PTY is needed only to *drive* the TUI
-(launch, type the prompt, answer approval prompts, cancel). Reply text,
-reasoning and completion come from `chat-messages.json` + the
-`Main prompt finished` log line — no screen scraping of assistant output.
-A new chat directory appears per freebuff process (and on `--continue`?
-TODO), so the bridge should snapshot the `chats/` listing before launch and
-watch the newest directory created after it.
+## Terminal protocol (from 610 KB of raw bytes)
 
-Also present: `~/.config/manicode/message-history.json` (prompt history),
-`freebuff-instance-owner.json` (single-instance lock — behaviour with a second
-process TODO), `credentials.json` (never read by bufflink).
+- Alternate screen (`ESC[?1049h`), bracketed paste, mouse tracking
+  `?1000h ?1002h ?1003h ?1006h`, synchronized output `?2026h/l` around every
+  frame (929×), cursor hidden (`?25l` 930×), `ESC[>4;1m` modifyOtherKeys.
+- **Queries sent** (kept running when unanswered, but a faithful driver should
+  reply): `ESC[6n` cursor position (×3), `ESC[?u` kitty keyboard, `ESC[>0q`
+  XTVERSION, `ESC]10;?` / `ESC]11;?` fg/bg colour, `ESC[14t` pixel size,
+  `ESC[?<n>$p` mode reports (1004 1016 2004 2026 2027 2031), OSC 99 (kitty
+  notification), OSC 1337 (iTerm2 capabilities).
+- Minimal replies: `ESC[<row>;<col>R` for `6n`; `ESC[?0u` for `?u`;
+  `ESC]11;rgb:0000/0000/0000 ESC\` and `ESC]10;rgb:ffff/ffff/ffff ESC\`;
+  ignore the rest. Size 120×40 renders everything cleanly; 80×24 works too.
 
-## TUI shape (from tmux captures)
+## Ads
 
-- Startup: large "FREEBUFF" block banner, then
-  `Freebuff will run commands on your behalf to help you build.`,
-  `Directory <cwd>`, a status line `<model> · <time> left`, then the input.
-- Sent prompts echo as `[HH:MM PM]` + the prompt text followed by `⌘`.
-- TODO (not captured before cancellation): exact idle-prompt glyph, approval
-  prompt text and keys, ad/waiting-room rendering, Esc vs Ctrl-C cancel
-  behaviour, clean exit command, 80x24 behaviour, multi-line paste.
+One inline sponsored card (`│ Eon   Ad │ … eon.io ↗ │`) rendered between
+thinking and reply on the third turn; needed no key and scrolled away. The
+ads endpoint mostly errors (`[ads] Web API returned error`, 400). Never
+dismiss ads except by waiting; ad text is not in `chat-messages.json`, so it
+never reaches the ACP client.
 
-## Probe protocol (reuse)
+## Timing
+
+Launch → splash 1–6 s; Enter → idle < 2 s. Trivial turn (Enter →
+`Main prompt finished`) 8–14 s. Cancel takes effect < 2 s.
+
+## Probe protocol (reuse — costs 5 Freebucks per launch)
 
 ```
 mkdir -p /tmp/bufflink-probe && cd /tmp/bufflink-probe && git init
-tmux new-session -d -s probe -x 120 -y 40 'freebuff --cwd /tmp/bufflink-probe'
-tmux send-keys -t probe 'Reply with exactly the single word PONG and nothing else.' Enter
-tmux capture-pane -t probe -p -e -S -200      # screen with escapes
+tmux new-session -d -s probe -x 120 -y 40 'script -q /tmp/bufflink-probe/raw.log freebuff --cwd /tmp/bufflink-probe'
+sleep 6; tmux send-keys -t probe Enter                      # accept model splash
+tmux send-keys -t probe -l 'Reply with exactly the single word PONG.'; sleep 1; tmux send-keys -t probe Enter
+tmux capture-pane -t probe -p -e -S -200
 tail -f ~/.config/manicode/projects/bufflink-probe/chats/*/log.jsonl
-tmux kill-session -t probe
+tmux send-keys -t probe -l '/exit'; tmux send-keys -t probe Enter
 ```
-Never dismiss ads except by waiting; never modify `~/.config/manicode`.
+Never dismiss ads except by waiting; never modify `~/.config/manicode`;
+never choose `Take over`.
