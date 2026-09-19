@@ -3,9 +3,12 @@
 //! fragile knowledge here so a TUI change is a one-module fix.
 
 pub mod chats;
+pub mod driver;
 pub mod log;
 pub mod screen;
 pub mod transcript;
+
+pub use driver::{DriverConfig, FreebuffBackend};
 
 /// Command to exit freebuff cleanly.
 pub const EXIT_COMMAND: &str = "/exit";
