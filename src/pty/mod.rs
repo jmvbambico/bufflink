@@ -9,7 +9,7 @@ mod reader;
 #[cfg(test)]
 mod tests;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::io::AsyncWriteExt;
+use tracing::warn;
 
 /// Configuration for spawning a child inside a new pseudo-terminal.
 #[derive(Debug, Clone)]
@@ -128,37 +129,98 @@ impl Pty {
     /// background reader task that feeds the screen model and auto-replies to
     /// terminal capability queries.
     pub async fn spawn(cfg: PtyConfig) -> Result<Pty> {
-        let (pty, pts) = pty_process::open().context("failed to open pty")?;
-        pty.resize(pty_process::Size::new(cfg.rows, cfg.cols))
-            .context("failed to size pty")?;
+        let max_attempts = 5;
+        let mut last_err: Option<anyhow::Error> = None;
 
-        let mut cmd = pty_process::Command::new(&cfg.program);
-        cmd = cmd.args(&cfg.args);
-        if let Some(dir) = &cfg.cwd {
-            cmd = cmd.current_dir(dir);
+        for attempt in 1..=max_attempts {
+            let (pty, pts) = match pty_process::open().context("failed to open pty") {
+                Ok(p) => p,
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < max_attempts {
+                        warn!(attempt, "pty open failed, retrying");
+                        tokio::time::sleep(Duration::from_millis(25 * attempt)).await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+
+            if let Err(e) = pty
+                .resize(pty_process::Size::new(cfg.rows, cfg.cols))
+                .context("failed to size pty")
+            {
+                last_err = Some(e);
+                if attempt < max_attempts {
+                    warn!(attempt, "pty resize failed, retrying");
+                    tokio::time::sleep(Duration::from_millis(25 * attempt)).await;
+                    continue;
+                }
+                break;
+            }
+
+            let mut cmd = pty_process::Command::new(&cfg.program);
+            cmd = cmd.args(&cfg.args);
+            if let Some(dir) = &cfg.cwd {
+                cmd = cmd.current_dir(dir);
+            }
+            cmd = cmd.envs(build_env(&cfg));
+
+            match cmd.spawn(pts) {
+                Ok(child) => {
+                    let (read_half, write_half) = pty.into_split();
+
+                    let shared = Arc::new(Shared {
+                        parser: Mutex::new(vt100::Parser::new(cfg.rows, cfg.cols, 0)),
+                        gen: tokio::sync::watch::channel(0u64).0,
+                        child_exited: AtomicBool::new(false),
+                        write: tokio::sync::Mutex::new(write_half),
+                    });
+
+                    let reader_shared = Arc::clone(&shared);
+                    tokio::spawn(reader::reader_task(read_half, reader_shared));
+
+                    return Ok(Pty {
+                        shared,
+                        child: Mutex::new(Some(child)),
+                    });
+                }
+                Err(e) => {
+                    let anyhow_err: anyhow::Error = e.into();
+                    let is_not_found = anyhow_err.chain().any(|c| {
+                        c.downcast_ref::<std::io::Error>()
+                            .map(|io| io.kind() == std::io::ErrorKind::NotFound)
+                            .unwrap_or(false)
+                    });
+                    let program_exists = Path::new(&cfg.program).exists();
+
+                    if is_not_found && program_exists && attempt < max_attempts {
+                        warn!(attempt, program = %cfg.program, "spawn failed with ENOENT, retrying");
+                        tokio::time::sleep(Duration::from_millis(25 * attempt)).await;
+                        last_err = Some(anyhow_err);
+                        continue;
+                    } else if !program_exists {
+                        last_err = Some(
+                            anyhow_err.context(format!("program `{}` does not exist", cfg.program)),
+                        );
+                        break;
+                    } else {
+                        last_err = Some(
+                            anyhow_err.context(format!("failed to spawn `{}` in pty", cfg.program)),
+                        );
+                        break;
+                    }
+                }
+            }
         }
-        cmd = cmd.envs(build_env(&cfg));
 
-        let child = cmd
-            .spawn(pts)
-            .with_context(|| format!("failed to spawn `{}` in pty", cfg.program))?;
-
-        let (read_half, write_half) = pty.into_split();
-
-        let shared = Arc::new(Shared {
-            parser: Mutex::new(vt100::Parser::new(cfg.rows, cfg.cols, 0)),
-            gen: tokio::sync::watch::channel(0u64).0,
-            child_exited: AtomicBool::new(false),
-            write: tokio::sync::Mutex::new(write_half),
-        });
-
-        let reader_shared = Arc::clone(&shared);
-        tokio::spawn(reader::reader_task(read_half, reader_shared));
-
-        Ok(Pty {
-            shared,
-            child: Mutex::new(Some(child)),
-        })
+        Err(last_err.unwrap_or_else(|| {
+            anyhow!(
+                "failed to spawn `{}` in pty after {} attempts",
+                cfg.program,
+                max_attempts
+            )
+        }))
     }
 
     /// Write raw bytes to the child's terminal input.

@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use super::{Key, Pty, PtyConfig};
+use tokio::task::JoinHandle;
 
 /// Build a config that runs `script` in `/bin/sh` at the given size.
 fn cfg(script: &str, cols: u16, rows: u16) -> PtyConfig {
@@ -174,4 +175,48 @@ async fn resize_inside_runtime_does_not_panic() {
     let pty = Pty::spawn(cfg("sleep 1", 80, 24)).await.expect("spawn");
     pty.resize(100, 30).await.expect("resize inside runtime");
     pty.kill().await.expect("kill");
+}
+
+/// Stress test: many concurrent PTY spawns must not hit transient ENOENT.
+/// Runs 3 rounds of 16 concurrent `sh -c 'printf ok; sleep 0.1'` children.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_spawns_do_not_fail() -> anyhow::Result<()> {
+    let script = "printf ok; sleep 0.1";
+    let cols = 80;
+    let rows = 24;
+    const ROUNDS: usize = 3;
+    const PER_ROUND: usize = 16;
+
+    for _round in 0..ROUNDS {
+        let mut handles: Vec<JoinHandle<anyhow::Result<()>>> = Vec::with_capacity(PER_ROUND);
+
+        for _ in 0..PER_ROUND {
+            let script = script.to_string();
+            handles.push(tokio::spawn(async move {
+                let pty = Pty::spawn(PtyConfig {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script],
+                    cwd: None,
+                    env: vec![],
+                    cols,
+                    rows,
+                })
+                .await?;
+
+                pty.wait_for(|s| s.contains("ok"), Duration::from_secs(5))
+                    .await?;
+                let status = pty.wait_exit(Duration::from_secs(3)).await?;
+                assert!(
+                    status.map(|s| s.success()).unwrap_or(false),
+                    "child exited unsuccessfully"
+                );
+                Ok(())
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("task panicked")?;
+        }
+    }
+    Ok(())
 }
