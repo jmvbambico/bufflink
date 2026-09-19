@@ -293,8 +293,8 @@ impl Pty {
     }
 
     /// Resize the PTY's terminal to `cols` x `rows`.
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        let write = self.shared.write.blocking_lock();
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        let write = self.shared.write.lock().await;
         write
             .resize(pty_process::Size::new(rows, cols))
             .context("failed to resize pty")

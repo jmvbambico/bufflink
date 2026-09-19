@@ -116,10 +116,14 @@ async fn finish_in_flight(
     if let Some(tx) = prompt_cancel.take() {
         let _ = tx.send(true);
     }
-    if let Some(handle) = prompt_task.take() {
-        match tokio::time::timeout(SHUTDOWN_GRACE, handle).await {
+    if let Some(mut handle) = prompt_task.take() {
+        match tokio::time::timeout(SHUTDOWN_GRACE, &mut handle).await {
             Ok(_) => {}
-            Err(_) => warn!("prompt task did not finish within {SHUTDOWN_GRACE:?} on EOF"),
+            Err(_) => {
+                warn!("prompt task did not finish within {SHUTDOWN_GRACE:?} on EOF; aborting");
+                handle.abort();
+                let _ = handle.await;
+            }
         }
     }
 }
@@ -439,6 +443,8 @@ mod tests {
         shutdowns: usize,
         /// When set, prompt waits until cancel becomes true, then returns Cancelled.
         wait_for_cancel: bool,
+        /// When set, prompt ignores cancel and never returns.
+        ignore_cancel: bool,
         /// Scripted updates to emit before completing.
         updates: Vec<SessionUpdate>,
         /// If set, prompt returns this error.
@@ -494,10 +500,11 @@ mod tests {
                     st.prompts.push((sid, text));
                 }
 
-                let (wait_cancel, scripted, err, delay) = {
+                let (wait_cancel, ignore_cancel, scripted, err, delay) = {
                     let st = self.state.lock().unwrap();
                     (
                         st.wait_for_cancel,
+                        st.ignore_cancel,
                         st.updates.clone(),
                         st.prompt_error.clone(),
                         st.prompt_delay,
@@ -514,6 +521,11 @@ mod tests {
 
                 if let Some(d) = delay {
                     sleep(d).await;
+                }
+
+                if ignore_cancel {
+                    std::future::pending::<()>().await;
+                    unreachable!()
                 }
 
                 if wait_cancel {
@@ -825,5 +837,30 @@ mod tests {
         .await;
         let _ = collect_lines(&mut client_r, 1).await;
         shutdown_serve(client_w, client_r, serve).await;
+    }
+
+    #[tokio::test]
+    async fn eof_aborts_prompt_that_ignores_cancel() {
+        let backend = FakeBackend::new("s1").with(|st| {
+            st.ignore_cancel = true;
+        });
+        let (mut client_w, mut client_r, server_r, server_w) = open_pipe();
+
+        let serve = tokio::spawn(serve(Arc::clone(&backend), server_r, server_w));
+        write_line(&mut client_w, init_req(1)).await;
+        write_line(&mut client_w, session_new(2, "/tmp")).await;
+        write_line(&mut client_w, prompt_req(3, "s1", "hang")).await;
+        let _ = collect_lines(&mut client_r, 2).await;
+        sleep(Duration::from_millis(50)).await;
+
+        drop(client_w);
+        drop(client_r);
+
+        timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("serve should return within ~4s")
+            .expect("serve join")
+            .expect("serve error");
+        assert_eq!(backend.state().shutdowns, 1);
     }
 }
