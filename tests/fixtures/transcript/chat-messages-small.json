@@ -1,0 +1,48 @@
+[
+  {
+    "variant": "ai",
+    "blocks": [
+      {
+        "type": "mode-divider",
+        "mode": "LITE"
+      }
+    ],
+    "isComplete": true
+  },
+  {
+    "variant": "user",
+    "content": "Hello, world!"
+  },
+  {
+    "variant": "ai",
+    "blocks": [
+      {
+        "type": "text",
+        "textType": "reasoning",
+        "content": "The user said hello."
+      },
+      {
+        "type": "tool",
+        "toolCallId": "tool-123",
+        "toolName": "run_terminal_command",
+        "input": {
+          "command": "echo hello",
+          "process_type": "SYNC",
+          "timeout_seconds": 30
+        },
+        "output": "hello\n",
+        "agentId": "main-agent",
+        "includeToolCall": true
+      },
+      {
+        "type": "text",
+        "textType": "text",
+        "content": "Hello there!"
+      }
+    ],
+    "isComplete": true,
+    "completionTime": "2026-09-19T15:00:00Z",
+    "credits": 5,
+    "metadata": {}
+  }
+]

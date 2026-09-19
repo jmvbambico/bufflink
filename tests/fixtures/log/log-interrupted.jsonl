@@ -1,0 +1,6 @@
+{"level":30,"timestamp":"2026-09-19T14:41:00.000Z","pid":88366,"hostname":"mac","msg":"[send-message] Sending message with sdk run config","data":{}}
+{"level":30,"timestamp":"2026-09-19T14:41:01.000Z","pid":88366,"hostname":"mac","msg":"Start agent GLM 5.3 Flash step 1","data":{}}
+{"level":30,"timestamp":"2026-09-19T14:41:03.000Z","pid":88366,"hostname":"mac","msg":"End agent GLM 5.3 Flash step 1","data":{}}
+{"level":30,"timestamp":"2026-09-19T14:41:05.000Z","pid":88366,"hostname":"mac","msg":"Start agent GLM 5.3 Flash step 2","data":{}}
+{"level":30,"timestamp":"2026-09-19T14:41:06.000Z","pid":88366,"hostname":"mac","msg":"Agent execution failed","data":{"error":{"name":"Error","message":"user-interrupt"}}}
+{"level":30,"timestamp":"2026-09-19T14:41:07.000Z","pid":88366,"hostname":"mac","msg":"Main prompt finished","data":{"outputType":"error"}}

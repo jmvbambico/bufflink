@@ -1,0 +1,40 @@
+
+  ╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ Eon                                                                                                          Ad │
+  │ Optimize your cloud infrastructure with Eon's cost-optimized storage layer and multi-region rate man…  eon.io ↗ │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+  Here's the directory listing (84 entries total):
+
+  drwx------  .freebuff/          (dir)
+  drwxr-xr-x  .git/               (dir)
+  drwxr-xr-x  leftover/           (dir)
+   
+  # Key files
+  -rw-r--r--  probe.txt   (3 bytes, 21:39)  ← created in previous step
+  -rw-r--r--  REPORT.md   (4.3K)
+  -rw-r--r--  raw1.log    (390K)
+   
+  # Capture/probe artifacts
+  launch-2s.txt, launch-6s.txt, launch-after-enter.txt
+  q3-approval-shell-6s.txt, q3-approval-shell-8s.txt, q3-file-10s.txt,
+  q3-file-approval-20s.txt, q3-ls-2s.txt, q3-ls-3s.txt, q3-shell-done.txt
+  marker, marker-turn1, marker-turn2 (empty)
+  poll-1.txt … poll-45.txt (mostly 2.7K each)
+  ready-120-escape.txt, startup-120-escape.txt, startup-120-plain.txt
+  turn1-5s-escape.txt, turn1-complete-escape.txt
+  turn2-1.txt … turn2-12.txt, turn2-final-escape.txt
+
+  Exit code 0. The directory looks like a set of session-capture/probe artifacts from earlier testing, plus the  
+  probe.txt  I just created.
+                                                                                                         ⎘ • 14s • △▽
+
+   [09:41 PM]
+   Count from 1 to 400, one number per line, with a short comment after each. ⎘
+
+ thinking...                                                                                                 4s  ■ Esc
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                      │
+│  ▍Enter a coding task or / for commands                                                                              │
+│                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
