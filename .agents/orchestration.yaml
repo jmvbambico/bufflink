@@ -1,0 +1,45 @@
+# Machine-readable orchestration contract for bufflink.
+# AGENTS.md is the constitution and wins on anything this file does not cover.
+
+branches:
+  integration_base: dev
+  protected: [main]
+  task_prefix: feature/
+
+gates:
+  # scope: worker -> runs in EACH implementer's worktree; no scope -> once on
+  # the integration branch.
+  - name: fmt
+    run: cargo fmt --all -- --check
+    scope: worker
+  - name: clippy
+    run: cargo clippy --all-targets -- -D warnings
+    scope: worker
+  - name: unit
+    run: cargo test --lib --bins
+    scope: worker
+  # e2e spawns the real freebuff, which is single-instance and shares
+  # ~/.config/manicode. Integration-only on purpose.
+  - name: e2e
+    run: BUFFLINK_E2E=1 cargo test --test e2e -- --ignored
+
+never_write:
+  - "target/**"
+  - "AGENTS.md"
+  - ".agents/**"
+  - "~/.config/manicode/**"
+
+merge_policy:
+  # Every merge is a human decision until the gates have proven themselves.
+  enabled: false
+  auto_merge_target: dev
+  max_diff_lines: 600
+  max_diff_files: 20
+  high_risk_paths:
+    - "Cargo.toml"
+    - "Cargo.lock"
+    - ".github/workflows/**"
+    - "AGENTS.md"
+    - ".agents/**"
+  require_no_test_count_decrease: true
+  require_cross_vendor_review: true
