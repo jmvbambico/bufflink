@@ -715,7 +715,6 @@ fn tool_kind(tool_name: &str) -> String {
 mod tests {
     use super::*;
     use std::env;
-    use std::fs;
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
@@ -729,11 +728,32 @@ mod tests {
             .join("fake-freebuff.sh")
     }
 
-    /// Create a unique temp directory for testing.
-    fn test_temp_dir() -> PathBuf {
+    /// RAII guard that removes its directory on drop.
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Create a unique temp directory for testing. Returns an RAII guard
+    /// that removes the directory when dropped, so driver tests never leak.
+    fn test_temp_dir() -> TempDir {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        std::env::temp_dir().join(format!("bufflink-test-{}-{}", std::process::id(), id))
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "bufflink-driver-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            id
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        TempDir(path)
     }
 
     /// Create a DriverConfig pointed at the fake binary with a temp manicode dir.
@@ -790,8 +810,8 @@ mod tests {
 
     #[tokio::test]
     async fn t1_new_session_reaches_idle_and_returns_id() {
-        let temp_dir = test_temp_dir();
-        fs::create_dir_all(&temp_dir).unwrap();
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
         let cfg = test_config(&temp_dir, None);
         let backend = FreebuffBackend::new(cfg);
 
@@ -810,8 +830,8 @@ mod tests {
 
     #[tokio::test]
     async fn t2_prompt_reply_pong_streams_updates_and_returns_endturn() {
-        let temp_dir = test_temp_dir();
-        fs::create_dir_all(&temp_dir).unwrap();
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
         let cfg = test_config(&temp_dir, None);
         let backend = FreebuffBackend::new(cfg);
 
@@ -874,8 +894,8 @@ mod tests {
 
     #[tokio::test]
     async fn t3_prompt_slow_count_with_cancel_returns_cancelled() {
-        let temp_dir = test_temp_dir();
-        fs::create_dir_all(&temp_dir).unwrap();
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
         let cfg = test_config(&temp_dir, None);
         let backend = FreebuffBackend::new(cfg);
 
@@ -904,8 +924,8 @@ mod tests {
 
     #[tokio::test]
     async fn t4_shutdown_makes_child_exit() {
-        let temp_dir = test_temp_dir();
-        fs::create_dir_all(&temp_dir).unwrap();
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
         let cfg = test_config(&temp_dir, None);
         let backend = FreebuffBackend::new(cfg);
 
@@ -930,8 +950,8 @@ mod tests {
 
     #[tokio::test]
     async fn t5_fake_freebuff_mode_gate_errors_with_freebucks() {
-        let temp_dir = test_temp_dir();
-        fs::create_dir_all(&temp_dir).unwrap();
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
         let cfg = test_config(&temp_dir, Some("gate"));
         let backend = FreebuffBackend::new(cfg);
 
@@ -947,8 +967,8 @@ mod tests {
 
     #[tokio::test]
     async fn t6_fake_freebuff_mode_running_errors_with_already_running() {
-        let temp_dir = test_temp_dir();
-        fs::create_dir_all(&temp_dir).unwrap();
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
         let cfg = test_config(&temp_dir, Some("running"));
         let backend = FreebuffBackend::new(cfg);
 
