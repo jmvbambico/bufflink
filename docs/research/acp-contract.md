@@ -85,7 +85,7 @@ PTY / screen model (measured, tree lines incl. root):
    `config_option_update` (model is chosen by freebuff's own splash /
    `--lite`; bufflink does not switch it).
 7. Recommended `~/.omnigent/config.yaml` entry:
-   `{name: Freebuff, command: bufflink, omnigent_mcp: false, inject_system_prompt: ?}`
+   `{name: Freebuff, command: blink, omnigent_mcp: false, inject_system_prompt: false}`
    — whether the injected system prompt survives freebuff's input box is a TUI
    question (multi-line paste, Q8 of the probe).
 8. `TERM` is forwarded; bufflink sets its own env for the PTY child

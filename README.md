@@ -11,5 +11,5 @@ Planned omnigent config:
 ```yaml
 acp:
   agents:
-    - { name: Freebuff, command: bufflink }
+    - { name: Freebuff, command: blink, omnigent_mcp: false, inject_system_prompt: false }
 ```
