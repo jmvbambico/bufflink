@@ -7,9 +7,11 @@ An [Agent Client Protocol](https://agentclientprotocol.com) bridge for the free
   <img src="assets/banner.png" alt="bufflink — blink: freebuff over ACP" width="850">
 </p>
 
-`blink` speaks ACP on stdio and, behind it, drives freebuff's interactive TUI in
-a pseudo-terminal — exactly the way a person would — so any ACP client
-([Omnigent](https://omnigent.ai), Zed, …) can use freebuff as a coding agent.
+`blink` is an ACP *agent*: it speaks the protocol on stdio and, behind it,
+drives freebuff's interactive TUI in a pseudo-terminal — exactly the way a
+person would. Any ACP client — an editor, an orchestrator, a chat front-end —
+can register it like any other agent and use freebuff without knowing a TUI
+is involved.
 
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org/)
 [![Tests](https://github.com/jmvbambico/bufflink/actions/workflows/tests.yml/badge.svg)](https://github.com/jmvbambico/bufflink/actions/workflows/tests.yml)
@@ -20,18 +22,28 @@ a pseudo-terminal — exactly the way a person would — so any ACP client
 cargo install --path .     # puts `blink` on PATH
 ```
 
-```yaml
-# ~/.omnigent/config.yaml
-acp:
-  agents:
-    - name: Freebuff
-      command: blink
-      omnigent_mcp: false
-      inject_system_prompt: false
+Then register `blink` wherever your client lists ACP agents. The agent takes
+no arguments and needs no environment beyond what freebuff itself needs
+(`freebuff` on PATH, logged in). Two examples:
+
+```jsonc
+// Zed — settings.json
+"agent_servers": {
+  "Freebuff": { "command": "blink" }
+}
 ```
 
-That's it. Omnigent launches `blink`; `blink` launches freebuff on the first
-`session/new`, types your prompt into it, and streams the reply back.
+```yaml
+# Omnigent — ~/.omnigent/config.yaml
+acp:
+  agents:
+    - { name: Freebuff, command: blink, omnigent_mcp: false, inject_system_prompt: false }
+```
+
+The client launches `blink`; `blink` launches freebuff on the first
+`session/new`, types your prompt into it, and streams the reply back over
+`session/update`. Anything that can spawn a process and speak newline-delimited
+JSON-RPC over its stdio can drive it — the protocol is the whole interface.
 
 ---
 
@@ -80,10 +92,17 @@ a freebuff UI change is a one-module fix.
 - **No approval gate.** This freebuff build runs commands and edits files
   without asking. `blink` reports every tool call but cannot block one.
 - **Replies arrive at turn end.** freebuff writes its transcript once, when
-  the turn finishes, so nothing streams while it thinks. Raise your client's
-  idle timeout for long tasks (Omnigent: `HARNESS_ACP_PROMPT_TIMEOUT_S`).
+  the turn finishes, so nothing streams while it thinks. If your client has
+  an idle/inactivity timeout on prompts, raise it for long tasks.
 - **Stop states are surfaced, never bypassed:** out of Freebucks, another
   freebuff already running (`blink` never chooses *Take over*), kicked out.
+  Each comes back as a JSON-RPC error with a plain-language message.
+- **Protocol surface, deliberately minimal:** `initialize` (v1),
+  `session/new`, `session/prompt`, `session/cancel`, and `session/update`
+  notifications (`agent_thought_chunk`, `agent_message_chunk`, `tool_call`,
+  `tool_call_update`). No `session/load`, no permission requests (freebuff
+  has nothing to gate), no MCP passthrough — `mcpServers` is accepted and
+  ignored.
 
 Environment: `BLINK_FREEBUFF_BIN` (default `freebuff`),
 `BLINK_TURN_TIMEOUT_S` (900), `BLINK_SETTLE_TIMEOUT_S` (5),
