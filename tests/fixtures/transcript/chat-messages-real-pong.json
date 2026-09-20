@@ -1,0 +1,44 @@
+[
+ {
+  "id": "divider-1789862499718",
+  "variant": "ai",
+  "content": "",
+  "blocks": [
+   {
+    "type": "mode-divider",
+    "mode": "LITE"
+   }
+  ],
+  "timestamp": "07:01 AM"
+ },
+ {
+  "id": "user-1789862499718",
+  "variant": "user",
+  "content": "Reply with exactly the single word PONG and nothing else.",
+  "timestamp": "07:01 AM"
+ },
+ {
+  "id": "ai-1789862500608-74e08f9af8a34",
+  "variant": "ai",
+  "content": "",
+  "blocks": [
+   {
+    "type": "text",
+    "content": "The user wants exactly the single word PONG, nothing else. Simple compliance is right here \u2014 no tools needed, no extra text.",
+    "textType": "reasoning",
+    "thinkingCollapseState": "preview",
+    "thinkingId": "thinking-1",
+    "thinkingOpen": false
+   },
+   {
+    "type": "text",
+    "content": "PONG",
+    "textType": "text"
+   }
+  ],
+  "timestamp": "07:01 AM",
+  "isComplete": true,
+  "completionTime": "3s",
+  "credits": 0
+ }
+]

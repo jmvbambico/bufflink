@@ -423,4 +423,145 @@ mod tests {
         block2.set_tool_output("done".to_string());
         assert_eq!(block2.tool_output(), Some("done"));
     }
+
+    #[test]
+    fn real_pong_transcript_parses_and_diffs() {
+        let json = include_str!("../../tests/fixtures/transcript/chat-messages-real-pong.json");
+        let result = parse_messages(json);
+
+        if let Err(ref e) = result {
+            eprintln!("Parse error: {e:#}");
+        }
+
+        let messages = result.expect("real pong transcript should parse");
+
+        eprintln!("Parsed messages: {:#?}", messages);
+
+        assert_eq!(messages.len(), 3, "expected 3 messages");
+
+        // First: AI message with mode-divider block (may be Other or Ai with ModeDivider)
+        match &messages[0] {
+            Message::Ai { blocks, .. } => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(&blocks[0], Block::ModeDivider { mode } if mode == "LITE"));
+            }
+            Message::Other => {
+                // Also acceptable per task description
+            }
+            _ => panic!(
+                "expected AI message with mode-divider or Other, got {:?}",
+                messages[0]
+            ),
+        }
+
+        // Second: User message
+        match &messages[1] {
+            Message::User { content } => {
+                assert_eq!(
+                    content,
+                    "Reply with exactly the single word PONG and nothing else."
+                );
+            }
+            _ => panic!("expected User message, got {:?}", messages[1]),
+        }
+
+        // Third: AI message with reasoning and text blocks
+        match &messages[2] {
+            Message::Ai {
+                blocks,
+                is_complete,
+                ..
+            } => {
+                assert!(*is_complete, "is_complete should be true");
+                assert_eq!(blocks.len(), 2, "expected 2 blocks (reasoning + text)");
+
+                // Block 0: reasoning text
+                assert!(
+                    matches!(&blocks[0], Block::Text { text_type, content } if text_type == "reasoning" && content == "The user wants exactly the single word PONG, nothing else. Simple compliance is right here — no tools needed, no extra text.")
+                );
+
+                // Block 1: regular text "PONG"
+                assert!(
+                    matches!(&blocks[1], Block::Text { text_type, content } if text_type == "text" && content == "PONG")
+                );
+            }
+            _ => panic!("expected AI message, got {:?}", messages[2]),
+        }
+
+        // Now simulate driver's polling: diffs with carried cursor
+        let mut cursor = Cursor::new();
+        let mut all_deltas = Vec::new();
+
+        // Snapshot 1: first message only
+        let (c1, d1) = diff(&cursor, &messages[..1]);
+        cursor = c1;
+        all_deltas.extend(d1);
+
+        // Snapshot 2: first two messages
+        let (c2, d2) = diff(&cursor, &messages[..2]);
+        cursor = c2;
+        all_deltas.extend(d2);
+
+        // Snapshot 3: all three messages
+        let (c3, d3) = diff(&cursor, &messages[..3]);
+        let _ = c3;
+        all_deltas.extend(d3);
+
+        // The union of deltas must contain a reasoning Text delta and a non-reasoning Text delta containing "PONG", each exactly once
+        let reasoning_deltas: Vec<_> = all_deltas
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Delta::Text {
+                        reasoning: true,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        let text_deltas: Vec<_> = all_deltas
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Delta::Text {
+                        reasoning: false,
+                        ..
+                    }
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            reasoning_deltas.len(),
+            1,
+            "expected exactly 1 reasoning delta, got {}",
+            reasoning_deltas.len()
+        );
+        assert_eq!(
+            text_deltas.len(),
+            1,
+            "expected exactly 1 text delta, got {}",
+            text_deltas.len()
+        );
+
+        // Check the text delta contains "PONG"
+        if let Delta::Text { delta, .. } = text_deltas[0] {
+            assert!(
+                delta.contains("PONG"),
+                "text delta should contain PONG, got: {}",
+                delta
+            );
+        }
+
+        // Check reasoning delta has expected content
+        if let Delta::Text { delta, .. } = reasoning_deltas[0] {
+            assert!(
+                delta.contains("Simple compliance"),
+                "reasoning delta should contain expected text, got: {}",
+                delta
+            );
+        }
+    }
 }
