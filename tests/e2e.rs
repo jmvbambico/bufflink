@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::{Command as StdCommand, ExitStatus};
@@ -7,9 +5,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
+use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use std::process::Stdio;
 use tokio::time;
 
 pub struct AcpClient {
@@ -142,6 +140,10 @@ impl AcpClient {
             .ok()
             .and_then(|r| r.ok())
     }
+
+    pub fn freebuff_processes() -> String {
+        freebuff_processes()
+    }
 }
 
 fn freebuff_processes() -> String {
@@ -188,5 +190,127 @@ async fn blink_initialize_without_session_does_not_spawn_freebuff() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_single_launch_pong_cancel_exit() {
-    eprintln!("part 2 not written yet");
+    let t0 = std::time::Instant::now();
+
+    eprintln!("[e2e +{}ms] start", t0.elapsed().as_millis());
+    if std::env::var("BUFFLINK_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping: BUFFLINK_E2E!=1");
+        return;
+    }
+
+    eprintln!("[e2e +{}ms] spawn", t0.elapsed().as_millis());
+    let mut c = AcpClient::spawn().await.unwrap();
+
+    eprintln!("[e2e +{}ms] initialize", t0.elapsed().as_millis());
+    let (resp, _updates) = c
+        .call(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":true,"writeTextFile":true},"terminal":false},"clientInfo":{"name":"e2e","version":"0"}}),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp["result"]["protocolVersion"], 1);
+    assert_eq!(resp["result"]["agentInfo"]["name"], "blink");
+
+    eprintln!("[e2e +{}ms] session/new", t0.elapsed().as_millis());
+    let (resp, _updates) = c
+        .call(
+            "session/new",
+            json!({"cwd": c.workdir.to_string_lossy(), "mcpServers": []}),
+            Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+    if resp.get("error").is_some() {
+        panic!("session/new failed: {}", resp["error"]);
+    }
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+    assert!(!sid.is_empty());
+
+    eprintln!("[e2e +{}ms] prompt pong", t0.elapsed().as_millis());
+    let (resp, updates) = c
+        .call(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"Reply with exactly the single word PONG and nothing else."}]}),
+            Duration::from_secs(180),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    let text = message_text(&updates);
+    assert!(text.contains("PONG"));
+    for update in &updates {
+        assert_eq!(update["params"]["sessionId"].as_str(), Some(sid.as_str()));
+    }
+    eprintln!(
+        "[e2e +{}ms] received {} notifications",
+        t0.elapsed().as_millis(),
+        updates.len()
+    );
+
+    eprintln!("[e2e +{}ms] prompt cancel", t0.elapsed().as_millis());
+    let id = c
+        .request(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"Count from 1 to 400, one number per line, with a short comment after each."}]}),
+        )
+        .await
+        .unwrap();
+    loop {
+        let msg = c.next_message(Duration::from_secs(90)).await.unwrap();
+        if msg.get("id").and_then(Value::as_u64) == Some(id) {
+            panic!("turn finished before we could cancel");
+        }
+        if msg.get("method").and_then(Value::as_str) == Some("session/update") {
+            break;
+        }
+    }
+    c.notify("session/cancel", json!({"sessionId": sid}))
+        .await
+        .unwrap();
+    loop {
+        let msg = c.next_message(Duration::from_secs(60)).await.unwrap();
+        if msg.get("id").and_then(Value::as_u64) == Some(id) {
+            assert_eq!(msg["result"]["stopReason"], "cancelled");
+            break;
+        }
+    }
+
+    eprintln!("[e2e +{}ms] prompt ping", t0.elapsed().as_millis());
+    let (resp, updates) = c
+        .call(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"Reply with exactly the single word PING and nothing else."}]}),
+            Duration::from_secs(180),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert!(message_text(&updates).contains("PING"));
+    for update in &updates {
+        assert_eq!(update["params"]["sessionId"].as_str(), Some(sid.as_str()));
+    }
+
+    eprintln!("[e2e +{}ms] close stdin", t0.elapsed().as_millis());
+    c.close_stdin().await;
+    let st = c.wait_exit(Duration::from_secs(10)).await;
+    assert!(st.is_some() && st.unwrap().success());
+
+    eprintln!("[e2e +{}ms] verify cleanup", t0.elapsed().as_millis());
+    assert!(
+        AcpClient::freebuff_processes().trim().is_empty(),
+        "leaked freebuff process"
+    );
+    let _ = std::fs::remove_dir_all(&c.workdir);
+}
+
+fn message_text(notes: &[Value]) -> String {
+    notes
+        .iter()
+        .filter(|note| {
+            note["params"]["update"]["sessionUpdate"].as_str() == Some("agent_message_chunk")
+        })
+        .filter_map(|note| note["params"]["update"]["content"]["text"].as_str())
+        .collect()
 }
