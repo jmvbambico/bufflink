@@ -100,6 +100,29 @@ GLM 5.3 Flash · 59m left · 16.4K (2%)      ✕ End session
 EOF
 }
 
+# Format a number with thousands separators (POSIX sh): 5001 → 5,001
+format_number() {
+    n=$1
+    result=""
+    while [ "$n" -gt 999 ] 2>/dev/null; do
+        remainder=$(expr "$n" % 1000)
+        n=$(expr "$n" / 1000)
+        remainder=$(printf "%03d" "$remainder")
+        result=",${remainder}${result}"
+    done
+    result="${n}${result}"
+    printf "%s" "$result"
+}
+
+# Print chip row above the box and re-print box with placeholder
+print_paste_chip_and_box() {
+    local count=$1
+    printf ' 📋 Pasted text (%s chars)\n' "$count"
+    printf '╭────╮\n'
+    printf '│  ▍Enter a coding task or / for commands  │\n'
+    printf '╰────╯\n'
+}
+
 # Print status line when busy
 print_status_busy() {
     printf 'thinking... 1s  ■ Esc\n'
@@ -334,6 +357,11 @@ idle_prompt() {
     printf '\n\n'
     ESC=$(printf '\033')
     line=$(printf '%s' "$line" | sed -e "s/${ESC}\[200~//g" -e "s/${ESC}\[201~//g")
+    line_len=${#line}
+    if [ "$line_len" -gt 1000 ]; then
+        formatted=$(format_number "$line_len")
+        print_paste_chip_and_box "$formatted"
+    fi
     if [ "$line" = "/exit" ]; then
         print_exit
         exit 0
