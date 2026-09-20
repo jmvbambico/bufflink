@@ -41,12 +41,16 @@ async fn main() -> anyhow::Result<()> {
         _ = sigterm.recv() => {
             tracing::info!("received SIGTERM, shutting down");
             (*backend).shutdown().await;
-            Ok(())
+            // the blocking stdin reader thread keeps the runtime alive; exit explicitly
+            tracing::info!("shutdown complete; exiting");
+            std::process::exit(0);
         }
         _ = sigint.recv() => {
             tracing::info!("received SIGINT, shutting down");
             (*backend).shutdown().await;
-            Ok(())
+            // the blocking stdin reader thread keeps the runtime alive; exit explicitly
+            tracing::info!("shutdown complete; exiting");
+            std::process::exit(0);
         }
     }
 }
