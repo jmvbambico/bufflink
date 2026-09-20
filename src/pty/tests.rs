@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use super::{Key, Pty, PtyConfig};
+use super::{group_target, Key, Pty, PtyConfig};
 use tokio::task::JoinHandle;
 
 /// Build a config that runs `script` in `/bin/sh` at the given size.
@@ -234,6 +234,13 @@ async fn resize_inside_runtime_does_not_panic() {
     let pty = Pty::spawn(cfg("sleep 1", 80, 24)).await.expect("spawn");
     pty.resize(100, 30).await.expect("resize inside runtime");
     pty.kill().await.expect("kill");
+}
+
+#[tokio::test]
+async fn group_target_returns_none_for_invalid_pids() {
+    assert_eq!(group_target(None), None);
+    assert_eq!(group_target(Some(0)), None);
+    assert_eq!(group_target(Some(u32::MAX)), None);
 }
 
 /// Stress test: many concurrent PTY spawns must not hit transient ENOENT.

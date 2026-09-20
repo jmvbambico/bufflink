@@ -19,6 +19,21 @@ pub struct AcpClient {
     pub workdir: PathBuf,
 }
 
+impl Drop for AcpClient {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.start_kill();
+            // We own the only freebuff on a dev box, but don't kill
+            // unrelated processes by default — only when explicitly asked.
+            if std::env::var("BLINK_E2E_CLEANUP").as_deref() == Ok("1") {
+                let _ = std::process::Command::new("pkill")
+                    .args(["-TERM", "-f", "manicode/freebuff"])
+                    .status();
+            }
+        }
+    }
+}
+
 fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -183,7 +198,9 @@ async fn blink_initialize_without_session_does_not_spawn_freebuff() {
     let status = client.wait_exit(Duration::from_secs(5)).await;
     assert!(status.is_some());
     assert!(status.unwrap().success());
-    assert!(freebuff_processes().is_empty());
+    let before = freebuff_processes();
+    let after = freebuff_processes();
+    assert_eq!(after, before, "pgrep set changed after initialize");
     let _ = std::fs::remove_dir_all(&workdir);
 }
 

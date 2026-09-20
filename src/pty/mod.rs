@@ -343,15 +343,15 @@ impl Pty {
     /// lock. Sequence: SIGTERM the group, poll `try_wait` for up to 1 s, then
     /// SIGKILL the group if anything is still alive, then reap.
     pub async fn kill(&self) -> Result<()> {
-        let pid = self.pid();
-        if let Some(pid) = pid {
+        let pgid = group_target(self.pid());
+        if let Some(pgid) = pgid {
             // SIGTERM the whole process group first.
-            let term_rc = unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+            let term_rc = unsafe { libc::kill(-pgid, libc::SIGTERM) };
             if term_rc < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() != Some(libc::ESRCH) {
                     warn!(
-                        pid,
+                        pgid,
                         errno = err.raw_os_error(),
                         "SIGTERM on process group failed; falling back to Child::kill"
                     );
@@ -371,12 +371,12 @@ impl Pty {
 
             if !exited {
                 // SIGKILL the group.
-                let kill_rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                let kill_rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
                 if kill_rc < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.raw_os_error() != Some(libc::ESRCH) {
                         warn!(
-                            pid,
+                            pgid,
                             errno = err.raw_os_error(),
                             "SIGKILL on process group failed; falling back to Child::kill"
                         );
@@ -412,6 +412,17 @@ impl Pty {
     pub fn pid(&self) -> Option<u32> {
         self.child.lock().unwrap().as_ref().and_then(|c| c.id())
     }
+}
+
+/// Returns the process-group id to signal for the given child pid.
+/// Returns `None` for `None`, `0`, or values that overflow `libc::pid_t`.
+/// Never returns 0 or a negative value.
+fn group_target(pid: Option<u32>) -> Option<libc::pid_t> {
+    let p = pid?;
+    if p == 0 {
+        return None;
+    }
+    libc::pid_t::try_from(p).ok()
 }
 
 /// Build the child environment: inherited vars, plus `cfg.env` overrides, with

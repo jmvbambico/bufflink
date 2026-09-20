@@ -318,9 +318,11 @@ impl FreebuffBackend {
         loop {
             if Instant::now() >= startup_deadline {
                 let snap = pty.screen();
+                let pid = pty.pid().unwrap_or(0);
                 return Err(anyhow!(
-                    "startup timeout after {:?}; last screen:\n{}",
+                    "startup timeout after {:?} pid={}; last screen:\n{}",
                     self.cfg.startup_timeout,
+                    pid,
                     snap.text()
                 ));
             }
@@ -481,7 +483,10 @@ impl Backend for FreebuffBackend {
             let child_pid = pty.pid().unwrap_or(0);
 
             // Run startup sequence
-            this.run_startup(&pty, &cwd).await?;
+            if let Err(e) = this.run_startup(&pty, &cwd).await {
+                let _ = pty.kill().await;
+                return Err(e);
+            }
 
             // Create session ID
             let session_id = format!(
@@ -539,6 +544,7 @@ impl Backend for FreebuffBackend {
             }
 
             info!(session_id = %session_id, "prompt: starting");
+            session.emitted_message_chunk.store(false, Ordering::SeqCst);
 
             let pty = session.pty.clone();
 
@@ -1217,6 +1223,53 @@ mod tests {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn t10_startup_timeout_kills_child() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let mut cfg = test_config(&temp_dir, Some("hang-splash"));
+        cfg.startup_timeout = Duration::from_secs(1);
+        let backend = FreebuffBackend::new(cfg);
+
+        let result = backend.new_session(temp_dir.clone()).await;
+        assert!(
+            result.is_err(),
+            "new_session should fail on startup timeout"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("startup timeout"),
+            "error should mention timeout: {}",
+            err
+        );
+        // Extract pid from error message: "pid=<n>"
+        let pid_str = err.split("pid=").nth(1).and_then(|s| {
+            s.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u32>()
+                .ok()
+        });
+        assert!(pid_str.is_some(), "error should contain pid=<n>: {}", err);
+        let pid = pid_str.unwrap();
+
+        // Wait briefly for the process group to be reaped.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let out = std::process::Command::new("pgrep")
+                .args(["-g", &pid.to_string()])
+                .output()
+                .expect("pgrep should run");
+            if !out.status.success() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("child pid {} still alive after startup timeout kill", pid);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 }

@@ -20,8 +20,12 @@ if [ -z "$CWD" ]; then
     CWD="."
 fi
 
-# Get BLINK_MANICODE_DIR from env
-MANICODE_DIR="${BLINK_MANICODE_DIR:-$HOME/.config/manicode}"
+if [ -z "$BLINK_MANICODE_DIR" ]; then
+    echo "fake-freebuff: BLINK_MANICODE_DIR is required" >&2
+    exit 64
+fi
+
+MANICODE_DIR="$BLINK_MANICODE_DIR"
 
 # Derive project name from cwd basename
 PROJECT_NAME=$(basename "$CWD")
@@ -235,6 +239,10 @@ case "${FAKE_FREEBUFF_MODE:-}" in
         print_already_running
         # Block forever
         while true; do sleep 1; done
+        ;;
+    hang-splash)
+        print_splash
+        sleep 60
         ;;
     grandchild)
         # Behaves like normal mode, but right after printing the idle screen
