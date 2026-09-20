@@ -69,10 +69,8 @@ impl DriverConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
-        let submit_timeout_secs = std::env::var("BLINK_SUBMIT_TIMEOUT_S")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30);
+        let submit_timeout =
+            parse_submit_timeout(std::env::var("BLINK_SUBMIT_TIMEOUT_S").ok().as_deref());
 
         Self {
             program,
@@ -86,9 +84,30 @@ impl DriverConfig {
             poll_interval: Duration::from_millis(250),
             exit_timeout: Duration::from_secs(3),
             settle_timeout: Duration::from_secs(settle_timeout_secs),
-            submit_timeout: Duration::from_secs(submit_timeout_secs),
+            submit_timeout,
         }
     }
+}
+
+/// Parse `BLINK_SUBMIT_TIMEOUT_S`. Default 30 s when the variable is absent or
+/// unparseable; floored at 2 s so the 2 s nudge remainder never underflows.
+fn parse_submit_timeout(raw: Option<&str>) -> Duration {
+    let secs = match raw.and_then(|s| s.parse::<u64>().ok()) {
+        Some(v) => v,
+        None => return Duration::from_secs(30),
+    };
+    if secs < 2 {
+        warn!("BLINK_SUBMIT_TIMEOUT_S={secs} is below the 2 s floor; using 2 s");
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
+/// Remainder of `submit_timeout` after reserving the 2 s nudge, saturating at
+/// zero so a programmatically built config can never underflow.
+fn remainder_after_nudge(submit_timeout: Duration) -> Duration {
+    submit_timeout.saturating_sub(Duration::from_secs(2))
 }
 
 /// Session state held by the backend.
@@ -497,7 +516,7 @@ impl FreebuffBackend {
             }
         }
         let resolved = match pty
-            .wait_for(move |s| pred(s), submit_timeout - Duration::from_secs(2))
+            .wait_for(move |s| pred(s), remainder_after_nudge(submit_timeout))
             .await
         {
             Ok(snap) => snap,
@@ -1468,5 +1487,21 @@ mod tests {
         assert!(saw_message_with_pong, "missing AgentMessageChunk with PONG");
 
         backend.shutdown().await;
+    }
+
+    #[test]
+    fn submit_timeout_floor_is_two_seconds() {
+        // A programmatically built config with a 1 s submit_timeout must never
+        // underflow the 2 s nudge remainder; it saturates to zero.
+        assert_eq!(
+            remainder_after_nudge(Duration::from_secs(1)),
+            Duration::ZERO
+        );
+
+        // Env parsing floors any value below 2 s up to 2 s (and defaults to 30).
+        assert_eq!(parse_submit_timeout(Some("1")), Duration::from_secs(2));
+        assert_eq!(parse_submit_timeout(Some("0")), Duration::from_secs(2));
+        assert_eq!(parse_submit_timeout(Some("30")), Duration::from_secs(30));
+        assert_eq!(parse_submit_timeout(None), Duration::from_secs(30));
     }
 }

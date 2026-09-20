@@ -41,7 +41,7 @@ usable as parser fixtures in `captures/`.
 | 3 busy | status bar becomes `thinking... <N>s  ■ Esc` (or `working... <N>s  ■ Esc`); content shows `• Thinking` (or `▸ Thinking` collapsed), tool lines like `$ echo hello` / `• Create probe.txt`, then the reply, then `⌘ • <N>s • △▽`. The elapsed counter is absent in the first instant (` working...   ■ Esc`); after a large paste it can take >5 s to appear. | poll transcript on disk |
 | 4 kicked out | `Another freebuff instance took over this account.` / `Only one CLI per account can be active at a time.` / `Close the other instance, then restart freebuff here.` / `Press Ctrl+C to exit.` | surface ACP error; Ctrl-C exits it |
 
-Idle vs busy: busy **iff** the status bar matches `(thinking|working)\.\.\. \d+s`;
+Idle vs busy: busy **iff** the status bar matches `(thinking|working)\.\.\.` followed by either `\d+s` or, in the first instant, nothing but spaces before `■ Esc`;
 idle iff it matches `· \d+[hm] left` and the input placeholder is visible.
 
 ## Input handling
