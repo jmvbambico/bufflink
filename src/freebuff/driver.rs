@@ -85,6 +85,10 @@ struct Session {
     log_offset: Arc<Mutex<u64>>,
     cancelled: Arc<AtomicBool>,
     session_id: String,
+    /// Count of consecutive transcript parse failures.
+    parse_failures: Arc<Mutex<u32>>,
+    /// Whether any AgentMessageChunk was emitted during the current turn.
+    emitted_message_chunk: Arc<AtomicBool>,
 }
 
 /// Backend that drives a single freebuff session per process.
@@ -187,11 +191,15 @@ impl FreebuffBackend {
     }
 
     /// Process transcript deltas and send updates.
+    /// Returns Ok(()) on success, or an error if parsing fails and this is a final flush attempt.
     async fn process_transcript_deltas(
         &self,
         chat_dir: &Path,
         cursor: &mut Cursor,
         updates: &UpdateSink,
+        parse_failures: &Arc<Mutex<u32>>,
+        emitted_message_chunk: &Arc<AtomicBool>,
+        is_final_flush: bool,
     ) -> Result<()> {
         let transcript_path = chat_dir.join(CHAT_MESSAGES);
         let content = match fs::read_to_string(&transcript_path).await {
@@ -199,10 +207,22 @@ impl FreebuffBackend {
             Err(_) => return Ok(()), // File doesn't exist yet
         };
 
-        // Try to parse; if it fails (torn write), just return and retry next poll
+        // Try to parse; if it fails, log and count
         let messages = match parse_messages(&content) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
+            Ok(m) => {
+                // Reset failure count on successful parse
+                *parse_failures.lock().await = 0;
+                m
+            }
+            Err(e) => {
+                let mut failures = parse_failures.lock().await;
+                *failures += 1;
+                tracing::warn!(failures = *failures, error = %e, "freebuff transcript parse failed");
+                if is_final_flush {
+                    return Err(anyhow!("freebuff transcript could not be parsed: {e:#}"));
+                }
+                return Ok(()); // Torn write, retry next poll
+            }
         };
 
         let (new_cursor, deltas) = diff(cursor, &messages);
@@ -223,6 +243,8 @@ impl FreebuffBackend {
                                 content: TextContent::text(delta),
                             })
                             .await;
+                        // Mark that we've emitted at least one message chunk
+                        emitted_message_chunk.store(true, Ordering::SeqCst);
                     }
                 }
                 Delta::ToolStarted {
@@ -474,6 +496,8 @@ impl Backend for FreebuffBackend {
                 log_offset: Arc::new(Mutex::new(0)),
                 cancelled: Arc::new(AtomicBool::new(false)),
                 session_id: session_id.clone(),
+                parse_failures: Arc::new(Mutex::new(0)),
+                emitted_message_chunk: Arc::new(AtomicBool::new(false)),
             };
 
             *this.session.lock().await = Some(session);
@@ -568,16 +592,31 @@ impl Backend for FreebuffBackend {
 
                 // Check turn outcome from log events
                 if let Some(turn_outcome) = outcome(&turn_events) {
-                    // Flush one last transcript diff
+                    // Flush one last transcript diff (final flush)
                     {
                         let mut cursor_guard = session.transcript_cursor.lock().await;
-                        this.process_transcript_deltas(&chat_dir, &mut cursor_guard, &updates)
-                            .await?;
+                        this.process_transcript_deltas(
+                            &chat_dir,
+                            &mut cursor_guard,
+                            &updates,
+                            &session.parse_failures,
+                            &session.emitted_message_chunk,
+                            true, // is_final_flush
+                        )
+                        .await?;
                     }
 
                     match turn_outcome {
                         TurnOutcome::Completed => {
                             info!("prompt: turn completed");
+                            // Check if any AgentMessageChunk was emitted during this turn
+                            if !session.emitted_message_chunk.load(Ordering::SeqCst) {
+                                return Err(anyhow!(
+                                    "freebuff finished the turn but no reply text was found in the transcript"
+                                ));
+                            }
+                            // Reset for next turn
+                            session.emitted_message_chunk.store(false, Ordering::SeqCst);
                             return Ok(if cancelled_sent {
                                 StopReason::Cancelled
                             } else {
@@ -586,6 +625,8 @@ impl Backend for FreebuffBackend {
                         }
                         TurnOutcome::Interrupted => {
                             info!("prompt: turn interrupted");
+                            // Reset for next turn
+                            session.emitted_message_chunk.store(false, Ordering::SeqCst);
                             return Ok(StopReason::Cancelled);
                         }
                         TurnOutcome::Error { message } => {
@@ -594,11 +635,18 @@ impl Backend for FreebuffBackend {
                     }
                 }
 
-                // Process transcript deltas
+                // Process transcript deltas (regular poll)
                 {
                     let mut cursor_guard = session.transcript_cursor.lock().await;
-                    this.process_transcript_deltas(&chat_dir, &mut cursor_guard, &updates)
-                        .await?;
+                    this.process_transcript_deltas(
+                        &chat_dir,
+                        &mut cursor_guard,
+                        &updates,
+                        &session.parse_failures,
+                        &session.emitted_message_chunk,
+                        false, // not final flush
+                    )
+                    .await?;
                 }
 
                 tokio::time::sleep(this.cfg.poll_interval).await;
@@ -670,6 +718,8 @@ impl Session {
             log_offset: self.log_offset.clone(),
             cancelled: self.cancelled.clone(),
             session_id: self.session_id.clone(),
+            parse_failures: self.parse_failures.clone(),
+            emitted_message_chunk: self.emitted_message_chunk.clone(),
         }
     }
 }
@@ -685,6 +735,8 @@ struct SessionRef {
     log_offset: Arc<Mutex<u64>>,
     cancelled: Arc<AtomicBool>,
     session_id: String,
+    parse_failures: Arc<Mutex<u32>>,
+    emitted_message_chunk: Arc<AtomicBool>,
 }
 
 /// Build tool title: tool_name + ": " + command/path from input
@@ -980,5 +1032,30 @@ mod tests {
             "error should mention already running: {}",
             err
         );
+    }
+
+    #[tokio::test]
+    async fn t7_fake_freebuff_mode_unparsable_errors_with_parse_failure() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("unparsable"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+
+        let (result, _updates) = run_prompt_collect(&backend, &session_id, "test").await;
+
+        assert!(
+            result.is_err(),
+            "prompt should fail with unparsable transcript"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("freebuff transcript could not be parsed"),
+            "error should mention transcript parse failure: {}",
+            err
+        );
+
+        backend.shutdown().await;
     }
 }

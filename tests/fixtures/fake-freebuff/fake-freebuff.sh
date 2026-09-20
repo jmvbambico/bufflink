@@ -181,6 +181,40 @@ write_chat_messages() {
 EOF
 }
 
+# Write unparsable chat-messages.json (for testing parse error handling)
+write_unparsable_chat_messages() {
+    cat > "$CHAT_DIR/chat-messages.json" <<'EOF'
+[
+  {
+    "variant": "ai",
+    "blocks": [
+      {
+        "type": "mode-divider",
+        "mode": "LITE"
+      }
+    ],
+    "isComplete": true
+  },
+  {
+    "variant": "user",
+    "content": "test"
+  },
+  {
+    "variant": "ai",
+    "blocks": [
+      {
+        "type": "text",
+        "textType": "reasoning",
+        "content": "ok"
+      }
+    ],
+    "isComplete": true
+  }
+  // This trailing comma makes it invalid JSON
+]
+EOF
+}
+
 # Setup terminal for cooked input
 stty sane 2>/dev/null || true
 
@@ -201,6 +235,35 @@ case "${FAKE_FREEBUFF_MODE:-}" in
         print_already_running
         # Block forever
         while true; do sleep 1; done
+        ;;
+    unparsable)
+        print_splash
+        read -r _
+        idle_prompt() {
+            printf '\033[2J\033[H'
+            print_idle
+            printf '\033[2A\033[4C'
+            read -r line || return 1
+            printf '\n\n'
+            ESC=$(printf '\033')
+            line=$(printf '%s' "$line" | sed -e "s/${ESC}\[200~//g" -e "s/${ESC}\[201~//g")
+            if [ "$line" = "/exit" ]; then
+                print_exit
+                exit 0
+            fi
+            TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%S.000Z")
+            CHAT_DIR="$CHATS_DIR/$TIMESTAMP"
+            mkdir -p "$CHAT_DIR"
+            write_log_line '[send-message] Sending message with sdk run config' '{}'
+            write_unparsable_chat_messages
+            print_status_busy
+            sleep 0.5
+            write_log_line 'Main prompt finished' '{"outputType":"lastMessage"}'
+            print_idle
+        }
+        while true; do
+            idle_prompt || break
+        done
         ;;
 esac
 
