@@ -36,11 +36,11 @@ CHATS_DIR="$MANICODE_DIR/projects/$PROJECT_NAME/chats"
 # Print splash screen
 print_splash() {
     cat <<'EOF'
-████████████████████████████████████████████████████████
+████████████████████████████████████████
 █                                                      █
 █   F  R  E  E  B  U  F  F                            █
 █                                                      █
-████████████████████████████████████████████████████████
+████████████████████████████████████████
 
 Start coding for free
 
@@ -58,11 +58,11 @@ EOF
 # Print freebucks gate splash
 print_gate_splash() {
     cat <<'EOF'
-████████████████████████████████████████████████████████
+████████████████████████████████████████
 █                                                      █
 █   F  R  E  E  B  U  F  F                            █
 █                                                      █
-████████████████████████████████████████████████████████
+████████████████████████████████████████
 
 Start coding for free
 
@@ -121,6 +121,14 @@ print_paste_chip_and_box() {
     printf '╭────╮\n'
     printf '│  ▍Enter a coding task or / for commands  │\n'
     printf '╰────╯\n'
+}
+
+# Idle screen whose input box is preceded by freebuff's pasted-text chip.
+print_idle_with_chip() {
+    printf '  Freebuff will run commands on your behalf to help you build.\n\n'
+    printf '  Directory %s\n\n' "$CWD"
+    printf 'GLM 5.3 Flash · 59m left · 16.4K (2%%)      ✕ End session\n'
+    print_paste_chip_and_box "1,500"
 }
 
 # Print status line when busy
@@ -274,6 +282,9 @@ case "${FAKE_FREEBUFF_MODE:-}" in
         # to. The idle loop below (after `esac`) handles the rest.
         GRANDCHILD_SPAWNED=0
         ;;
+    chip)
+        # Normal flow; idle_prompt shows the chip and reads without echo.
+        ;;
     unparsable)
         print_splash
         read -r _
@@ -352,8 +363,20 @@ idle_prompt() {
         sh -c 'exec sleep 60' &
         GRANDCHILD_SPAWNED=1
     fi
-    printf '\033[2A\033[4C'
-    read -r line || return 1
+    if [ "$FAKE_FREEBUFF_MODE" = "chip" ]; then
+        # freebuff collapses a large paste into a chip above the box and does
+        # not echo it. Show the chip BEFORE reading, and read in
+        # non-canonical mode: canonical mode caps a line at MAX_CANON
+        # (1024 bytes on macOS), which a long paste overflows.
+        printf '\033[2J\033[H'
+        print_idle_with_chip
+        stty -icanon -echo icrnl min 1 time 0 2>/dev/null || true
+        read -r line || return 1
+        stty sane 2>/dev/null || true
+    else
+        printf '\033[2A\033[4C'
+        read -r line || return 1
+    fi
     printf '\n\n'
     ESC=$(printf '\033')
     line=$(printf '%s' "$line" | sed -e "s/${ESC}\[200~//g" -e "s/${ESC}\[201~//g")

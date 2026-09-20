@@ -1307,7 +1307,7 @@ mod tests {
     async fn t11_long_prompt_is_submitted_via_paste_chip() {
         let tmp = test_temp_dir();
         let temp_dir = tmp.0.clone();
-        let cfg = test_config(&temp_dir, None);
+        let cfg = test_config(&temp_dir, Some("chip"));
         let backend = FreebuffBackend::new(cfg);
 
         let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
