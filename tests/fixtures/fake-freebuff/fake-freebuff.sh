@@ -371,7 +371,7 @@ idle_prompt() {
         printf '\033[2J\033[H'
         print_idle_with_chip
         stty -icanon -echo icrnl min 1 time 0 2>/dev/null || true
-        read -r line || return 1
+        if ! read -r line; then stty sane 2>/dev/null || true; return 1; fi
         stty sane 2>/dev/null || true
     else
         printf '\033[2A\033[4C'

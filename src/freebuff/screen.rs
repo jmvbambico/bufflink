@@ -347,4 +347,22 @@ mod tests {
         let rows = load_fixture("paste-chip-120x40");
         assert_eq!(classify(&rows), ScreenState::Idle);
     }
+
+    #[test]
+    fn pasted_chip_chars_edge_cases() {
+        let cases = [
+            (" 📋 Pasted text (12,345 chars)", Some(12345)),
+            ("Pasted text (0 chars)", Some(0)),
+            ("note before 📋 Pasted text (7 chars) and after", Some(7)),
+            ("Pasted text (chars)", None),
+            ("nothing here", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                pasted_chip_chars(&[input.to_string()]),
+                expected,
+                "input: {input}"
+            );
+        }
+    }
 }
