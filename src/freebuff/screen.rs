@@ -175,6 +175,22 @@ pub fn input_box_text(rows: &[String]) -> Option<String> {
     }
 }
 
+/// Parse the pasted-text chip count from rows.
+/// Finds a row containing `Pasted text (` and parses the number before ` chars)`.
+/// Digits may include thousands separators (`,`). Returns `Some(count)` or `None`.
+pub fn pasted_chip_chars(rows: &[String]) -> Option<u64> {
+    for row in rows {
+        if let Some(start) = row.find("Pasted text (") {
+            let after = &row[start + "Pasted text (".len()..];
+            if let Some(end) = after.find(" chars)") {
+                let num_str = after[..end].replace(',', "");
+                return num_str.parse::<u64>().ok();
+            }
+        }
+    }
+    None
+}
+
 /// Check if the input box is empty (showing the placeholder).
 pub fn input_box_is_empty(rows: &[String]) -> bool {
     input_box_text(rows)
@@ -202,6 +218,7 @@ mod tests {
             "kicked-out" => fixture!("kicked-out"),
             "freebucks-gate-80x24" => fixture!("freebucks-gate-80x24"),
             "slash-menu" => fixture!("slash-menu"),
+            "paste-chip-120x40" => fixture!("paste-chip-120x40"),
             _ => panic!("unknown fixture: {}", name),
         };
         content.lines().map(|s| s.to_string()).collect()
@@ -311,5 +328,41 @@ mod tests {
     fn input_box_text_none_when_no_box() {
         let rows = vec!["Just some text".to_string(), "More text".to_string()];
         assert_eq!(input_box_text(&rows), None);
+    }
+
+    #[test]
+    fn paste_chip_parses_count() {
+        let rows = load_fixture("paste-chip-120x40");
+        assert_eq!(pasted_chip_chars(&rows), Some(5001));
+    }
+
+    #[test]
+    fn paste_chip_none_when_no_chip() {
+        let rows = load_fixture("idle-120x40");
+        assert_eq!(pasted_chip_chars(&rows), None);
+    }
+
+    #[test]
+    fn paste_chip_classifies_as_idle() {
+        let rows = load_fixture("paste-chip-120x40");
+        assert_eq!(classify(&rows), ScreenState::Idle);
+    }
+
+    #[test]
+    fn pasted_chip_chars_edge_cases() {
+        let cases = [
+            (" 📋 Pasted text (12,345 chars)", Some(12345)),
+            ("Pasted text (0 chars)", Some(0)),
+            ("note before 📋 Pasted text (7 chars) and after", Some(7)),
+            ("Pasted text (chars)", None),
+            ("nothing here", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                pasted_chip_chars(&[input.to_string()]),
+                expected,
+                "input: {input}"
+            );
+        }
     }
 }

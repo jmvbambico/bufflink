@@ -55,6 +55,11 @@ idle iff it matches `· \d+[hm] left` and the input placeholder is visible.
   if not). Newlines inside a paste are literal (multi-line prompt), not
   submit — not exercised live (Freebucks ran out), inferred from the paste
   mode.
+- When a pasted prompt is longer than ~1 000 chars freebuff does **not** echo it
+  inline in the input box; instead it shows a chip above the box reading
+  `📋 Pasted text (N chars)` (N with thousands separators, e.g. `5,001`) and
+  re-displays the box with its placeholder. Enter submits it — expected, to be
+  confirmed live. (Observed at 5 001 chars; inline echo at ≤ 74.)
 - Slash menu on `/`: `/help /diagnostics /interview /plan /review /queue /new
   /history /copy /export /feedback /bash /theme:toggle /byok /reasoning`;
   `/exit` and `/quit` work but are not listed. Escape does not close the

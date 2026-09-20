@@ -20,7 +20,9 @@ use crate::freebuff::chats::{
     chats_dir, instance_owner, newest_new_chat, snapshot, CHAT_MESSAGES, LOG,
 };
 use crate::freebuff::log::{outcome, parse_log_line, LogEvent, TurnOutcome};
-use crate::freebuff::screen::{classify, input_box_text, ScreenState, SPLASH_ACCEPT_KEY};
+use crate::freebuff::screen::{
+    classify, input_box_text, pasted_chip_chars, ScreenState, SPLASH_ACCEPT_KEY,
+};
 use crate::freebuff::transcript::{diff, parse_messages, Block, Cursor, Delta, Message};
 use crate::freebuff::{CANCEL_KEY, EXIT_COMMAND};
 use crate::pty::{Key, Pty, PtyConfig};
@@ -155,6 +157,7 @@ impl FreebuffBackend {
     }
 
     /// Wait for input box to contain expected text.
+    #[allow(dead_code)]
     async fn wait_for_input_box_contains(
         &self,
         pty: &Pty,
@@ -420,10 +423,36 @@ impl FreebuffBackend {
         info!("prompt: pasting text ({} chars)", text.len());
         pty.paste(text).await?;
 
-        // Wait for input box to show the text (first 20 chars)
+        // Wait for input box to show the text (first 20 chars) or a pasted chip
         let preview: String = text.chars().take(20).collect();
-        self.wait_for_input_box_contains(pty, &preview, Duration::from_secs(5))
-            .await?;
+        match pty
+            .wait_for(
+                |s| {
+                    let in_box = input_box_text(&s.rows)
+                        .map(|t| t.contains(&preview))
+                        .unwrap_or(false);
+                    let chip = pasted_chip_chars(&s.rows).is_some();
+                    in_box || chip
+                },
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(snap) => {
+                if pasted_chip_chars(&snap.rows).is_some() {
+                    let count = pasted_chip_chars(&snap.rows).unwrap();
+                    info!("prompt: pasted-text chip appeared ({} chars)", count);
+                } else {
+                    info!("prompt: text appeared in input box ({} chars)", text.len());
+                }
+            }
+            Err(_) => {
+                return Err(anyhow!(
+                    "freebuff did not show the prompt text or a pasted-text chip in the input box within 5s; screen:\n{}",
+                    pty.screen().text()
+                ));
+            }
+        }
 
         // Send Enter
         info!("prompt: sending Enter");
@@ -436,19 +465,20 @@ impl FreebuffBackend {
                 Ok(())
             }
             Err(_) => {
-                // Check if text is still in input box - might need second Enter
+                // Check if text or chip is still in input box - might need second Enter
                 let snap = pty.screen();
-                if input_box_text(&snap.rows)
+                let text_still_visible = input_box_text(&snap.rows)
                     .map(|t| !t.is_empty() && !t.contains("Enter a coding task"))
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+                let chip_still_visible = pasted_chip_chars(&snap.rows).is_some();
+                if text_still_visible || chip_still_visible {
                     info!("prompt: still not busy, sending Enter again");
                     pty.key(Key::Enter).await?;
                     self.wait_for_busy(pty, Duration::from_secs(5)).await?;
                     Ok(())
                 } else {
                     Err(anyhow!(
-                        "freebuff did not go busy after prompt; screen:\n{}",
+                        "freebuff did not go busy after prompt; box showed neither text nor pasted-text chip; screen:\n{}",
                         snap.text()
                     ))
                 }
@@ -1271,5 +1301,72 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn t11_long_prompt_is_submitted_via_paste_chip() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("chip"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+
+        // Build a 1,500-char prompt by repeating a sentence (no "slow").
+        let sentence = "A quick brown fox jumps. ";
+        let prompt = sentence.repeat(60);
+        assert_eq!(prompt.len(), 1500, "prompt must be exactly 1500 chars");
+        assert!(!prompt.contains("slow"), "prompt must not contain 'slow'");
+
+        let (result, updates) = run_prompt_collect(&backend, &session_id, &prompt).await;
+
+        assert!(result.is_ok(), "prompt failed: {:?}", result.err());
+        assert_eq!(result.unwrap(), StopReason::EndTurn);
+
+        let mut saw_thought = false;
+        let mut saw_tool_call = false;
+        let mut saw_tool_update = false;
+        let mut saw_message_with_pong = false;
+
+        for u in &updates {
+            match u {
+                SessionUpdate::AgentThoughtChunk { .. } => saw_thought = true,
+                SessionUpdate::ToolCall {
+                    tool_call_id,
+                    title,
+                    kind,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(*status, ToolCallStatus::InProgress);
+                    assert!(!tool_call_id.is_empty());
+                    assert!(title.contains("run_terminal_command"));
+                    assert_eq!(*kind, "execute");
+                    saw_tool_call = true;
+                }
+                SessionUpdate::ToolCallUpdate {
+                    tool_call_id,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(*status, ToolCallStatus::Completed);
+                    assert!(!tool_call_id.is_empty());
+                    saw_tool_update = true;
+                }
+                SessionUpdate::AgentMessageChunk { content } => {
+                    let TextContent::Text { text } = content;
+                    if text.contains("PONG") {
+                        saw_message_with_pong = true;
+                    }
+                }
+            }
+        }
+
+        assert!(saw_thought, "missing AgentThoughtChunk");
+        assert!(saw_tool_call, "missing ToolCall");
+        assert!(saw_tool_update, "missing ToolCallUpdate");
+        assert!(saw_message_with_pong, "missing AgentMessageChunk with PONG");
+
+        backend.shutdown().await;
     }
 }
