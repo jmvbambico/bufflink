@@ -21,7 +21,7 @@ use crate::freebuff::chats::{
 };
 use crate::freebuff::log::{outcome, parse_log_line, LogEvent, TurnOutcome};
 use crate::freebuff::screen::{classify, input_box_text, ScreenState, SPLASH_ACCEPT_KEY};
-use crate::freebuff::transcript::{diff, parse_messages, Cursor, Delta};
+use crate::freebuff::transcript::{diff, parse_messages, Block, Cursor, Delta, Message};
 use crate::freebuff::{CANCEL_KEY, EXIT_COMMAND};
 use crate::pty::{Key, Pty, PtyConfig};
 
@@ -48,6 +48,8 @@ pub struct DriverConfig {
     pub poll_interval: Duration,
     /// Exit timeout for graceful shutdown (default: 3s).
     pub exit_timeout: Duration,
+    /// Time to wait for transcript to settle after turn log event (default: 5s, env: BLINK_SETTLE_TIMEOUT_S).
+    pub settle_timeout: Duration,
 }
 
 impl DriverConfig {
@@ -59,6 +61,10 @@ impl DriverConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(15 * 60);
+        let settle_timeout_secs = std::env::var("BLINK_SETTLE_TIMEOUT_S")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
 
         Self {
             program,
@@ -71,6 +77,7 @@ impl DriverConfig {
             turn_timeout: Duration::from_secs(turn_timeout_secs),
             poll_interval: Duration::from_millis(250),
             exit_timeout: Duration::from_secs(3),
+            settle_timeout: Duration::from_secs(settle_timeout_secs),
         }
     }
 }
@@ -592,6 +599,40 @@ impl Backend for FreebuffBackend {
 
                 // Check turn outcome from log events
                 if let Some(turn_outcome) = outcome(&turn_events) {
+                    // Wait for transcript to settle before final flush
+                    let settle_start = Instant::now();
+                    while settle_start.elapsed() < this.cfg.settle_timeout {
+                        let transcript_path = chat_dir.join(CHAT_MESSAGES);
+                        if let Ok(content) = fs::read_to_string(&transcript_path).await {
+                            if let Ok(messages) = parse_messages(&content) {
+                                if let Some(Message::Ai {
+                                    blocks,
+                                    is_complete,
+                                    ..
+                                }) = messages.last()
+                                {
+                                    let has_content = blocks.iter().any(|b| {
+                                        matches!(b, Block::Text { text_type, .. } if text_type != "reasoning")
+                                            || matches!(b, Block::Tool { .. })
+                                    });
+                                    match turn_outcome {
+                                        TurnOutcome::Completed if *is_complete && has_content => {
+                                            break
+                                        }
+                                        TurnOutcome::Interrupted if !blocks.is_empty() => break,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        tokio::time::sleep(this.cfg.poll_interval).await;
+                    }
+                    let settle_elapsed = settle_start.elapsed();
+                    info!(
+                        elapsed_ms = settle_elapsed.as_millis(),
+                        "transcript settled"
+                    );
+
                     // Flush one last transcript diff (final flush)
                     {
                         let mut cursor_guard = session.transcript_cursor.lock().await;
@@ -834,7 +875,7 @@ mod tests {
         session_id: &str,
         text: &str,
     ) -> (Result<StopReason>, Vec<SessionUpdate>) {
-        let (tx, mut _rx) = mpsc::channel(64);
+        let (tx, mut rx) = mpsc::channel(64);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let sink = UpdateSink::new(tx);
 
@@ -847,7 +888,7 @@ mod tests {
         loop {
             tokio::select! {
                 biased;
-                Some(u) = _rx.recv() => {
+                Some(u) = rx.recv() => {
                     updates.push(u);
                 }
                 result = &mut prompt_fut => {
@@ -855,6 +896,11 @@ mod tests {
                     break;
                 }
             }
+        }
+
+        // Drain any remaining updates after prompt completes
+        while let Ok(u) = rx.try_recv() {
+            updates.push(u);
         }
 
         (outcome.expect("prompt completed"), updates)
@@ -1055,6 +1101,70 @@ mod tests {
             "error should mention transcript parse failure: {}",
             err
         );
+
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn t8_late_transcript_is_still_streamed() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("late-transcript"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+
+        let (result, updates) = run_prompt_collect(&backend, &session_id, "Reply PONG").await;
+
+        assert!(result.is_ok(), "prompt failed: {:?}", result.err());
+        assert_eq!(result.unwrap(), StopReason::EndTurn);
+
+        // Check update sequence: AgentThoughtChunk, ToolCall, ToolCallUpdate, AgentMessageChunk with PONG
+        assert!(!updates.is_empty(), "no updates streamed");
+
+        let mut saw_thought = false;
+        let mut saw_tool_call = false;
+        let mut saw_tool_update = false;
+        let mut saw_message_with_pong = false;
+
+        for u in &updates {
+            match u {
+                SessionUpdate::AgentThoughtChunk { .. } => saw_thought = true,
+                SessionUpdate::ToolCall {
+                    tool_call_id,
+                    title,
+                    kind,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(*status, ToolCallStatus::InProgress);
+                    assert!(!tool_call_id.is_empty());
+                    assert!(title.contains("run_terminal_command"));
+                    assert_eq!(*kind, "execute");
+                    saw_tool_call = true;
+                }
+                SessionUpdate::ToolCallUpdate {
+                    tool_call_id,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(*status, ToolCallStatus::Completed);
+                    assert!(!tool_call_id.is_empty());
+                    saw_tool_update = true;
+                }
+                SessionUpdate::AgentMessageChunk { content } => {
+                    let TextContent::Text { text } = content;
+                    if text.contains("PONG") {
+                        saw_message_with_pong = true;
+                    }
+                }
+            }
+        }
+
+        assert!(saw_thought, "missing AgentThoughtChunk");
+        assert!(saw_tool_call, "missing ToolCall");
+        assert!(saw_tool_update, "missing ToolCallUpdate");
+        assert!(saw_message_with_pong, "missing AgentMessageChunk with PONG");
 
         backend.shutdown().await;
     }

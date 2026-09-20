@@ -265,6 +265,37 @@ case "${FAKE_FREEBUFF_MODE:-}" in
             idle_prompt || break
         done
         ;;
+    late-transcript)
+        print_splash
+        read -r _
+        idle_prompt() {
+            printf '\033[2J\033[H'
+            print_idle
+            printf '\033[2A\033[4C'
+            read -r line || return 1
+            printf '\n\n'
+            ESC=$(printf '\033')
+            line=$(printf '%s' "$line" | sed -e "s/${ESC}\[200~//g" -e "s/${ESC}\[201~//g")
+            if [ "$line" = "/exit" ]; then
+                print_exit
+                exit 0
+            fi
+            TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%S.000Z")
+            CHAT_DIR="$CHATS_DIR/$TIMESTAMP"
+            mkdir -p "$CHAT_DIR"
+            write_log_line '[send-message] Sending message with sdk run config' '{}'
+            print_status_busy
+            sleep 0.5
+            # Write log line FIRST, then sleep, then write chat-messages.json
+            write_log_line 'Main prompt finished' '{"outputType":"lastMessage"}'
+            sleep 0.4
+            write_chat_messages "$line" "LITE"
+            print_idle
+        }
+        while true; do
+            idle_prompt || break
+        done
+        ;;
 esac
 
 # Normal mode: print splash and wait for Enter
