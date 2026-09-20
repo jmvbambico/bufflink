@@ -325,6 +325,12 @@ impl Pty {
         match guard.as_mut() {
             Some(child) => {
                 let result = child.try_wait().map_err(anyhow::Error::from)?;
+                // Group cleanup happens exactly once, immediately after the
+                // reap is observed. The leader (freebuff's launcher) is gone,
+                // but any surviving descendant (the real freebuff binary)
+                // keeps the process group alive, so the pgid cannot be reused
+                // by an unrelated process while there is something to kill.
+                // If no descendant survived, the signal finds nothing (ESRCH).
                 if result.is_some() && !self.group_cleaned.load(Ordering::SeqCst) {
                     self.signal_group_once(libc::SIGKILL);
                     info!(
