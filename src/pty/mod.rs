@@ -120,6 +120,10 @@ pub(crate) struct Shared {
 /// An async handle to a child running inside a pseudo-terminal.
 pub struct Pty {
     shared: Arc<Shared>,
+    /// Captured at spawn time. `tokio::process::Child::id()` returns `None`
+    /// once the child has been reaped, so we remember the pid here to keep the
+    /// process-group kill working in that window.
+    spawn_pid: u32,
     /// Guarded because `tokio::process::Child` isn't `Sync`.
     child: Mutex<Option<tokio::process::Child>>,
 }
@@ -168,6 +172,7 @@ impl Pty {
 
             match cmd.spawn(pts) {
                 Ok(child) => {
+                    let spawn_pid = child.id().expect("fresh child has a pid");
                     let (read_half, write_half) = pty.into_split();
 
                     let shared = Arc::new(Shared {
@@ -182,6 +187,7 @@ impl Pty {
 
                     return Ok(Pty {
                         shared,
+                        spawn_pid,
                         child: Mutex::new(Some(child)),
                     });
                 }
@@ -343,7 +349,14 @@ impl Pty {
     /// lock. Sequence: SIGTERM the group, poll `try_wait` for up to 1 s, then
     /// SIGKILL the group if anything is still alive, then reap.
     pub async fn kill(&self) -> Result<()> {
-        let pgid = group_target(self.pid());
+        // Signal the child's process group, identified by the pid captured at
+        // spawn time. `Child::id()` is `None` once the child has been reaped by
+        // `wait_exit`/`try_wait`, which would skip the whole-group kill and
+        // leave an orphaned grandchild (e.g. the real freebuff binary launched
+        // by the npm wrapper) alive and holding the single-instance lock. The
+        // process group id outlives its leader as long as any member lives, and
+        // ESRCH on a vanished group is already tolerated below.
+        let pgid = group_target(Some(self.spawn_pid));
         if let Some(pgid) = pgid {
             // SIGTERM the whole process group first.
             let term_rc = unsafe { libc::kill(-pgid, libc::SIGTERM) };
@@ -408,9 +421,25 @@ impl Pty {
             .context("failed to resize pty")
     }
 
-    /// The child's OS pid, if a child is still tracked.
+    /// The child's OS pid, so long as a child is still tracked (i.e. not taken
+    /// out of its slot by `kill`). The pid is captured at spawn time, so it
+    /// remains available **after** the child has been reaped via
+    /// `try_wait`/`wait` — which clears `Child::id()` — and is `None` only
+    /// while `kill` has temporarily removed the child.
     pub fn pid(&self) -> Option<u32> {
-        self.child.lock().unwrap().as_ref().and_then(|c| c.id())
+        let child = self.child.lock().unwrap();
+        if child.is_some() {
+            Some(self.spawn_pid)
+        } else {
+            None
+        }
+    }
+
+    /// The pid captured at spawn time. Always available for addressing the
+    /// child's process group, even after the child has been reaped, when
+    /// `pid()` may have already returned `None`.
+    pub fn spawn_pid(&self) -> u32 {
+        self.spawn_pid
     }
 }
 

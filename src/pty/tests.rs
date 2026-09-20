@@ -208,6 +208,57 @@ async fn kill_terminates_grandchild() {
     }
 }
 
+/// After the child has exited and been reaped, `kill()` must still signal the
+/// whole process group so an orphaned grandchild dies. `pid()` is `None` once
+/// the child is reaped (`Child::id()` clears after `wait`/`try_wait`), so the
+/// group id comes from the spawn pid captured at spawn time.
+#[tokio::test]
+async fn kill_after_child_exit_still_kills_group() {
+    // The parent shell exits immediately, orphaning the inner `sleep 30`
+    // grandchild in the same process group.
+    let pty = Pty::spawn(cfg("sh -c 'sh -c \"exec sleep 30\" & exit 0'", 80, 24))
+        .await
+        .expect("spawn");
+
+    let spawn_pid = pty.spawn_pid();
+    assert!(spawn_pid > 0);
+
+    // Parent exits on its own; wait_exit reaps it and returns Some.
+    let status = pty
+        .wait_exit(Duration::from_secs(2))
+        .await
+        .expect("wait_exit");
+    assert!(status.is_some(), "child should have exited on its own");
+
+    // Even though the child is now reaped, kill() must still reach the orphan
+    // grandchild via the spawn pid's process group.
+    let killed = tokio::time::timeout(Duration::from_secs(2), pty.kill())
+        .await
+        .expect("kill() returns within 2s");
+    killed.expect("kill ok");
+
+    // `pgrep -g <spawn_pid>` matches only the child's process group, which
+    // persists as long as the grandchild lives. It must be empty.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let out = std::process::Command::new("pgrep")
+            .args(["-g", &spawn_pid.to_string()])
+            .output()
+            .expect("pgrep should run");
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            panic!(
+                "grandchild survived kill() after child exit; pgrep -g {} returned:\n{}",
+                spawn_pid, stdout
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn wait_for_timeout_includes_screen_text() {
     let pty = Pty::spawn(cfg("printf 'abc\\n'; sleep 0.5", 80, 24))
