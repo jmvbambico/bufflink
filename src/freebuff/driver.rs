@@ -21,11 +21,11 @@ use crate::freebuff::chats::{
 };
 use crate::freebuff::log::{outcome, parse_log_line, LogEvent, TurnOutcome};
 use crate::freebuff::screen::{
-    classify, input_box_text, pasted_chip_chars, ScreenState, SPLASH_ACCEPT_KEY,
+    classify, input_box_is_empty, input_box_text, pasted_chip_chars, ScreenState, SPLASH_ACCEPT_KEY,
 };
 use crate::freebuff::transcript::{diff, parse_messages, Block, Cursor, Delta, Message};
 use crate::freebuff::{CANCEL_KEY, EXIT_COMMAND};
-use crate::pty::{Key, Pty, PtyConfig};
+use crate::pty::{Key, Pty, PtyConfig, ScreenSnapshot};
 
 /// Configuration for the freebuff driver.
 #[derive(Debug, Clone)]
@@ -52,6 +52,8 @@ pub struct DriverConfig {
     pub exit_timeout: Duration,
     /// Time to wait for transcript to settle after turn log event (default: 5s, env: BLINK_SETTLE_TIMEOUT_S).
     pub settle_timeout: Duration,
+    /// Time to wait after Enter for freebuff to go busy or consume the paste (default: 30s, env: BLINK_SUBMIT_TIMEOUT_S).
+    pub submit_timeout: Duration,
 }
 
 impl DriverConfig {
@@ -67,6 +69,10 @@ impl DriverConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
+        let submit_timeout_secs = std::env::var("BLINK_SUBMIT_TIMEOUT_S")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
 
         Self {
             program,
@@ -80,6 +86,7 @@ impl DriverConfig {
             poll_interval: Duration::from_millis(250),
             exit_timeout: Duration::from_secs(3),
             settle_timeout: Duration::from_secs(settle_timeout_secs),
+            submit_timeout: Duration::from_secs(submit_timeout_secs),
         }
     }
 }
@@ -147,6 +154,7 @@ impl FreebuffBackend {
     }
 
     /// Wait for the pty to reach Busy state.
+    #[allow(dead_code)]
     async fn wait_for_busy(&self, pty: &Pty, timeout: Duration) -> Result<()> {
         pty.wait_for(
             |s| matches!(classify(&s.rows), ScreenState::Busy { .. }),
@@ -458,32 +466,56 @@ impl FreebuffBackend {
         info!("prompt: sending Enter");
         pty.key(Key::Enter).await?;
 
-        // Wait for Busy (max 5s)
-        match self.wait_for_busy(pty, Duration::from_secs(5)).await {
-            Ok(_) => {
-                info!("prompt: freebuff went busy");
-                Ok(())
-            }
-            Err(_) => {
-                // Check if text or chip is still in input box - might need second Enter
-                let snap = pty.screen();
-                let text_still_visible = input_box_text(&snap.rows)
-                    .map(|t| !t.is_empty() && !t.contains("Enter a coding task"))
-                    .unwrap_or(false);
-                let chip_still_visible = pasted_chip_chars(&snap.rows).is_some();
-                if text_still_visible || chip_still_visible {
-                    info!("prompt: still not busy, sending Enter again");
-                    pty.key(Key::Enter).await?;
-                    self.wait_for_busy(pty, Duration::from_secs(5)).await?;
-                    Ok(())
-                } else {
-                    Err(anyhow!(
-                        "freebuff did not go busy after prompt; box showed neither text nor pasted-text chip; screen:\n{}",
-                        snap.text()
-                    ))
-                }
+        // Wait for freebuff to go Busy, or for the paste to be consumed (input
+        // box back to the placeholder and no pasted-text chip), up to submit_timeout.
+        let submit_timeout = self.cfg.submit_timeout;
+        let pred = move |s: &ScreenSnapshot| {
+            matches!(classify(&s.rows), ScreenState::Busy { .. })
+                || (!input_box_text(&s.rows)
+                    .map(|t| t.contains(&preview))
+                    .unwrap_or(false)
+                    && pasted_chip_chars(&s.rows).is_none()
+                    && input_box_is_empty(&s.rows))
+        };
+
+        // Short window for the TUI to consume the paste on its own; if the text
+        // or chip is still visible after 2s, nudge with one more Enter.
+        let pred_first = pred.clone();
+        if pty
+            .wait_for(move |s| pred_first(s), Duration::from_secs(2))
+            .await
+            .is_err()
+        {
+            let last = pty.screen();
+            let text_still_visible = input_box_text(&last.rows)
+                .map(|t| !t.is_empty() && !t.contains("Enter a coding task"))
+                .unwrap_or(false);
+            let chip_still_visible = pasted_chip_chars(&last.rows).is_some();
+            if text_still_visible || chip_still_visible {
+                info!("prompt: still not busy, sending Enter again");
+                pty.key(Key::Enter).await?;
             }
         }
+        let resolved = match pty
+            .wait_for(move |s| pred(s), submit_timeout - Duration::from_secs(2))
+            .await
+        {
+            Ok(snap) => snap,
+            Err(_) => {
+                let snap = pty.screen();
+                return Err(anyhow!(
+                    "freebuff neither went busy nor consumed the prompt within {:?}; screen:\n{}",
+                    submit_timeout,
+                    snap.text()
+                ));
+            }
+        };
+        if matches!(classify(&resolved.rows), ScreenState::Busy { .. }) {
+            info!("prompt: freebuff went busy");
+        } else {
+            info!("prompt: paste consumed; proceeding to the turn loop");
+        }
+        Ok(())
     }
 }
 
@@ -905,6 +937,7 @@ mod tests {
         cfg.turn_timeout = Duration::from_secs(30);
         cfg.poll_interval = Duration::from_millis(100);
         cfg.exit_timeout = Duration::from_secs(2);
+        cfg.submit_timeout = Duration::from_secs(10);
         cfg
     }
 
