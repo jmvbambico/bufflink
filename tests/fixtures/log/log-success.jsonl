@@ -1,0 +1,6 @@
+{"level":30,"timestamp":"2026-09-19T14:37:47.705Z","pid":88366,"hostname":"mac","msg":"[send-message] Sending message with sdk run config","data":{}}
+{"level":30,"timestamp":"2026-09-19T14:37:48.000Z","pid":88366,"hostname":"mac","msg":"Start agent GLM 5.3 Flash step 1","data":{}}
+{"level":30,"timestamp":"2026-09-19T14:37:50.000Z","pid":88366,"hostname":"mac","msg":"End agent GLM 5.3 Flash step 1","data":{}}
+{"level":30,"timestamp":"2026-09-19T14:37:52.000Z","pid":88366,"hostname":"mac","msg":"Start agent GLM 5.3 Flash step 2","data":{}}
+{"level":30,"timestamp":"2026-09-19T14:37:54.000Z","pid":88366,"hostname":"mac","msg":"End agent GLM 5.3 Flash step 2","data":{}}
+{"level":30,"timestamp":"2026-09-19T14:37:56.000Z","pid":88366,"hostname":"mac","msg":"Main prompt finished","data":{"outputType":"lastMessage"}}

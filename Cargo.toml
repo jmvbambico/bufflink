@@ -1,0 +1,38 @@
+[package]
+name = "bufflink"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "ACP bridge for the freebuff CLI"
+
+[[bin]]
+name = "blink"
+path = "src/main.rs"
+
+[lib]
+name = "bufflink"
+path = "src/lib.rs"
+
+[dependencies]
+# tokio: async runtime for the PTY driver, stdout/stderr IO, timers, signals,
+# child process management and the stdio JSON-RPC loop.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "process", "signal", "fs"] }
+# serde: derive for the ACP JSON-RPC request/response structs.
+serde = { version = "1", features = ["derive"] }
+# serde_json: newline-delimited JSON-RPC framing on stdio.
+serde_json = "1"
+# anyhow: ergonomic error propagation for the CLI, including into ACP errors.
+anyhow = "1"
+# pty-process: spawn freebuff in a pseudo-terminal and resize/read its screen.
+pty-process = { version = "0.5", features = ["async"] }
+# vt100: parse the PTY byte stream into a cell grid / alternate screen model.
+vt100 = "0.16"
+# tracing: structured logs on stderr while stdout stays reserved for JSON-RPC.
+tracing = "0.1"
+# tracing-subscriber: EnvFilter-backed stderr logging initialisation in main.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# libc: kill(2) on the child's process group — the freebuff launcher forwards no
+# signals to the real binary. Already a transitive dependency; adds no crate to
+# the tree.
+libc = "0.2"

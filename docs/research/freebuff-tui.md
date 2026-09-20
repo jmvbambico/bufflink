@@ -149,3 +149,22 @@ tmux send-keys -t probe -l '/exit'; tmux send-keys -t probe Enter
 ```
 Never dismiss ads except by waiting; never modify `~/.config/manicode`;
 never choose `Take over`.
+
+## Learned from live bridge runs (2026-09-20, three launches, blink e2e)
+
+- `chat-messages.json` is written **once, at the end of the turn** (~970 KB
+  with tool definitions), ~13 ms **after** `Main prompt finished` lands in
+  `log.jsonl`. The bridge waits for the last AI message to show
+  `isComplete: true` before its final flush (`BLINK_SETTLE_TIMEOUT_S`, 5 s).
+  Consequence: nothing streams while freebuff is thinking; reasoning + reply
+  arrive together at completion. Long turns therefore sit silent against
+  omnigent's 300 s idle timer (`HARNESS_ACP_PROMPT_TIMEOUT_S`).
+- The chat directory is created at **launch** (splash accept), before the
+  first prompt; `chat-messages.json` appears only after the first turn.
+- Typing `/exit` + Enter from the bridge did **not** exit freebuff within 3 s
+  in any of the three runs (it did in the manual tmux probe). Suspect the
+  slash-autocomplete popup swallows the first Enter. The bridge falls back to
+  SIGTERM/SIGKILL on the child's **process group**: the npm launcher forwards
+  no signals, and the real Bun binary survives SIGHUP from the closing PTY.
+- Splash → Idle takes ~2.3 s; a trivial turn 3–7 s; Esc cancel is honoured
+  in < 0.4 s and the next prompt works in the same session.

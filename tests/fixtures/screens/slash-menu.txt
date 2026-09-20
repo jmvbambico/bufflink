@@ -1,0 +1,40 @@
+  poll-1.txt … poll-45.txt (mostly 2.7K each)                                                                          
+  ready-120-escape.txt, startup-120-escape.txt, startup-120-plain.txt                                                  
+  turn1-5s-escape.txt, turn1-complete-escape.txt                                                                       
+  turn2-1.txt … turn2-12.txt, turn2-final-escape.txt                                                                   
+                                                                                                                       
+  Exit code 0. The directory looks like a set of session-capture/probe artifacts from earlier testing, plus the        
+  probe.txt  I just created.                                                                                           
+                                                                                                        ⎘ • 14s • △▽   
+                                                                                                                       
+   [09:41 PM]                                                                                                          
+   Count from 1 to 400, one number per line, with a short comment after each. ⎘                                        
+                                                                                                                       
+  ▸ Thinking                                                                                                           
+                                                                                                              ⎘ • △▽   
+                                                                                                                       
+   [09:41 PM]                                                                                                          
+   Count from 1 to 400, one number per line, with a short comment after each. ⎘                                        █
+                                                                                                                       █
+  [response interrupted]                                                                                               █
+                                                                                                              ⎘ • △▽   █
+ GLM 5.3 Flash · 56m left · 20.7K (2%)                                                                   ✕ End session
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  /help          Display keyboard shortcuts and tips                                                                  │
+│  /diagnostics   Show local CLI resource usage and terminal tool process IDs                                          │
+│  /interview     AI asks a series of questions to flesh out request into a spec                                       │
+│  /plan          Create a plan for how to implement a request                                                         │
+│  /review        Review code changes                                                                                  │
+│  /queue         Edit, reorder, or delete the messages waiting to be sent                                             │
+│  /new           Clear the conversation history and start a new chat                                                  │
+│  /history       Browse and resume past conversations                                                                 │
+│  /copy          Copy the full conversation (messages + tool results) to the clipboard                                │
+│  /export        Write the full conversation to a file (.md, or .json for raw messages)                               │
+│  /feedback      Share general feedback about Freebuff                                                                │
+│  /bash          Enter bash mode ("!" at beginning enters bash mode)                                                  │
+│  /theme:toggle  Toggle between light and dark mode                                                                   │
+│  /byok          Manage direct OpenRouter or OpenAI-compatible inference                                              │
+│  /reasoning     Set how hard the current model thinks (low / high / max)                                             │
+│                                                                                                                      │
+│  /▍                                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
