@@ -31,12 +31,47 @@ runs any command that speaks ACP. bufflink is that command.
 
 ## Development workflow
 
+### Git flow
+
+Two long-lived branches, one direction of travel:
+
+```
+feature/<slug> ──PR──▶ dev ──promotion (human, merge commit)──▶ main ──tag──▶ release
+```
+
+- **`main`** is protected and never touched by an agent. It only ever
+  receives promotions from `dev`, done by the human with a merge commit
+  (`git merge --no-ff dev`). Every commit on `main` is releasable.
+- **`dev`** is the integration base. Work reaches it only through a PR from
+  a task or integration branch, after the full gate is green and the
+  cross-vendor review has reported.
+- **`feature/<slug>`** is one task. **`integration/<goal>`** batches several
+  tasks before one PR. **`release/vX.Y.Z`** carries only the version bump
+  (`Cargo.toml`, `Cargo.lock`) and, when needed, a changelog line; it is a
+  PR into `dev` like any other. **`hotfix/<slug>`** branches from `main`,
+  PRs into `main` (human merges), and is merged back into `dev` afterwards.
+
+### Releases
+
+Releases are cut from **`main`**, never from `dev`:
+
+1. `release/vX.Y.Z` merged into `dev` (version in `Cargo.toml` == the tag
+   that follows).
+2. Human promotes `dev` → `main`.
+3. The annotated tag `vX.Y.Z` is created on the **`main`** merge commit and
+   pushed; the GitHub release is created from that tag with the release
+   binary attached (`agentInfo.version` in `initialize` must report X.Y.Z).
+
+A tag that does not point at a commit on `main` is a mistake, not a release.
+Agents may prepare the release branch and, once the tag exists on `main`,
+build and publish the release; they never create a tag on `dev`.
+
 ### Branching
 
-Integration base `dev`; task branches `feature/<slug>`; `main` is protected
-and never touched by an agent. There is a remote (GitHub) only once the human
-creates it; until then the deliverable is a local `integration/<goal>` branch
-with the full gate green and the reviewer's verdict reported in chat.
+Task branches `feature/<slug>` are cut from `dev`. The remote is GitHub
+(`jmvbambico/bufflink`); the deliverable of an orchestrated run is a PR into
+`dev` with the full gate green and the reviewer's verdict in the PR body
+(`cross-vendor-review: passed` / `degraded-review`).
 
 ### Worktrees
 
