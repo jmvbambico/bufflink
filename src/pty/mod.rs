@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::io::AsyncWriteExt;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Configuration for spawning a child inside a new pseudo-terminal.
 #[derive(Debug, Clone)]
@@ -124,6 +124,7 @@ pub struct Pty {
     /// once the child has been reaped, so we remember the pid here to keep the
     /// process-group kill working in that window.
     spawn_pid: u32,
+    group_cleaned: AtomicBool,
     /// Guarded because `tokio::process::Child` isn't `Sync`.
     child: Mutex<Option<tokio::process::Child>>,
 }
@@ -188,6 +189,7 @@ impl Pty {
                     return Ok(Pty {
                         shared,
                         spawn_pid,
+                        group_cleaned: AtomicBool::new(false),
                         child: Mutex::new(Some(child)),
                     });
                 }
@@ -321,7 +323,17 @@ impl Pty {
     pub fn try_wait(&self) -> Result<Option<ExitStatus>> {
         let mut guard = self.child.lock().unwrap();
         match guard.as_mut() {
-            Some(child) => child.try_wait().map_err(Into::into),
+            Some(child) => {
+                let result = child.try_wait().map_err(anyhow::Error::from)?;
+                if result.is_some() && !self.group_cleaned.load(Ordering::SeqCst) {
+                    self.signal_group_once(libc::SIGKILL);
+                    info!(
+                        spawn_pid = self.spawn_pid,
+                        "child exited; signalled its process group once"
+                    );
+                }
+                Ok(result)
+            }
             None => Ok(None),
         }
     }
@@ -346,69 +358,39 @@ impl Pty {
     /// equals its pid. freebuff's launcher spawns the real Bun binary as a
     /// grandchild and forwards no signals, so signalling only the direct
     /// child leaves the grandchild alive and holding the single-instance
-    /// lock. Sequence: SIGTERM the group, poll `try_wait` for up to 1 s, then
-    /// SIGKILL the group if anything is still alive, then reap.
+    /// lock. Sequence: SIGTERM the group via `signal_group_once`, poll
+    /// `try_wait` for up to 1 s, then SIGKILL the group via
+    /// `signal_group_once`, reap. If the child has already been reaped
+    /// this is a no-op (the group was signalled exactly once at reap time).
     pub async fn kill(&self) -> Result<()> {
-        // Signal the child's process group, identified by the pid captured at
-        // spawn time. `Child::id()` is `None` once the child has been reaped by
-        // `wait_exit`/`try_wait`, which would skip the whole-group kill and
-        // leave an orphaned grandchild (e.g. the real freebuff binary launched
-        // by the npm wrapper) alive and holding the single-instance lock. The
-        // process group id outlives its leader as long as any member lives, and
-        // ESRCH on a vanished group is already tolerated below.
-        let pgid = group_target(Some(self.spawn_pid));
-        if let Some(pgid) = pgid {
-            // SIGTERM the whole process group first.
-            let term_rc = unsafe { libc::kill(-pgid, libc::SIGTERM) };
-            if term_rc < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::ESRCH) {
-                    warn!(
-                        pgid,
-                        errno = err.raw_os_error(),
-                        "SIGTERM on process group failed; falling back to Child::kill"
-                    );
-                }
-            }
-
-            // Poll for up to 1 s for the group to die from SIGTERM.
-            let deadline = std::time::Instant::now() + Duration::from_secs(1);
-            let mut exited = false;
-            while std::time::Instant::now() < deadline {
-                if self.try_wait()?.is_some() {
-                    exited = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-
-            if !exited {
-                // SIGKILL the group.
-                let kill_rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-                if kill_rc < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() != Some(libc::ESRCH) {
-                        warn!(
-                            pgid,
-                            errno = err.raw_os_error(),
-                            "SIGKILL on process group failed; falling back to Child::kill"
-                        );
-                    }
-                }
-            }
+        if self.try_wait()?.is_some() {
+            return Ok(());
         }
 
-        // Fall back to Child::kill for any direct child still alive.
+        self.signal_group_once(libc::SIGTERM);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut exited = false;
+        while std::time::Instant::now() < deadline {
+            if self.try_wait()?.is_some() {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        if !exited {
+            self.signal_group_once(libc::SIGKILL);
+        }
+
         let mut child = {
             let mut guard = self.child.lock().unwrap();
             match guard.take() {
                 Some(child) => child,
                 None => return Ok(()),
             }
-        }; // guard dropped here, before the await below.
+        };
         child.kill().await.context("failed to kill child")?;
-        // Put the (dead) child back so `pid()`/`try_wait()` still work and can
-        // reap it.
         *self.child.lock().unwrap() = Some(child);
         Ok(())
     }
@@ -421,18 +403,12 @@ impl Pty {
             .context("failed to resize pty")
     }
 
-    /// The child's OS pid, so long as a child is still tracked (i.e. not taken
-    /// out of its slot by `kill`). The pid is captured at spawn time, so it
-    /// remains available **after** the child has been reaped via
-    /// `try_wait`/`wait` — which clears `Child::id()` — and is `None` only
-    /// while `kill` has temporarily removed the child.
+    /// The child's OS pid. Returns `Child::id()` which is `None` once
+    /// the child has been reaped via `try_wait`/`wait`. Use `spawn_pid()`
+    /// for the stable identity captured at spawn time.
     pub fn pid(&self) -> Option<u32> {
         let child = self.child.lock().unwrap();
-        if child.is_some() {
-            Some(self.spawn_pid)
-        } else {
-            None
-        }
+        child.as_ref().and_then(|c| c.id())
     }
 
     /// The pid captured at spawn time. Always available for addressing the
@@ -440,6 +416,40 @@ impl Pty {
     /// `pid()` may have already returned `None`.
     pub fn spawn_pid(&self) -> u32 {
         self.spawn_pid
+    }
+
+    /// Whether `signal_group_once(SIGKILL)` has already fired (at reap
+    /// time or during `kill`).
+    pub fn group_cleaned(&self) -> bool {
+        self.group_cleaned.load(Ordering::SeqCst)
+    }
+
+    /// Send `sig` to the child's process group exactly once: if
+    /// `group_cleaned` is already true this is a no-op; otherwise
+    /// `kill(-(spawn_pid as pid_t), sig)` is sent (ESRCH ignored, other
+    /// errors warn`ed`). For `SIGKILL` sets `group_cleaned = true`
+    /// afterwards. `SIGTERM` alone does not set the flag.
+    fn signal_group_once(&self, sig: libc::c_int) {
+        if self.group_cleaned.load(Ordering::SeqCst) {
+            return;
+        }
+        let pgid = group_target(Some(self.spawn_pid));
+        if let Some(pgid) = pgid {
+            let rc = unsafe { libc::kill(-pgid, sig) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    warn!(
+                        pgid,
+                        errno = err.raw_os_error(),
+                        "signal process group failed"
+                    );
+                }
+            }
+        }
+        if sig == libc::SIGKILL {
+            self.group_cleaned.store(true, Ordering::SeqCst);
+        }
     }
 }
 

@@ -208,10 +208,11 @@ async fn kill_terminates_grandchild() {
     }
 }
 
-/// After the child has exited and been reaped, `kill()` must still signal the
-/// whole process group so an orphaned grandchild dies. `pid()` is `None` once
-/// the child is reaped (`Child::id()` clears after `wait`/`try_wait`), so the
-/// group id comes from the spawn pid captured at spawn time.
+/// After the child has exited and been reaped, the process group
+/// is signalled exactly once at reap time (SIGKILL), killing any
+/// orphaned grandchild. `kill()` is then a no-op. `pid()` is `None`
+/// once the child is reaped (`Child::id()` clears), so the group id
+/// comes from the spawn pid captured at spawn time.
 #[tokio::test]
 async fn kill_after_child_exit_still_kills_group() {
     // The parent shell exits immediately, orphaning the inner `sleep 30`
@@ -230,15 +231,8 @@ async fn kill_after_child_exit_still_kills_group() {
         .expect("wait_exit");
     assert!(status.is_some(), "child should have exited on its own");
 
-    // Even though the child is now reaped, kill() must still reach the orphan
-    // grandchild via the spawn pid's process group.
-    let killed = tokio::time::timeout(Duration::from_secs(2), pty.kill())
-        .await
-        .expect("kill() returns within 2s");
-    killed.expect("kill ok");
-
-    // `pgrep -g <spawn_pid>` matches only the child's process group, which
-    // persists as long as the grandchild lives. It must be empty.
+    // Reap-time SIGKILL killed the orphan grandchild. Do NOT call
+    // kill(); verify pgrep -g <spawn_pid> is empty on its own.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         let out = std::process::Command::new("pgrep")
@@ -248,7 +242,7 @@ async fn kill_after_child_exit_still_kills_group() {
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
             panic!(
-                "grandchild survived kill() after child exit; pgrep -g {} returned:\n{}",
+                "grandchild survived reap-time cleanup; pgrep -g {} returned:\n{}",
                 spawn_pid, stdout
             );
         }
@@ -257,6 +251,33 @@ async fn kill_after_child_exit_still_kills_group() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// After the child has been reaped, `kill()` must be a no-op and
+/// must signal nothing further. `group_cleaned` is true because
+/// the reap-time `try_wait` fired `signal_group_once(SIGKILL)`.
+#[tokio::test]
+async fn kill_after_reap_is_noop_and_signals_nothing() {
+    let pty = Pty::spawn(cfg("exit 0", 80, 24)).await.expect("spawn");
+
+    let status = pty
+        .wait_exit(Duration::from_secs(2))
+        .await
+        .expect("wait_exit");
+    assert!(status.is_some(), "child should have exited");
+
+    assert!(
+        pty.group_cleaned(),
+        "group_cleaned should be true after reap-time SIGKILL"
+    );
+
+    // kill() after reap must be a no-op, returning Ok both times.
+    pty.kill()
+        .await
+        .expect("first kill() after reap should be Ok");
+    pty.kill()
+        .await
+        .expect("second kill() after reap should be Ok");
 }
 
 #[tokio::test]
