@@ -335,11 +335,57 @@ impl Pty {
         }
     }
 
-    /// Terminate the child. Intended as "SIGTERM, then SIGKILL after 1 s", but
-    /// because neither `nix` nor `libc` is usable without editing `Cargo.toml`
-    /// (forbidden by the contract), this sends SIGKILL via
-    /// [`tokio::process::Child::kill`] directly (see report).
+    /// Terminate the child and its whole process group. The child is spawned as
+    /// a session leader by pty-process (`setsid`), so its process group id
+    /// equals its pid. freebuff's launcher spawns the real Bun binary as a
+    /// grandchild and forwards no signals, so signalling only the direct
+    /// child leaves the grandchild alive and holding the single-instance
+    /// lock. Sequence: SIGTERM the group, poll `try_wait` for up to 1 s, then
+    /// SIGKILL the group if anything is still alive, then reap.
     pub async fn kill(&self) -> Result<()> {
+        let pid = self.pid();
+        if let Some(pid) = pid {
+            // SIGTERM the whole process group first.
+            let term_rc = unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+            if term_rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    warn!(
+                        pid,
+                        errno = err.raw_os_error(),
+                        "SIGTERM on process group failed; falling back to Child::kill"
+                    );
+                }
+            }
+
+            // Poll for up to 1 s for the group to die from SIGTERM.
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let mut exited = false;
+            while std::time::Instant::now() < deadline {
+                if self.try_wait()?.is_some() {
+                    exited = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            if !exited {
+                // SIGKILL the group.
+                let kill_rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                if kill_rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::ESRCH) {
+                        warn!(
+                            pid,
+                            errno = err.raw_os_error(),
+                            "SIGKILL on process group failed; falling back to Child::kill"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Fall back to Child::kill for any direct child still alive.
         let mut child = {
             let mut guard = self.child.lock().unwrap();
             match guard.take() {

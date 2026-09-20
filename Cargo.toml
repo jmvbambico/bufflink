@@ -32,3 +32,7 @@ vt100 = "0.16"
 tracing = "0.1"
 # tracing-subscriber: EnvFilter-backed stderr logging initialisation in main.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# libc: kill(2) on the child's process group — the freebuff launcher forwards no
+# signals to the real binary. Already a transitive dependency; adds no crate to
+# the tree.
+libc = "0.2"

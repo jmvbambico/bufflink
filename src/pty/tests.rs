@@ -149,6 +149,65 @@ async fn kill_terminates_child() {
     assert!(pty.try_wait().expect("try_wait").is_some());
 }
 
+/// The child is spawned as a session leader, so its process group id equals
+/// its pid. A grandchild started by the shell lives in the same group.
+/// `kill()` must terminate the whole group, not just the direct child.
+#[tokio::test]
+async fn kill_terminates_grandchild() {
+    let pty = Pty::spawn(cfg("sh -c 'sh -c \"exec sleep 30\" & sleep 30'", 80, 24))
+        .await
+        .expect("spawn");
+
+    // Let the grandchild fork and enter its sleep.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let pid = pty
+        .pid()
+        .expect("child pid should be available before kill");
+    assert!(pid > 0);
+
+    let killed = tokio::time::timeout(Duration::from_secs(2), pty.kill())
+        .await
+        .expect("kill() returns within 2s");
+    killed.expect("kill ok");
+
+    // Poll try_wait until the direct child has been reaped.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if pty.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child not reaped after kill within 2s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The grandchild must be gone too. `pgrep -g <pid>` matches only the
+    // child's process group, which is exact — no false positives from other
+    // `sleep 30` processes anywhere on the host.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let out = std::process::Command::new("pgrep")
+            .args(["-g", &pid.to_string()])
+            .output()
+            .expect("pgrep should run");
+        if out.status.success() {
+            // Non-empty: something is still alive in the group.
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            panic!(
+                "grandchild survived kill(); pgrep -g {} returned:\n{}",
+                pid, stdout
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn wait_for_timeout_includes_screen_text() {
     let pty = Pty::spawn(cfg("printf 'abc\\n'; sleep 0.5", 80, 24))

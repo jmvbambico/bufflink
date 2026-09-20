@@ -724,7 +724,11 @@ impl Backend for FreebuffBackend {
             let _ = pty.type_text(EXIT_COMMAND).await;
             let _ = pty.key(Key::Enter).await;
 
-            // Wait for exit
+            // Wait for exit, then always kill the whole process group.
+            // `pty.kill()` is a no-op once the child is reaped, but the
+            // launcher forwards no signals to the real binary, so a clean
+            // exit of the launcher script can leave an orphan grandchild
+            // alive and holding the single-instance lock.
             match pty.wait_exit(this.cfg.exit_timeout).await {
                 Ok(Some(status)) => {
                     info!(?status, "shutdown: child exited cleanly");
@@ -734,13 +738,12 @@ impl Backend for FreebuffBackend {
                         "shutdown: child did not exit within {:?}, killing",
                         this.cfg.exit_timeout
                     );
-                    let _ = pty.kill().await;
                 }
                 Err(e) => {
                     error!(error = %e, "shutdown: error waiting for exit");
-                    let _ = pty.kill().await;
                 }
             }
+            let _ = pty.kill().await;
 
             info!("shutdown: complete");
         }
@@ -1167,5 +1170,53 @@ mod tests {
         assert!(saw_message_with_pong, "missing AgentMessageChunk with PONG");
 
         backend.shutdown().await;
+    }
+
+    /// freebuff's launcher spawns the real Bun binary as a grandchild and
+    /// forwards no signals to it. When the launcher script exits on `/exit`,
+    /// the orphan grandchild survives and keeps the single-instance lock, so
+    /// `shutdown()` must kill the whole process group even on a clean exit.
+    #[tokio::test]
+    async fn t9_shutdown_kills_grandchild() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("grandchild"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let _session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+
+        // Capture the child pid before shutdown takes the session.
+        let child_pid = {
+            let guard = backend.session.lock().await;
+            guard.as_ref().unwrap().pty.pid().unwrap_or(0)
+        };
+        assert!(child_pid > 0, "child pid should be available");
+
+        // Shutdown: the fake exits cleanly on /exit, but must still kill the
+        // orphan grandchild (`sh -c 'exec sleep 60' &`).
+        let shutdown_fut = backend.shutdown();
+        let result = timeout(Duration::from_secs(5), shutdown_fut).await;
+        assert!(result.is_ok(), "shutdown timed out");
+
+        // The grandchild must be gone. `pgrep -g <pid>` matches only the
+        // child's process group, which is exact.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let out = std::process::Command::new("pgrep")
+                .args(["-g", &child_pid.to_string()])
+                .output()
+                .expect("pgrep should run");
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                panic!(
+                    "grandchild survived shutdown; pgrep -g {} returned:\n{}",
+                    child_pid, stdout
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

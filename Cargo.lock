@@ -34,6 +34,7 @@ name = "bufflink"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "pty-process",
  "serde",
  "serde_json",

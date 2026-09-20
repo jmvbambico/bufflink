@@ -236,6 +236,13 @@ case "${FAKE_FREEBUFF_MODE:-}" in
         # Block forever
         while true; do sleep 1; done
         ;;
+    grandchild)
+        # Behaves like normal mode, but right after printing the idle screen
+        # for the first time it spawns an orphan grandchild
+        # (`sh -c 'exec sleep 60' &`) that the launcher forwards no signals
+        # to. The idle loop below (after `esac`) handles the rest.
+        GRANDCHILD_SPAWNED=0
+        ;;
     unparsable)
         print_splash
         read -r _
@@ -307,6 +314,13 @@ read -r _
 idle_prompt() {
     printf '\033[2J\033[H'
     print_idle
+    if [ "$FAKE_FREEBUFF_MODE" = "grandchild" ] && [ "$GRANDCHILD_SPAWNED" -eq 0 ]; then
+        # Spawn an orphan grandchild in the same session/process group.
+        # The launcher forwards no signals to it, so only a group kill
+        # reaches it.
+        sh -c 'exec sleep 60' &
+        GRANDCHILD_SPAWNED=1
+    fi
     printf '\033[2A\033[4C'
     read -r line || return 1
     printf '\n\n'
