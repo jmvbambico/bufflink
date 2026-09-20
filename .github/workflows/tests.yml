@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --lib --bins
+      # The e2e target compiles and runs its non-ignored smoke test only; the
+      # ignored test launches the real freebuff (single-instance, costs quota)
+      # and is run by hand on the integration branch — see AGENTS.md.
+      - run: cargo test --test e2e
