@@ -1402,4 +1402,71 @@ mod tests {
 
         backend.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn t12_slow_busy_prompt_still_completes() {
+        // A prompt in slow-busy mode: the fake shows the placeholder box (the
+        // paste is 'consumed') for 6 s before going busy. The prompt must still
+        // complete EndTurn, passing through the 'paste consumed' signal.
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("slow-busy"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+
+        let (result, updates) = run_prompt_collect(&backend, &session_id, "Reply PONG").await;
+
+        assert!(result.is_ok(), "prompt failed: {:?}", result.err());
+        assert_eq!(result.unwrap(), StopReason::EndTurn);
+
+        // Check update sequence: AgentThoughtChunk, ToolCall, ToolCallUpdate, AgentMessageChunk with PONG
+        assert!(!updates.is_empty(), "no updates streamed");
+
+        let mut saw_thought = false;
+        let mut saw_tool_call = false;
+        let mut saw_tool_update = false;
+        let mut saw_message_with_pong = false;
+
+        for u in &updates {
+            match u {
+                SessionUpdate::AgentThoughtChunk { .. } => saw_thought = true,
+                SessionUpdate::ToolCall {
+                    tool_call_id,
+                    title,
+                    kind,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(*status, ToolCallStatus::InProgress);
+                    assert!(!tool_call_id.is_empty());
+                    assert!(title.contains("run_terminal_command"));
+                    assert_eq!(*kind, "execute");
+                    saw_tool_call = true;
+                }
+                SessionUpdate::ToolCallUpdate {
+                    tool_call_id,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(*status, ToolCallStatus::Completed);
+                    assert!(!tool_call_id.is_empty());
+                    saw_tool_update = true;
+                }
+                SessionUpdate::AgentMessageChunk { content } => {
+                    let TextContent::Text { text } = content;
+                    if text.contains("PONG") {
+                        saw_message_with_pong = true;
+                    }
+                }
+            }
+        }
+
+        assert!(saw_thought, "missing AgentThoughtChunk");
+        assert!(saw_tool_call, "missing ToolCall");
+        assert!(saw_tool_update, "missing ToolCallUpdate");
+        assert!(saw_message_with_pong, "missing AgentMessageChunk with PONG");
+
+        backend.shutdown().await;
+    }
 }

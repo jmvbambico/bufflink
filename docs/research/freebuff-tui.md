@@ -38,7 +38,7 @@ usable as parser fixtures in `captures/`.
 | 1b Freebucks gate | inside the model box: `Not enough Freebucks — … Enter opens plans.` | **stop**: surface an ACP error; never press Enter (opens purchase). |
 | 1c already running | `Freebuff is already running` / `Only one freebuff instance is allowed at a time.` / buttons `Take over` (default, highlighted) `Exit` | **stop**: choose `Exit` (→ arrow then Enter, or just report and kill) and surface an ACP error naming the owner pid from `freebuff-instance-owner.json`. Never take over. |
 | 2 idle | `Freebuff will run commands on your behalf to help you build.`, `Directory <cwd>`, status `GLM 5.3 Flash · 59m left · 16.4K (2%)` + `✕ End session` on the right, bordered input box with `▍Enter a coding task or / for commands` | ready |
-| 3 busy | status bar becomes `thinking... <N>s  ■ Esc` (or `working... <N>s  ■ Esc`); content shows `• Thinking` (or `▸ Thinking` collapsed), tool lines like `$ echo hello` / `• Create probe.txt`, then the reply, then `⌘ • <N>s • △▽` | poll transcript on disk |
+| 3 busy | status bar becomes `thinking... <N>s  ■ Esc` (or `working... <N>s  ■ Esc`); content shows `• Thinking` (or `▸ Thinking` collapsed), tool lines like `$ echo hello` / `• Create probe.txt`, then the reply, then `⌘ • <N>s • △▽`. The elapsed counter is absent in the first instant (` working...   ■ Esc`); after a large paste it can take >5 s to appear. | poll transcript on disk |
 | 4 kicked out | `Another freebuff instance took over this account.` / `Only one CLI per account can be active at a time.` / `Close the other instance, then restart freebuff here.` / `Press Ctrl+C to exit.` | surface ACP error; Ctrl-C exits it |
 
 Idle vs busy: busy **iff** the status bar matches `(thinking|working)\.\.\. \d+s`;
