@@ -175,6 +175,7 @@ fn freebuff_processes() -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn blink_initialize_without_session_does_not_spawn_freebuff() {
+    let before = freebuff_processes();
     let mut client = AcpClient::spawn().await.unwrap();
     let workdir = client.workdir.clone();
     let (resp, _updates) = client
@@ -194,13 +195,14 @@ async fn blink_initialize_without_session_does_not_spawn_freebuff() {
         .unwrap();
     assert_eq!(resp["result"]["protocolVersion"], 1);
     assert_eq!(resp["result"]["agentInfo"]["name"], "blink");
+    let after = freebuff_processes();
+    assert_eq!(after, before, "pgrep set changed after initialize");
     client.close_stdin().await;
     let status = client.wait_exit(Duration::from_secs(5)).await;
     assert!(status.is_some());
     assert!(status.unwrap().success());
-    let before = freebuff_processes();
-    let after = freebuff_processes();
-    assert_eq!(after, before, "pgrep set changed after initialize");
+    let after_exit = freebuff_processes();
+    assert_eq!(after_exit, before, "pgrep set changed after exit");
     let _ = std::fs::remove_dir_all(&workdir);
 }
 
