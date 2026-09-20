@@ -285,6 +285,10 @@ case "${FAKE_FREEBUFF_MODE:-}" in
     chip)
         # Normal flow; idle_prompt shows the chip and reads without echo.
         ;;
+    slow-busy)
+        # Normal flow; idle_prompt shows the placeholder (paste consumed) for
+        # 6 s before going busy.
+        ;;
     unparsable)
         print_splash
         read -r _
@@ -380,6 +384,13 @@ idle_prompt() {
     printf '\n\n'
     ESC=$(printf '\033')
     line=$(printf '%s' "$line" | sed -e "s/${ESC}\[200~//g" -e "s/${ESC}\[201~//g")
+    if [ "$FAKE_FREEBUFF_MODE" = "slow-busy" ]; then
+        # Simulate freebuff consuming a large paste: the input box falls back
+        # to the placeholder (paste is 'consumed') and busy is slow to appear.
+        printf '\033[2J\033[H'
+        print_idle
+        sleep 6
+    fi
     line_len=${#line}
     if [ "$line_len" -gt 1000 ]; then
         formatted=$(format_number "$line_len")

@@ -21,11 +21,11 @@ use crate::freebuff::chats::{
 };
 use crate::freebuff::log::{outcome, parse_log_line, LogEvent, TurnOutcome};
 use crate::freebuff::screen::{
-    classify, input_box_text, pasted_chip_chars, ScreenState, SPLASH_ACCEPT_KEY,
+    classify, input_box_is_empty, input_box_text, pasted_chip_chars, ScreenState, SPLASH_ACCEPT_KEY,
 };
 use crate::freebuff::transcript::{diff, parse_messages, Block, Cursor, Delta, Message};
 use crate::freebuff::{CANCEL_KEY, EXIT_COMMAND};
-use crate::pty::{Key, Pty, PtyConfig};
+use crate::pty::{Key, Pty, PtyConfig, ScreenSnapshot};
 
 /// Configuration for the freebuff driver.
 #[derive(Debug, Clone)]
@@ -52,6 +52,8 @@ pub struct DriverConfig {
     pub exit_timeout: Duration,
     /// Time to wait for transcript to settle after turn log event (default: 5s, env: BLINK_SETTLE_TIMEOUT_S).
     pub settle_timeout: Duration,
+    /// Time to wait after Enter for freebuff to go busy or consume the paste (default: 30s, env: BLINK_SUBMIT_TIMEOUT_S).
+    pub submit_timeout: Duration,
 }
 
 impl DriverConfig {
@@ -67,6 +69,8 @@ impl DriverConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
+        let submit_timeout =
+            parse_submit_timeout(std::env::var("BLINK_SUBMIT_TIMEOUT_S").ok().as_deref());
 
         Self {
             program,
@@ -80,8 +84,30 @@ impl DriverConfig {
             poll_interval: Duration::from_millis(250),
             exit_timeout: Duration::from_secs(3),
             settle_timeout: Duration::from_secs(settle_timeout_secs),
+            submit_timeout,
         }
     }
+}
+
+/// Parse `BLINK_SUBMIT_TIMEOUT_S`. Default 30 s when the variable is absent or
+/// unparseable; floored at 2 s so the 2 s nudge remainder never underflows.
+fn parse_submit_timeout(raw: Option<&str>) -> Duration {
+    let secs = match raw.and_then(|s| s.parse::<u64>().ok()) {
+        Some(v) => v,
+        None => return Duration::from_secs(30),
+    };
+    if secs < 2 {
+        warn!("BLINK_SUBMIT_TIMEOUT_S={secs} is below the 2 s floor; using 2 s");
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
+/// Remainder of `submit_timeout` after reserving the 2 s nudge, saturating at
+/// zero so a programmatically built config can never underflow.
+fn remainder_after_nudge(submit_timeout: Duration) -> Duration {
+    submit_timeout.saturating_sub(Duration::from_secs(2))
 }
 
 /// Session state held by the backend.
@@ -147,6 +173,7 @@ impl FreebuffBackend {
     }
 
     /// Wait for the pty to reach Busy state.
+    #[allow(dead_code)]
     async fn wait_for_busy(&self, pty: &Pty, timeout: Duration) -> Result<()> {
         pty.wait_for(
             |s| matches!(classify(&s.rows), ScreenState::Busy { .. }),
@@ -458,32 +485,56 @@ impl FreebuffBackend {
         info!("prompt: sending Enter");
         pty.key(Key::Enter).await?;
 
-        // Wait for Busy (max 5s)
-        match self.wait_for_busy(pty, Duration::from_secs(5)).await {
-            Ok(_) => {
-                info!("prompt: freebuff went busy");
-                Ok(())
-            }
-            Err(_) => {
-                // Check if text or chip is still in input box - might need second Enter
-                let snap = pty.screen();
-                let text_still_visible = input_box_text(&snap.rows)
-                    .map(|t| !t.is_empty() && !t.contains("Enter a coding task"))
-                    .unwrap_or(false);
-                let chip_still_visible = pasted_chip_chars(&snap.rows).is_some();
-                if text_still_visible || chip_still_visible {
-                    info!("prompt: still not busy, sending Enter again");
-                    pty.key(Key::Enter).await?;
-                    self.wait_for_busy(pty, Duration::from_secs(5)).await?;
-                    Ok(())
-                } else {
-                    Err(anyhow!(
-                        "freebuff did not go busy after prompt; box showed neither text nor pasted-text chip; screen:\n{}",
-                        snap.text()
-                    ))
-                }
+        // Wait for freebuff to go Busy, or for the paste to be consumed (input
+        // box back to the placeholder and no pasted-text chip), up to submit_timeout.
+        let submit_timeout = self.cfg.submit_timeout;
+        let pred = move |s: &ScreenSnapshot| {
+            matches!(classify(&s.rows), ScreenState::Busy { .. })
+                || (!input_box_text(&s.rows)
+                    .map(|t| t.contains(&preview))
+                    .unwrap_or(false)
+                    && pasted_chip_chars(&s.rows).is_none()
+                    && input_box_is_empty(&s.rows))
+        };
+
+        // Short window for the TUI to consume the paste on its own; if the text
+        // or chip is still visible after 2s, nudge with one more Enter.
+        let pred_first = pred.clone();
+        if pty
+            .wait_for(move |s| pred_first(s), Duration::from_secs(2))
+            .await
+            .is_err()
+        {
+            let last = pty.screen();
+            let text_still_visible = input_box_text(&last.rows)
+                .map(|t| !t.is_empty() && !t.contains("Enter a coding task"))
+                .unwrap_or(false);
+            let chip_still_visible = pasted_chip_chars(&last.rows).is_some();
+            if text_still_visible || chip_still_visible {
+                info!("prompt: still not busy, sending Enter again");
+                pty.key(Key::Enter).await?;
             }
         }
+        let resolved = match pty
+            .wait_for(move |s| pred(s), remainder_after_nudge(submit_timeout))
+            .await
+        {
+            Ok(snap) => snap,
+            Err(_) => {
+                let snap = pty.screen();
+                return Err(anyhow!(
+                    "freebuff neither went busy nor consumed the prompt within {:?}; screen:\n{}",
+                    submit_timeout,
+                    snap.text()
+                ));
+            }
+        };
+        if matches!(classify(&resolved.rows), ScreenState::Busy { .. }) {
+            info!("prompt: freebuff went busy");
+        } else {
+            info!("prompt: paste consumed; proceeding to the turn loop");
+        }
+        Ok(())
     }
 }
 
@@ -905,6 +956,7 @@ mod tests {
         cfg.turn_timeout = Duration::from_secs(30);
         cfg.poll_interval = Duration::from_millis(100);
         cfg.exit_timeout = Duration::from_secs(2);
+        cfg.submit_timeout = Duration::from_secs(10);
         cfg
     }
 
@@ -1368,5 +1420,88 @@ mod tests {
         assert!(saw_message_with_pong, "missing AgentMessageChunk with PONG");
 
         backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn t12_slow_busy_prompt_still_completes() {
+        // A prompt in slow-busy mode: the fake shows the placeholder box (the
+        // paste is 'consumed') for 6 s before going busy. The prompt must still
+        // complete EndTurn, passing through the 'paste consumed' signal.
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("slow-busy"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+
+        let (result, updates) = run_prompt_collect(&backend, &session_id, "Reply PONG").await;
+
+        assert!(result.is_ok(), "prompt failed: {:?}", result.err());
+        assert_eq!(result.unwrap(), StopReason::EndTurn);
+
+        // Check update sequence: AgentThoughtChunk, ToolCall, ToolCallUpdate, AgentMessageChunk with PONG
+        assert!(!updates.is_empty(), "no updates streamed");
+
+        let mut saw_thought = false;
+        let mut saw_tool_call = false;
+        let mut saw_tool_update = false;
+        let mut saw_message_with_pong = false;
+
+        for u in &updates {
+            match u {
+                SessionUpdate::AgentThoughtChunk { .. } => saw_thought = true,
+                SessionUpdate::ToolCall {
+                    tool_call_id,
+                    title,
+                    kind,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(*status, ToolCallStatus::InProgress);
+                    assert!(!tool_call_id.is_empty());
+                    assert!(title.contains("run_terminal_command"));
+                    assert_eq!(*kind, "execute");
+                    saw_tool_call = true;
+                }
+                SessionUpdate::ToolCallUpdate {
+                    tool_call_id,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(*status, ToolCallStatus::Completed);
+                    assert!(!tool_call_id.is_empty());
+                    saw_tool_update = true;
+                }
+                SessionUpdate::AgentMessageChunk { content } => {
+                    let TextContent::Text { text } = content;
+                    if text.contains("PONG") {
+                        saw_message_with_pong = true;
+                    }
+                }
+            }
+        }
+
+        assert!(saw_thought, "missing AgentThoughtChunk");
+        assert!(saw_tool_call, "missing ToolCall");
+        assert!(saw_tool_update, "missing ToolCallUpdate");
+        assert!(saw_message_with_pong, "missing AgentMessageChunk with PONG");
+
+        backend.shutdown().await;
+    }
+
+    #[test]
+    fn submit_timeout_floor_is_two_seconds() {
+        // A programmatically built config with a 1 s submit_timeout must never
+        // underflow the 2 s nudge remainder; it saturates to zero.
+        assert_eq!(
+            remainder_after_nudge(Duration::from_secs(1)),
+            Duration::ZERO
+        );
+
+        // Env parsing floors any value below 2 s up to 2 s (and defaults to 30).
+        assert_eq!(parse_submit_timeout(Some("1")), Duration::from_secs(2));
+        assert_eq!(parse_submit_timeout(Some("0")), Duration::from_secs(2));
+        assert_eq!(parse_submit_timeout(Some("30")), Duration::from_secs(30));
+        assert_eq!(parse_submit_timeout(None), Duration::from_secs(30));
     }
 }

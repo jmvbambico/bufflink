@@ -1,0 +1,23 @@
+
+
+  Freebuff will run commands on your behalf to help you build.
+
+  Directory ~/projects/og-sandbox
+
+   [02:01 AM]
+   ┌──────────────────────┐
+   │ You are a coding     │
+   │ sub-agent (Freebuff, │
+   │  vi…                 │
+   │ 📄 5,765 chars       │
+   └──────────────────────┘
+
+  • Thinking
+    Let me start by orienting. I'm a sub-agent for task T6 csv-export.
+    2. Read AGENTS.md
+ working...                                                                                                  ■ Esc
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                      │
+│  ▍Enter a coding task or / for commands                                                                              │
+│                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

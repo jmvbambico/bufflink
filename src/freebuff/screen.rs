@@ -214,6 +214,7 @@ mod tests {
             "splash-80x24" => fixture!("splash-80x24"),
             "idle-120x40" => fixture!("idle-120x40"),
             "busy-120x40" => fixture!("busy-120x40"),
+            "busy-first-instant-120x40" => fixture!("busy-first-instant-120x40"),
             "after-esc" => fixture!("after-esc"),
             "kicked-out" => fixture!("kicked-out"),
             "freebucks-gate-80x24" => fixture!("freebucks-gate-80x24"),
@@ -251,6 +252,14 @@ mod tests {
         if let ScreenState::Busy { elapsed_s } = state {
             assert_eq!(elapsed_s, Some(4));
         }
+    }
+
+    #[test]
+    fn busy_first_instant_classifies_busy_without_elapsed() {
+        let rows = load_fixture("busy-first-instant-120x40");
+        let state = classify(&rows);
+        assert_eq!(state, ScreenState::Busy { elapsed_s: None });
+        assert!(input_box_is_empty(&rows));
     }
 
     #[test]
