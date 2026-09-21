@@ -1,4 +1,4 @@
-<h1><img src="assets/icon.png" height="32" valign="middle"> bufflink</h1>
+<h1><img src="assets/icon.png" height="32" valign="middle"> BuffLINK</h1>
 
 An [Agent Client Protocol](https://agentclientprotocol.com) bridge for the free
 [freebuff](https://freebuff.com/cli) coding agent.

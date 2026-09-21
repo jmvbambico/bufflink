@@ -2,7 +2,7 @@
 # AGENTS.md is the constitution and wins on anything this file does not cover.
 
 branches:
-  integration_base: dev
+  integration_base: main
   protected: [main]
   task_prefix: feature/
 
@@ -32,7 +32,7 @@ never_write:
 merge_policy:
   # Every merge is a human decision until the gates have proven themselves.
   enabled: false
-  auto_merge_target: dev
+  auto_merge_target: main
   max_diff_lines: 600
   max_diff_files: 20
   high_risk_paths:
