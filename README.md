@@ -115,8 +115,12 @@ matched case-insensitively against the splash's display names. Unset means
 freebuff's default (Enter on the collapsed splash). The lineup rotates, so
 match on the name you saw, not an id; a name that matches nothing — or
 several rows — fails loudly instead of starting the wrong hour. A previous
-hard kill leaves a `Session ended` resume screen on the next launch;
-`blink` sends Esc there for a fresh splash and never resumes blindly.
+ hard kill leaves a `Session ended` resume screen on the next launch;
+`blink` sends Esc there for a fresh splash and never resumes blindly. If an
+hour is already running, freebuff skips the splash and resumes on that
+hour's model, so on reaching Idle `blink` re-checks the status row against
+`BLINK_MODEL` and fails loudly on a mismatch instead of running the wrong
+hour.
 
 ## Development
 

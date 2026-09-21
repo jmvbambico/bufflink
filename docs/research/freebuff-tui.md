@@ -45,6 +45,12 @@ usable as parser fixtures in `captures/`.
 
 Idle vs busy: busy **iff** the status bar matches `(thinking|working)\.\.\.` followed by either `\d+s` or, in the first instant, nothing but spaces before `■ Esc`;
 idle iff it matches `· \d+[hm] left` and the input placeholder is visible.
+Within a running hour freebuff skips the splash entirely (no model picker,
+no error) and resumes straight on the hour's model — a `BLINK_MODEL`
+request for anything else is silently ignored unless the driver checks. The
+idle status row (`<model> · <n>h/m left`, e.g. `MiMo 2.5 · 58m left`) is the
+only place the active model is shown; the bridge parses it on every Idle
+entry and fails loudly when it does not match the request.
 
 ## Input handling
 

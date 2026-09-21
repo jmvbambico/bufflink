@@ -283,6 +283,73 @@ pub fn match_model(target: &str, names: &[String]) -> ModelMatch {
     }
 }
 
+/// Active model and time left from the Idle screen's status row, e.g.
+/// ` MiMo 2.5 · 58m left … ✕ End session` -> `("MiMo 2.5", "58m left")`.
+/// The name is the trimmed text before the first ` · `; the time is the
+/// `\d+[hm] left` fragment. Rows mentioning Freebucks are splash cost lines,
+/// not the status row. Returns None when no row parses: within a running
+/// hour freebuff skips the splash and resumes on the hour's model, so the
+/// status row is the only place the active model is shown — callers must
+/// fail loudly rather than assume the requested model is active.
+pub fn active_model(rows: &[String]) -> Option<(String, String)> {
+    for row in rows {
+        if row.contains("Freebucks") {
+            continue;
+        }
+        if !row.contains('·') || !row.contains("left") {
+            continue;
+        }
+        let Some(sep) = row.find(" · ") else {
+            continue;
+        };
+        let name = row[..sep].trim();
+        if name.is_empty() {
+            continue;
+        }
+        let Some(time) = time_left_fragment(row) else {
+            continue;
+        };
+        return Some((name.to_string(), time.to_string()));
+    }
+    None
+}
+
+/// The `\d+[hm] left` fragment of a status row (`58m left`, `1h left`).
+fn time_left_fragment(row: &str) -> Option<&str> {
+    let bytes = row.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b'h' || bytes[j] == b'm') {
+                let after = &row[j + 1..];
+                if after.starts_with(" left") {
+                    return Some(&row[i..j + 1 + " left".len()]);
+                }
+            }
+            i = j.max(i + 1);
+        } else {
+            i += row[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        }
+    }
+    None
+}
+
+/// Decide whether an already-running hour satisfies `BLINK_MODEL`, using the
+/// same [`match_model`] rule as the splash: against a single active name the
+/// outcome is match or already-running error (never ambiguous).
+pub fn check_active_model(target: &str, active: &str, time_left: &str) -> Result<(), String> {
+    match match_model(target, &[active.to_string()]) {
+        ModelMatch::One(_) => Ok(()),
+        _ => Err(format!(
+            "freebuff: an hour on '{active}' is already running ({time_left}); requested '{target}' — wait for it to end or unset BLINK_MODEL"
+        )),
+    }
+}
+
 /// One step of the model-selection walk over the expanded list: pure so it is
 /// unit-testable without a PTY.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,6 +480,7 @@ mod tests {
             "splash-list-80x24-focus4" => fixture!("splash-list-80x24-focus4"),
             "splash-list-80x24-focus1" => fixture!("splash-list-80x24-focus1"),
             "idle-120x40" => fixture!("idle-120x40"),
+            "idle-midhour-120x40" => fixture!("idle-midhour-120x40"),
             "busy-120x40" => fixture!("busy-120x40"),
             "busy-first-instant-120x40" => fixture!("busy-first-instant-120x40"),
             "after-esc" => fixture!("after-esc"),
@@ -667,6 +735,79 @@ mod tests {
     fn idle_120x40_classifies_as_idle() {
         let rows = load_fixture("idle-120x40");
         assert_eq!(classify(&rows), ScreenState::Idle);
+    }
+
+    #[test]
+    fn active_model_reads_both_idle_fixtures() {
+        let rows = load_fixture("idle-midhour-120x40");
+        assert_eq!(classify(&rows), ScreenState::Idle);
+        assert_eq!(
+            active_model(&rows),
+            Some(("MiMo 2.5".to_string(), "58m left".to_string()))
+        );
+        let rows = load_fixture("idle-120x40");
+        assert_eq!(
+            active_model(&rows),
+            Some(("GLM 5.3 Flash".to_string(), "1h left".to_string()))
+        );
+    }
+
+    #[test]
+    fn active_model_table() {
+        // Multi-segment status rows (usage suffix) still parse.
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            (
+                " GLM 5.3 Flash · 59m left · 16.4K (2%)      ✕ End session",
+                Some(("GLM 5.3 Flash", "59m left")),
+            ),
+            (
+                " MiMo 2.5 · 58m left                    ✕ End session",
+                Some(("MiMo 2.5", "58m left")),
+            ),
+            (
+                " GLM 5.3 Flash · 1h left                    ✕ End session",
+                Some(("GLM 5.3 Flash", "1h left")),
+            ),
+            // Splash cost lines are not the status row.
+            (" Session ended · 25 Freebucks left", None),
+            (" 5 Freebucks/hr", None),
+            // No time-left token, no separator, empty name.
+            (" MiMo 2.5 · Balanced · Images", None),
+            ("MiMo 2.5 58m left", None),
+            (" · 58m left", None),
+            ("nothing here", None),
+        ];
+        for (input, expected) in cases {
+            let rows = vec![input.to_string()];
+            let expected = expected.map(|(n, t)| (n.to_string(), t.to_string()));
+            assert_eq!(active_model(&rows), expected, "input: {input}");
+        }
+        // Splash fixtures carry no status row.
+        for name in ["splash-120x40", "splash-list-120x40"] {
+            let rows = load_fixture(name);
+            assert_eq!(active_model(&rows), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn check_active_model_table() {
+        // Match reuses the match_model rule (normalised substring).
+        assert_eq!(
+            check_active_model("mimo-2.5", "MiMo 2.5", "58m left"),
+            Ok(())
+        );
+        assert_eq!(
+            check_active_model("glm-5.3-flash", "GLM 5.3 Flash", "1h left"),
+            Ok(())
+        );
+        assert_eq!(
+            check_active_model("deepseek-v4-pro", "MiMo 2.5", "58m left"),
+            Err("freebuff: an hour on 'MiMo 2.5' is already running (58m left); requested 'deepseek-v4-pro' — wait for it to end or unset BLINK_MODEL".to_string())
+        );
+        assert_eq!(
+            check_active_model("mimo", "GLM 5.3 Flash", "1h left"),
+            Err("freebuff: an hour on 'GLM 5.3 Flash' is already running (1h left); requested 'mimo' — wait for it to end or unset BLINK_MODEL".to_string())
+        );
     }
 
     #[test]

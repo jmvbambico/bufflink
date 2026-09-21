@@ -21,8 +21,9 @@ use crate::freebuff::chats::{
 };
 use crate::freebuff::log::{outcome, parse_log_line, LogEvent, TurnOutcome};
 use crate::freebuff::screen::{
-    classify, input_box_is_empty, input_box_text, match_model, model_rows, pasted_chip_chars,
-    plan_select_step, ModelMatch, ScreenState, SelectStep, SPLASH_ACCEPT_KEY,
+    active_model, check_active_model, classify, input_box_is_empty, input_box_text, match_model,
+    model_rows, pasted_chip_chars, plan_select_step, ModelMatch, ScreenState, SelectStep,
+    SPLASH_ACCEPT_KEY,
 };
 use crate::freebuff::transcript::{diff, parse_messages, Block, Cursor, Delta, Message};
 use crate::freebuff::{CANCEL_KEY, EXIT_COMMAND};
@@ -368,6 +369,38 @@ impl FreebuffBackend {
         Ok(())
     }
 
+    /// Enforce `BLINK_MODEL` against the Idle screen's status row. Within a
+    /// running hour freebuff skips the splash and resumes on the hour's
+    /// model, so a launch that never saw the splash must still be checked
+    /// here — silently running the wrong hour is the failure this guards.
+    /// No `BLINK_MODEL` means no check, exactly as before.
+    async fn verify_idle_model(
+        &self,
+        pty: &Pty,
+        rows: &[String],
+        splash_accept_sent: bool,
+    ) -> Result<()> {
+        let Some(target) = self.cfg.model.as_ref() else {
+            return Ok(());
+        };
+        let Some((active, left)) = active_model(rows) else {
+            let _ = pty.kill().await;
+            return Err(anyhow!(
+                "freebuff: cannot read the active model from the idle screen"
+            ));
+        };
+        if let Err(msg) = check_active_model(target, &active, &left) {
+            let _ = pty.kill().await;
+            return Err(anyhow!(msg));
+        }
+        if !splash_accept_sent {
+            info!(
+                "startup: resumed active hour on '{active}' ({left}) matching BLINK_MODEL={target}"
+            );
+        }
+        Ok(())
+    }
+
     /// Handle startup sequence after spawning freebuff.
     async fn run_startup(&self, pty: &Arc<Pty>, _cwd: &Path) -> Result<()> {
         let mut splash_accept_sent = false;
@@ -413,6 +446,8 @@ impl FreebuffBackend {
                     .iter()
                     .any(|r| r.contains("Enter a coding task or / for commands"));
                 if has_time_left && has_placeholder {
+                    self.verify_idle_model(pty, &snap.rows, splash_accept_sent)
+                        .await?;
                     info!("startup: reached Idle (idle markers visible)");
                     return Ok(());
                 }
@@ -573,6 +608,8 @@ impl FreebuffBackend {
                     return Err(anyhow!("freebuff: another instance took over this account"));
                 }
                 ScreenState::Idle => {
+                    self.verify_idle_model(pty, &snap.rows, splash_accept_sent)
+                        .await?;
                     info!("startup: reached Idle");
                     return Ok(());
                 }
