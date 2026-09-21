@@ -33,45 +33,42 @@ runs any command that speaks ACP. bufflink is that command.
 
 ### Git flow
 
-Two long-lived branches, one direction of travel:
+One long-lived branch, the same way `og` works:
 
 ```
-feature/<slug> ──PR──▶ dev ──promotion (human, merge commit)──▶ main ──tag──▶ release
+feature/<slug> ──PR (gate green, cross-vendor review)──▶ main ──tag──▶ release
 ```
 
-- **`main`** is protected and never touched by an agent. It only ever
-  receives promotions from `dev`, done by the human with a merge commit
-  (`git merge --no-ff dev`). Every commit on `main` is releasable.
-- **`dev`** is the integration base. Work reaches it only through a PR from
-  a task or integration branch, after the full gate is green and the
-  cross-vendor review has reported.
-- **`feature/<slug>`** is one task. **`integration/<goal>`** batches several
-  tasks before one PR. **`release/vX.Y.Z`** carries only the version bump
-  (`Cargo.toml`, `Cargo.lock`) and, when needed, a changelog line; it is a
-  PR into `dev` like any other. **`hotfix/<slug>`** branches from `main`,
-  PRs into `main` (human merges), and is merged back into `dev` afterwards.
+- **`main`** is the only long-lived branch and is protected: an agent never
+  pushes to it or merges into it. Work reaches it only through a PR that the
+  human merges. Every commit on `main` is releasable.
+- **`feature/<slug>`** is one task, cut from `main`. **`integration/<goal>`**
+  batches several tasks before one PR. Fixes found by review or by a live
+  run go on the same feature branch before the PR merges.
+- The deliverable of an orchestrated run is the PR into `main` with the full
+  gate green and the reviewer's verdict in the PR body
+  (`cross-vendor-review: passed` / `degraded-review`).
 
 ### Releases
 
-Releases are cut from **`main`**, never from `dev`:
+Unlike `og`, whose version is `git describe`, `blink` reports the version in
+`Cargo.toml` (`agentInfo.version` in `initialize`), so a release has a bump:
 
-1. `release/vX.Y.Z` merged into `dev` (version in `Cargo.toml` == the tag
-   that follows).
-2. Human promotes `dev` → `main`.
-3. The annotated tag `vX.Y.Z` is created on the **`main`** merge commit and
-   pushed; the GitHub release is created from that tag with the release
-   binary attached (`agentInfo.version` in `initialize` must report X.Y.Z).
+1. A `release/vX.Y.Z` branch bumps `Cargo.toml` + `Cargo.lock` and nothing
+   else; it is a PR into `main` like any other (no review needed for the
+   bump alone).
+2. After the human merges it, the annotated tag `vX.Y.Z` is created on that
+   `main` merge commit and pushed; the GitHub release is created from the
+   tag with the release binary attached, built from that exact commit.
 
 A tag that does not point at a commit on `main` is a mistake, not a release.
-Agents may prepare the release branch and, once the tag exists on `main`,
-build and publish the release; they never create a tag on `dev`.
+Agents may prepare the release branch and, once the bump is on `main`, tag,
+build and publish; they never tag an unmerged commit.
 
 ### Branching
 
-Task branches `feature/<slug>` are cut from `dev`. The remote is GitHub
-(`jmvbambico/bufflink`); the deliverable of an orchestrated run is a PR into
-`dev` with the full gate green and the reviewer's verdict in the PR body
-(`cross-vendor-review: passed` / `degraded-review`).
+Task branches `feature/<slug>` are cut from `main`. The remote is GitHub
+(`jmvbambico/bufflink`).
 
 ### Worktrees
 
