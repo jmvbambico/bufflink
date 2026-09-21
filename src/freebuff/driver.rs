@@ -406,6 +406,8 @@ impl FreebuffBackend {
         let mut splash_accept_sent = false;
         // Down presses sent while walking the expanded model list.
         let mut model_presses: u32 = 0;
+        // Previous poll's screen, to spot the collapsed splash expanding.
+        let mut prev_was_splash = false;
 
         let startup_deadline = Instant::now() + self.cfg.startup_timeout;
 
@@ -433,6 +435,13 @@ impl FreebuffBackend {
 
             let snap = pty.screen();
             let state = classify(&snap.rows);
+
+            // WHY: the expanded list refocuses from the top on every entry,
+            // so a stale Down count from an earlier visit would cap the walk early.
+            if matches!(state, ScreenState::ModelList) && prev_was_splash {
+                model_presses = 0;
+            }
+            prev_was_splash = matches!(state, ScreenState::ModelSplash);
 
             // If we've already sent splash accept, check for Idle markers directly
             // (splash markers may linger in the buffer alongside idle markers)
@@ -462,7 +471,14 @@ impl FreebuffBackend {
                     // splash; Enter would resume with the previous model and
                     // start the hour, so never Enter here.
                     info!("startup: session-ended screen detected, sending Esc for a fresh splash");
-                    pty.write(CANCEL_KEY.as_bytes()).await?;
+                    let snap_text = snap.text();
+                    self.press_and_settle(
+                        pty,
+                        Key::Escape,
+                        &snap_text,
+                        "dismissing session-ended screen",
+                    )
+                    .await?;
                 }
                 ScreenState::ModelSplash => {
                     if splash_accept_sent {

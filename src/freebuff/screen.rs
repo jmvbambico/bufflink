@@ -306,36 +306,45 @@ pub fn active_model(rows: &[String]) -> Option<(String, String)> {
         if name.is_empty() {
             continue;
         }
-        let Some(time) = time_left_fragment(row) else {
+        // The status row is `<Name> · <N>[hm] left`: the time fragment sits
+        // immediately after the separator, so anything else there (a mode
+        // word, a transcript line) is not the status row.
+        let after = row[sep + " · ".len()..].trim_start();
+        let Some(time) = time_left_at_start(after) else {
             continue;
         };
+        // After the time only the usage suffix (`· …`) or `✕ End session`
+        // may follow; trailing prose (`5m left on the problem`) is a
+        // transcript line, not the status row.
+        let rest = after[time.len()..].trim_start();
+        if !(rest.is_empty() || rest.starts_with('·') || rest.starts_with('✕')) {
+            continue;
+        }
         return Some((name.to_string(), time.to_string()));
     }
     None
 }
 
-/// The `\d+[hm] left` fragment of a status row (`58m left`, `1h left`).
-fn time_left_fragment(row: &str) -> Option<&str> {
-    let bytes = row.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let mut j = i;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-            if j < bytes.len() && (bytes[j] == b'h' || bytes[j] == b'm') {
-                let after = &row[j + 1..];
-                if after.starts_with(" left") {
-                    return Some(&row[i..j + 1 + " left".len()]);
-                }
-            }
-            i = j.max(i + 1);
-        } else {
-            i += row[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-        }
+/// The `\d+[hm] left` fragment at the START of `s` (`58m left`, `1h left`).
+/// Anchored so callers can require the time immediately after the ` · `
+/// separator instead of matching it anywhere in the row.
+fn time_left_at_start(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut j = 0;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
     }
-    None
+    if j == 0 || j >= bytes.len() {
+        return None;
+    }
+    if bytes[j] != b'h' && bytes[j] != b'm' {
+        return None;
+    }
+    if s[j + 1..].starts_with(" left") {
+        Some(&s[..j + 1 + " left".len()])
+    } else {
+        None
+    }
 }
 
 /// Decide whether an already-running hour satisfies `BLINK_MODEL`, using the
@@ -775,6 +784,9 @@ mod tests {
             (" MiMo 2.5 · Balanced · Images", None),
             ("MiMo 2.5 58m left", None),
             (" · 58m left", None),
+            // Transcript-like row: time-shaped text with trailing prose is
+            // not the status row.
+            (" Thinking · 5m left on the problem", None),
             ("nothing here", None),
         ];
         for (input, expected) in cases {
@@ -787,6 +799,15 @@ mod tests {
             let rows = load_fixture(name);
             assert_eq!(active_model(&rows), None, "{name}");
         }
+    }
+
+    #[test]
+    fn active_model_rejects_transcript_like_row() {
+        // A transcript line can carry both `·` and a time-shaped fragment;
+        // only `<Name> · <N>[hm] left` with nothing prose-like after it is
+        // the status row.
+        let rows = vec![" Thinking · 5m left on the problem".to_string()];
+        assert_eq!(active_model(&rows), None);
     }
 
     #[test]
