@@ -109,6 +109,19 @@ Environment: `BLINK_FREEBUFF_BIN` (default `freebuff`),
 `BLINK_MANICODE_DIR` (`~/.config/manicode`), `RUST_LOG` (logs go to stderr;
 stdout is JSON-RPC only).
 
+`BLINK_MODEL` pins the model picked on freebuff's splash: a name or id
+fragment (`deepseek/deepseek-v4.1-flash`, `glm-5.3-flash`, `mimo-2.5`),
+matched case-insensitively against the splash's display names. Unset means
+freebuff's default (Enter on the collapsed splash). The lineup rotates, so
+match on the name you saw, not an id; a name that matches nothing — or
+several rows — fails loudly instead of starting the wrong hour. A previous
+ hard kill leaves a `Session ended` resume screen on the next launch;
+`blink` sends Esc there for a fresh splash and never resumes blindly. If an
+hour is already running, freebuff skips the splash and resumes on that
+hour's model, so on reaching Idle `blink` re-checks the status row against
+`BLINK_MODEL` and fails loudly on a mismatch instead of running the wrong
+hour.
+
 ## Development
 
 ```

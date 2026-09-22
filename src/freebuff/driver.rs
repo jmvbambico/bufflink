@@ -21,7 +21,9 @@ use crate::freebuff::chats::{
 };
 use crate::freebuff::log::{outcome, parse_log_line, LogEvent, TurnOutcome};
 use crate::freebuff::screen::{
-    classify, input_box_is_empty, input_box_text, pasted_chip_chars, ScreenState, SPLASH_ACCEPT_KEY,
+    active_model, check_active_model, classify, input_box_is_empty, input_box_text, match_model,
+    model_rows, pasted_chip_chars, plan_select_step, ModelMatch, ScreenState, SelectStep,
+    SPLASH_ACCEPT_KEY,
 };
 use crate::freebuff::transcript::{diff, parse_messages, Block, Cursor, Delta, Message};
 use crate::freebuff::{CANCEL_KEY, EXIT_COMMAND};
@@ -54,6 +56,12 @@ pub struct DriverConfig {
     pub settle_timeout: Duration,
     /// Time to wait after Enter for freebuff to go busy or consume the paste (default: 30s, env: BLINK_SUBMIT_TIMEOUT_S).
     pub submit_timeout: Duration,
+    /// Model to select on the splash (default: None -> freebuff's default,
+    /// env: BLINK_MODEL). A name or id fragment matched case-insensitively
+    /// against the splash's display names (the lineup rotates, so ids are
+    /// never hardcoded); unset means Enter on the collapsed splash. A name
+    /// that matches nothing (or several rows) fails loudly.
+    pub model: Option<String>,
 }
 
 impl DriverConfig {
@@ -71,6 +79,10 @@ impl DriverConfig {
             .unwrap_or(5);
         let submit_timeout =
             parse_submit_timeout(std::env::var("BLINK_SUBMIT_TIMEOUT_S").ok().as_deref());
+        let model = std::env::var("BLINK_MODEL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         Self {
             program,
@@ -85,6 +97,7 @@ impl DriverConfig {
             exit_timeout: Duration::from_secs(3),
             settle_timeout: Duration::from_secs(settle_timeout_secs),
             submit_timeout,
+            model,
         }
     }
 }
@@ -339,9 +352,62 @@ impl FreebuffBackend {
         Ok(())
     }
 
+    /// Settle after a startup keypress before re-reading the screen.
+    /// Focus moves render one frame later; reading too early replays the
+    /// previous focus and the walk would skip a row.
+    const MODEL_KEY_SETTLE: Duration = Duration::from_millis(300);
+
+    /// Send a startup key, then wait for the screen to change. Fails loudly
+    /// when nothing changes: pressing further keys blind could spend
+    /// Freebucks on the wrong model.
+    async fn press_and_settle(&self, pty: &Pty, key: Key, before: &str, why: &str) -> Result<()> {
+        pty.key(key).await?;
+        tokio::time::sleep(Self::MODEL_KEY_SETTLE).await;
+        pty.wait_for(|s| s.text() != before, Duration::from_secs(10))
+            .await
+            .map_err(|e| anyhow!("freebuff: screen did not change after {why}: {e}"))?;
+        Ok(())
+    }
+
+    /// Enforce `BLINK_MODEL` against the Idle screen's status row. Within a
+    /// running hour freebuff skips the splash and resumes on the hour's
+    /// model, so a launch that never saw the splash must still be checked
+    /// here — silently running the wrong hour is the failure this guards.
+    /// No `BLINK_MODEL` means no check, exactly as before.
+    async fn verify_idle_model(
+        &self,
+        pty: &Pty,
+        rows: &[String],
+        splash_accept_sent: bool,
+    ) -> Result<()> {
+        let Some(target) = self.cfg.model.as_ref() else {
+            return Ok(());
+        };
+        let Some((active, left)) = active_model(rows) else {
+            let _ = pty.kill().await;
+            return Err(anyhow!(
+                "freebuff: cannot read the active model from the idle screen"
+            ));
+        };
+        if let Err(msg) = check_active_model(target, &active, &left) {
+            let _ = pty.kill().await;
+            return Err(anyhow!(msg));
+        }
+        if !splash_accept_sent {
+            info!(
+                "startup: resumed active hour on '{active}' ({left}) matching BLINK_MODEL={target}"
+            );
+        }
+        Ok(())
+    }
+
     /// Handle startup sequence after spawning freebuff.
     async fn run_startup(&self, pty: &Arc<Pty>, _cwd: &Path) -> Result<()> {
         let mut splash_accept_sent = false;
+        // Down presses sent while walking the expanded model list.
+        let mut model_presses: u32 = 0;
+        // Previous poll's screen, to spot the collapsed splash expanding.
+        let mut prev_was_splash = false;
 
         let startup_deadline = Instant::now() + self.cfg.startup_timeout;
 
@@ -370,6 +436,13 @@ impl FreebuffBackend {
             let snap = pty.screen();
             let state = classify(&snap.rows);
 
+            // WHY: the expanded list refocuses from the top on every entry,
+            // so a stale Down count from an earlier visit would cap the walk early.
+            if matches!(state, ScreenState::ModelList) && prev_was_splash {
+                model_presses = 0;
+            }
+            prev_was_splash = matches!(state, ScreenState::ModelSplash);
+
             // If we've already sent splash accept, check for Idle markers directly
             // (splash markers may linger in the buffer alongside idle markers)
             if splash_accept_sent {
@@ -382,6 +455,8 @@ impl FreebuffBackend {
                     .iter()
                     .any(|r| r.contains("Enter a coding task or / for commands"));
                 if has_time_left && has_placeholder {
+                    self.verify_idle_model(pty, &snap.rows, splash_accept_sent)
+                        .await?;
                     info!("startup: reached Idle (idle markers visible)");
                     return Ok(());
                 }
@@ -391,15 +466,141 @@ impl FreebuffBackend {
                 ScreenState::Booting => {
                     trace!("startup: booting");
                 }
+                ScreenState::SessionEnded => {
+                    // A hard-killed previous session. Esc goes to the normal
+                    // splash; Enter would resume with the previous model and
+                    // start the hour, so never Enter here.
+                    info!("startup: session-ended screen detected, sending Esc for a fresh splash");
+                    let snap_text = snap.text();
+                    self.press_and_settle(
+                        pty,
+                        Key::Escape,
+                        &snap_text,
+                        "dismissing session-ended screen",
+                    )
+                    .await?;
+                }
                 ScreenState::ModelSplash => {
-                    if !splash_accept_sent {
+                    if splash_accept_sent {
+                        trace!("startup: waiting after splash accept");
+                    } else if let Some(target) = self.cfg.model.as_ref() {
+                        let snap_text = snap.text();
+                        let rows = model_rows(&snap.rows);
+                        if rows.is_empty() {
+                            let _ = pty.kill().await;
+                            return Err(anyhow!(
+                                "freebuff: could not read model rows from the splash for BLINK_MODEL='{target}'"
+                            ));
+                        }
+                        let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+                        match match_model(target, &names) {
+                            ModelMatch::One(i) => {
+                                info!(
+                                    "startup: selected model '{}' for BLINK_MODEL={}",
+                                    rows[i].name, target
+                                );
+                                self.press_and_settle(
+                                    pty,
+                                    Key::Enter,
+                                    &snap_text,
+                                    "accepting the matching model",
+                                )
+                                .await?;
+                                splash_accept_sent = true;
+                            }
+                            ModelMatch::Ambiguous(names) => {
+                                let _ = pty.kill().await;
+                                return Err(anyhow!(
+                                    "freebuff: model '{target}' is ambiguous; matches: {}",
+                                    names.join(", ")
+                                ));
+                            }
+                            ModelMatch::None { .. } => {
+                                // Focus `See all`, then expand the list.
+                                self.press_and_settle(
+                                    pty,
+                                    Key::Down,
+                                    &snap_text,
+                                    "focusing See all models",
+                                )
+                                .await?;
+                                let expanded_from = pty.screen().text();
+                                self.press_and_settle(
+                                    pty,
+                                    Key::Enter,
+                                    &expanded_from,
+                                    "expanding the model list",
+                                )
+                                .await?;
+                            }
+                        }
+                    } else {
                         info!(
                             "startup: model splash detected, sending Enter to accept default model"
                         );
                         pty.write(SPLASH_ACCEPT_KEY.as_bytes()).await?;
                         splash_accept_sent = true;
-                    } else {
+                    }
+                }
+                ScreenState::ModelList => {
+                    if splash_accept_sent {
                         trace!("startup: waiting after splash accept");
+                    } else if let Some(target) = self.cfg.model.as_ref() {
+                        let snap_text = snap.text();
+                        let rows = model_rows(&snap.rows);
+                        let show_fewer = snap.rows.iter().any(|r| r.contains("Show fewer"));
+                        match plan_select_step(target, &rows, show_fewer, model_presses) {
+                            SelectStep::Accept => {
+                                let idx = rows.iter().position(|r| r.focused).expect(
+                                    "plan_select_step returns Accept only when a row is focused",
+                                );
+                                info!(
+                                    "startup: selected model '{}' for BLINK_MODEL={}",
+                                    rows[idx].name, target
+                                );
+                                self.press_and_settle(
+                                    pty,
+                                    Key::Enter,
+                                    &snap_text,
+                                    "accepting the matching model",
+                                )
+                                .await?;
+                                splash_accept_sent = true;
+                            }
+                            SelectStep::Down => {
+                                self.press_and_settle(
+                                    pty,
+                                    Key::Down,
+                                    &snap_text,
+                                    "moving to the next model",
+                                )
+                                .await?;
+                                model_presses += 1;
+                            }
+                            SelectStep::NotOffered { offered } => {
+                                let _ = pty.kill().await;
+                                return Err(anyhow!(
+                                    "freebuff: model '{target}' not offered; splash lists: {}",
+                                    offered.join(", ")
+                                ));
+                            }
+                            SelectStep::Ambiguous(names) => {
+                                let _ = pty.kill().await;
+                                return Err(anyhow!(
+                                    "freebuff: model '{target}' is ambiguous; matches: {}",
+                                    names.join(", ")
+                                ));
+                            }
+                        }
+                    } else {
+                        // No BLINK_MODEL: accept whatever is focused, exactly
+                        // as before (the expanded list used to classify as
+                        // ModelSplash and take this same path).
+                        info!(
+                            "startup: model splash detected, sending Enter to accept default model"
+                        );
+                        pty.write(SPLASH_ACCEPT_KEY.as_bytes()).await?;
+                        splash_accept_sent = true;
                     }
                 }
                 ScreenState::FreebucksGate { message } => {
@@ -423,6 +624,8 @@ impl FreebuffBackend {
                     return Err(anyhow!("freebuff: another instance took over this account"));
                 }
                 ScreenState::Idle => {
+                    self.verify_idle_model(pty, &snap.rows, splash_accept_sent)
+                        .await?;
                     info!("startup: reached Idle");
                     return Ok(());
                 }
