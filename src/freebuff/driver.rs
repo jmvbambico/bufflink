@@ -181,10 +181,13 @@ fn redact_home(s: &str) -> String {
     }
 }
 
-/// Replace `home` with `~` when non-empty. Split out so the redaction is
-/// unit-testable without mutating the process environment.
+/// Replace `home` with `~` when it is a real path. Split out so the redaction
+/// is unit-testable without mutating the process environment. A home too short
+/// to be a real directory (`/`, empty, or a single character) is skipped: with
+/// `HOME=/` a naive replace would turn every slash in the bounded tail into
+/// `~`, and with an empty one it would match everywhere.
 fn redact_home_with(s: &str, home: &str) -> String {
-    if home.is_empty() {
+    if home.trim().len() <= 1 {
         s.to_string()
     } else {
         s.replace(home, "~")
@@ -425,16 +428,51 @@ impl FreebuffBackend {
     /// previous focus and the walk would skip a row.
     const MODEL_KEY_SETTLE: Duration = Duration::from_millis(300);
 
+    /// Fail-loud startup-timeout error from the CURRENT screen: names the last
+    /// observed `ScreenState` and a bounded, redacted tail. Every deadline exit
+    /// — top of the poll loop, after blocking work, or a clamped wait expiring
+    /// because the budget ran out — goes through here so the diagnostic never
+    /// degrades to a bare "timed out".
+    fn startup_timeout_error(&self, pty: &Pty) -> anyhow::Error {
+        let snap = pty.screen();
+        let pid = pty.pid().unwrap_or(0);
+        let state = classify(&snap.rows);
+        anyhow!(
+            "startup timeout after {:?} pid={} state={:?}; last screen: {}",
+            self.cfg.startup_timeout,
+            pid,
+            state,
+            screen_tail(&snap.rows)
+        )
+    }
+
     /// Send a startup key, then wait for the screen to change. Fails loudly
     /// when nothing changes: pressing further keys blind could spend
     /// Freebucks on the wrong model.
-    async fn press_and_settle(&self, pty: &Pty, key: Key, before: &str, why: &str) -> Result<()> {
+    ///
+    /// Every blocking wait is clamped to the absolute startup `deadline`, so a
+    /// keypress that starts just before the deadline cannot run past it: the
+    /// settle sleep and the screen-change wait are each bounded by the budget
+    /// that remains at that moment. When a clamp expires because the BUDGET
+    /// ran out (not because the TUI is wedged), the fail-loud startup-timeout
+    /// error is returned rather than a misleading "screen did not change".
+    async fn press_and_settle(
+        &self,
+        pty: &Pty,
+        key: Key,
+        before: &str,
+        why: &str,
+        deadline: Instant,
+    ) -> Result<()> {
         pty.key(key).await?;
-        tokio::time::sleep(Self::MODEL_KEY_SETTLE).await;
-        pty.wait_for(|s| s.text() != before, Duration::from_secs(10))
-            .await
-            .map_err(|e| anyhow!("freebuff: screen did not change after {why}: {e}"))?;
-        Ok(())
+        let settle = Self::MODEL_KEY_SETTLE.min(deadline.saturating_duration_since(Instant::now()));
+        tokio::time::sleep(settle).await;
+        let wait = Duration::from_secs(10).min(deadline.saturating_duration_since(Instant::now()));
+        match pty.wait_for(|s| s.text() != before, wait).await {
+            Ok(_) => Ok(()),
+            Err(_) if Instant::now() >= deadline => Err(self.startup_timeout_error(pty)),
+            Err(e) => Err(anyhow!("freebuff: screen did not change after {why}: {e}")),
+        }
     }
 
     /// Enforce `BLINK_MODEL` against the Idle screen's status row. Within a
@@ -486,16 +524,7 @@ impl FreebuffBackend {
 
         loop {
             if Instant::now() >= startup_deadline {
-                let snap = pty.screen();
-                let pid = pty.pid().unwrap_or(0);
-                let state = classify(&snap.rows);
-                return Err(anyhow!(
-                    "startup timeout after {:?} pid={} state={:?}; last screen: {}",
-                    self.cfg.startup_timeout,
-                    pid,
-                    state,
-                    screen_tail(&snap.rows)
-                ));
+                return Err(self.startup_timeout_error(pty));
             }
 
             // Check if child exited
@@ -561,6 +590,7 @@ impl FreebuffBackend {
                         Key::Escape,
                         &snap_text,
                         "dismissing session-ended screen",
+                        startup_deadline,
                     )
                     .await?;
                 }
@@ -588,6 +618,7 @@ impl FreebuffBackend {
                                     Key::Enter,
                                     &snap_text,
                                     "accepting the matching model",
+                                    startup_deadline,
                                 )
                                 .await?;
                                 splash_accept_sent = true;
@@ -606,6 +637,7 @@ impl FreebuffBackend {
                                     Key::Down,
                                     &snap_text,
                                     "focusing See all models",
+                                    startup_deadline,
                                 )
                                 .await?;
                                 let expanded_from = pty.screen().text();
@@ -614,6 +646,7 @@ impl FreebuffBackend {
                                     Key::Enter,
                                     &expanded_from,
                                     "expanding the model list",
+                                    startup_deadline,
                                 )
                                 .await?;
                             }
@@ -647,6 +680,7 @@ impl FreebuffBackend {
                                     Key::Enter,
                                     &snap_text,
                                     "accepting the matching model",
+                                    startup_deadline,
                                 )
                                 .await?;
                                 splash_accept_sent = true;
@@ -657,6 +691,7 @@ impl FreebuffBackend {
                                     Key::Down,
                                     &snap_text,
                                     "moving to the next model",
+                                    startup_deadline,
                                 )
                                 .await?;
                                 model_presses += 1;
@@ -721,7 +756,19 @@ impl FreebuffBackend {
                 }
             }
 
-            tokio::time::sleep(self.cfg.poll_interval).await;
+            // Re-check the deadline straight after the blocking work above, so
+            // expiry during a settle returns the fail-loud error promptly
+            // instead of after another full iteration.
+            if Instant::now() >= startup_deadline {
+                return Err(self.startup_timeout_error(pty));
+            }
+            // Clamp the inter-poll sleep too: it must not carry us past the
+            // deadline either.
+            let nap = self
+                .cfg
+                .poll_interval
+                .min(startup_deadline.saturating_duration_since(Instant::now()));
+            tokio::time::sleep(nap).await;
         }
     }
 
@@ -1853,5 +1900,42 @@ mod tests {
         );
         // An empty home (unset) must not replace everything.
         assert_eq!(redact_home_with("/tmp/x", ""), "/tmp/x");
+        // A home too short to be real must be skipped, not mangle every slash.
+        assert_eq!(redact_home_with("/a/b/c", "/"), "/a/b/c");
+        assert_eq!(redact_home_with("/a/b/c", "x"), "/a/b/c");
+    }
+
+    /// The startup budget must bound the WHOLE startup, not just the gaps
+    /// between blocking calls. `hang-splash` never reaches Idle, and a
+    /// `BLINK_MODEL` matching no listed row keeps the walk pressing keys; each
+    /// press would otherwise block ~10 s in `press_and_settle` waiting for a
+    /// screen change that never comes. With the waits clamped to the deadline
+    /// the whole call must return close to `startup_timeout`, fail-loud.
+    #[tokio::test]
+    async fn t13_startup_wait_is_bounded_by_startup_timeout() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let mut cfg = test_config(&temp_dir, Some("hang-splash"));
+        cfg.model = Some("deepseek-v4-pro".to_string());
+        let startup_timeout = Duration::from_secs(2);
+        cfg.startup_timeout = startup_timeout;
+        let backend = FreebuffBackend::new(cfg);
+
+        let start = std::time::Instant::now();
+        let result = backend.new_session(temp_dir.clone()).await;
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("startup must time out").to_string();
+        assert!(
+            err.contains("state="),
+            "error should carry the last observed screen state: {}",
+            err
+        );
+        // A single unclamped settle would be ~10.3 s; the budget plus a small
+        // tolerance is the bound the reviewer asked us to prove.
+        assert!(
+            elapsed < startup_timeout + Duration::from_secs(1),
+            "startup ran {elapsed:?}, past the {startup_timeout:?} budget: {err}"
+        );
     }
 }
