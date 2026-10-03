@@ -107,9 +107,13 @@ a freebuff UI change is a one-module fix.
 Environment: `BLINK_FREEBUFF_BIN` (default `freebuff`),
 `BLINK_STARTUP_TIMEOUT_S` (25), `BLINK_TURN_TIMEOUT_S` (900),
 `BLINK_SETTLE_TIMEOUT_S` (5), `BLINK_MANICODE_DIR` (`~/.config/manicode`),
-`RUST_LOG` (logs go to stderr; stdout is JSON-RPC only). The startup budget
-defaults to 25 s so it expires inside the client's hard-coded 30 s
-`session/new` deadline, with room to report why a slow splash never settled.
+`BLINK_DUMP_SCREEN` (unset), `RUST_LOG` (logs go to stderr; stdout is JSON-RPC
+only). `BLINK_DUMP_SCREEN` is a file path; when set, a startup timeout writes
+the raw screen there — every physical row with its exact length and trailing
+padding, so a misclassification can be re-derived from the bytes. Unset, it is
+inert. The startup budget defaults to 25 s so it expires inside the client's
+hard-coded 30 s `session/new` deadline, with room to report why a slow splash
+never settled.
 
 `BLINK_MODEL` pins the model picked on freebuff's splash: a name or id
 fragment (`deepseek/deepseek-v4.1-flash`, `glm-5.3-flash`, `mimo-2.5`),

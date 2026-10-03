@@ -67,6 +67,11 @@ pub struct DriverConfig {
     /// never hardcoded); unset means Enter on the collapsed splash. A name
     /// that matches nothing (or several rows) fails loudly.
     pub model: Option<String>,
+    /// Path to dump the raw startup screen to on a startup timeout (default:
+    /// None, env: BLINK_DUMP_SCREEN). Unset means the feature is inert — no
+    /// file I/O and no hot-path cost. Set it to capture exactly what the
+    /// classifier sees, so a misclassification can be re-derived from bytes.
+    pub dump_screen: Option<PathBuf>,
 }
 
 impl DriverConfig {
@@ -90,6 +95,9 @@ impl DriverConfig {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let dump_screen = std::env::var_os("BLINK_DUMP_SCREEN")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty());
 
         Self {
             program,
@@ -105,6 +113,7 @@ impl DriverConfig {
             settle_timeout: Duration::from_secs(settle_timeout_secs),
             submit_timeout,
             model,
+            dump_screen,
         }
     }
 }
@@ -192,6 +201,34 @@ fn redact_home_with(s: &str, home: &str) -> String {
     } else {
         s.replace(home, "~")
     }
+}
+
+/// Write the raw startup screen to `path` for offline classification
+/// debugging. Preserves every physical row exactly — its trailing padding
+/// included — with its character count, so the wrap decision (a row continues
+/// when `len == width && last cell != space`) can be re-derived from the
+/// bytes. Each row's content is delimited `|<content>|` and prefixed with its
+/// index and length, so trailing spaces survive a text editor and `git diff`.
+/// Returns the raw I/O error; callers must `warn!` and keep their own error.
+fn write_screen_dump(
+    path: &Path,
+    rows: &[String],
+    state: &ScreenState,
+    cols: u16,
+    screen_rows: u16,
+) -> std::io::Result<()> {
+    let mut out = String::new();
+    out.push_str("# blink screen dump\n");
+    out.push_str(&format!("# state: {state:?}\n"));
+    out.push_str(&format!(
+        "# cols: {cols} rows: {screen_rows} count: {}\n",
+        rows.len()
+    ));
+    out.push_str("# format: row NNN len=LLL |<exact content including trailing padding>|\n");
+    for (i, row) in rows.iter().enumerate() {
+        out.push_str(&format!("row {i:03} len={} |{row}|\n", row.chars().count()));
+    }
+    std::fs::write(path, out)
 }
 
 /// Session state held by the backend.
@@ -437,6 +474,20 @@ impl FreebuffBackend {
         let snap = pty.screen();
         let pid = pty.pid().unwrap_or(0);
         let state = classify(&snap.rows);
+        // Capture the raw screen ONCE for offline classification debugging.
+        // Inert unless BLINK_DUMP_SCREEN is set: unset means no file I/O here.
+        // An I/O failure must never mask the real startup error.
+        if let Some(path) = self.cfg.dump_screen.as_deref() {
+            if let Err(e) =
+                write_screen_dump(path, &snap.rows, &state, self.cfg.cols, self.cfg.rows)
+            {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "startup: could not write BLINK_DUMP_SCREEN dump; keeping the startup error"
+                );
+            }
+        }
         anyhow!(
             "startup timeout after {:?} pid={} state={:?}; last screen: {}",
             self.cfg.startup_timeout,
@@ -1947,5 +1998,74 @@ mod tests {
             elapsed < startup_timeout + Duration::from_secs(1),
             "startup ran {elapsed:?}, past the {startup_timeout:?} budget: {err}"
         );
+    }
+
+    /// The dump must preserve every row's exact content and length, trailing
+    /// padding included, so the wrap rule can be re-derived from the bytes.
+    /// One short padded row plus one genuinely full row proves the distinction.
+    #[test]
+    fn screen_dump_round_trips_rows_and_lengths() {
+        let tmp = test_temp_dir();
+        let path = tmp.0.join("dump.txt");
+        let padded_short = format!("short padded row{}", " ".repeat(4));
+        let full = "z".repeat(120);
+        let rows = vec![padded_short.clone(), full.clone()];
+
+        write_screen_dump(&path, &rows, &ScreenState::Unknown, 120, 40).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# state: Unknown"), "{text}");
+        assert!(text.contains("# cols: 120 rows: 40 count: 2"), "{text}");
+
+        let mut dumped: Vec<(usize, usize, String)> = Vec::new();
+        for line in text.lines().filter(|l| l.starts_with("row ")) {
+            let rest = line.strip_prefix("row ").unwrap();
+            let (idx, rest) = rest.split_once(' ').unwrap();
+            let (len_field, rest) = rest.split_once(' ').unwrap();
+            let len: usize = len_field.strip_prefix("len=").unwrap().parse().unwrap();
+            let start = rest.find('|').unwrap() + 1;
+            let end = rest.rfind('|').unwrap();
+            // The delimiters bracket exactly `len` chars.
+            assert_eq!(end - start, len, "line: {line}");
+            dumped.push((idx.parse().unwrap(), len, rest[start..end].to_string()));
+        }
+
+        assert_eq!(dumped.len(), 2);
+        assert_eq!(dumped[0].0, 0);
+        assert_eq!(dumped[0].1, padded_short.chars().count());
+        assert_eq!(dumped[0].2, padded_short);
+        assert!(
+            dumped[0].2.ends_with("    "),
+            "trailing padding must survive"
+        );
+        assert_eq!(dumped[1].0, 1);
+        assert_eq!(dumped[1].1, 120);
+        assert_eq!(dumped[1].2, full);
+    }
+
+    /// An unwritable BLINK_DUMP_SCREEN path must not replace the real startup
+    /// error — the write only warns.
+    #[tokio::test]
+    async fn t14_unwritable_dump_path_keeps_original_startup_error() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let mut cfg = test_config(&temp_dir, Some("hang-splash"));
+        cfg.startup_timeout = Duration::from_secs(1);
+        // Parent directory does not exist: the dump write fails.
+        let bad = temp_dir.join("no-such-dir").join("dump.txt");
+        cfg.dump_screen = Some(bad.clone());
+        let backend = FreebuffBackend::new(cfg);
+
+        let result = backend.new_session(temp_dir.clone()).await;
+        let err = result.expect_err("startup must time out").to_string();
+        assert!(
+            err.contains("startup timeout"),
+            "original error must survive a dump failure: {err}"
+        );
+        assert!(
+            err.contains("state="),
+            "original error must survive a dump failure: {err}"
+        );
+        assert!(!bad.exists(), "dump must not have been written");
     }
 }
