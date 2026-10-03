@@ -39,16 +39,6 @@ pub const SPLASH_ACCEPT_KEY: &str = "\r";
 /// Classify the current screen state from a list of text rows (ANSI already stripped).
 pub fn classify(rows: &[String]) -> ScreenState {
     // Precedence: FreebucksGate > AlreadyRunning > Login > SessionEnded > KickedOut > Busy > ModelList > ModelSplash > Idle > Booting > Unknown
-    //
-    // `logical` reunites rows split by a terminal wrap; the short single-row
-    // markers below are matched on physical rows (they never wrap), while the
-    // Idle affordance and the status row must see through a wrap.
-    let logical = logical_lines(rows);
-    let any = |needle: &str| {
-        rows.iter()
-            .chain(logical.iter())
-            .any(|r| r.contains(needle))
-    };
 
     // Check for FreebucksGate first (inside the model box)
     for row in rows {
@@ -118,16 +108,17 @@ pub fn classify(rows: &[String]) -> ScreenState {
         return ScreenState::ModelSplash;
     }
 
-    // Check for Idle: a live session status row (active model, carrying
-    // `/model to change`; the `N[hm] left` figure is present on some plans and
-    // absent on others, e.g. `GLM 5.3 Flash • max · ...`) AND an input
-    // affordance (placeholder or "✕ End session"). Keying on the status row —
-    // not a time figure, and not merely the placeholder — keeps this specific
-    // enough that screens matched earlier in the precedence chain (splash,
-    // login) are never misread as Idle.
+    // Check for Idle: a live session status row (active model; the plan may
+    // report remaining time or omit it, e.g. `GLM 5.3 Flash • max · ...`) AND
+    // an input affordance (placeholder or "✕ End session"). Keying on the
+    // status row — not a time figure, and not merely the placeholder — keeps
+    // this specific enough that screens matched earlier in the precedence
+    // chain (splash, login) are never misread as Idle.
     let has_status_row = active_model(rows).is_some();
-    let has_placeholder = any("Enter a coding task or / for commands");
-    let has_end_session = any("✕ End session");
+    let has_placeholder = rows
+        .iter()
+        .any(|r| r.contains("Enter a coding task or / for commands"));
+    let has_end_session = rows.iter().any(|r| r.contains("✕ End session"));
     if has_status_row && (has_placeholder || has_end_session) {
         return ScreenState::Idle;
     }
@@ -308,9 +299,9 @@ pub fn match_model(target: &str, names: &[String]) -> ModelMatch {
 }
 
 /// Active model and (optional) time left from the Idle screen's status row.
-/// Two shapes are accepted: current plans mark the row with `/model to change`
-/// and may report no remaining time (e.g. `GLM 5.3 Flash • max · /dir ·
-/// /model to change · Chat: New chat`), while older plans carry a
+/// Two shapes are accepted: current plans mark the row with the `/model`
+/// command hint and may report no remaining time (e.g. `GLM 5.3 Flash • max ·
+/// /dir · /model to change · Chat: New chat`), while older plans carry a
 /// `\d+[hm] left` figure. The name is the trimmed text before the first ` · `
 /// or ` • `; the time is the `\d+[hm] left` fragment when present. Rows
 /// mentioning Freebucks are splash cost lines, not the status row. Returns
@@ -319,25 +310,30 @@ pub fn match_model(target: &str, names: &[String]) -> ModelMatch {
 /// active model is shown — callers must fail loudly rather than assume the
 /// requested model is active.
 pub fn active_model(rows: &[String]) -> Option<(String, Option<String>)> {
-    // Physical rows first (an unwrapped status row matches exactly as before),
-    // then reconstructed logical lines so a status row split by a terminal
-    // wrap still parses.
-    let logical = logical_lines(rows);
-    rows.iter()
-        .chain(logical.iter())
-        .find_map(|row| parse_status_row(row))
+    rows.iter().find_map(|row| parse_status_row(row))
 }
 
-/// Parse a single (physical or reconstructed logical) row as the live-session
-/// status row. Shape A: current plans mark it with `/model to change` and the
-/// remaining-time figure may be absent (`• max`) or present. Shape B: older
-/// plans carry `<Name> · <N>[hm] left`, with nothing prose-like after the
-/// figure so transcript lines stay rejected.
+/// Parse a single physical row as the live-session status row. Shape A:
+/// current plans mark it with the `/model` command hint and the remaining-time
+/// figure may be absent (`• max`) or present. Shape B: older plans carry
+/// `<Name> · <N>[hm] left`, with nothing prose-like after the figure so
+/// transcript lines stay rejected.
+///
+/// Why `/model` and not the full `/model to change`: freebuff soft-wraps at a
+/// WORD boundary, so with a long working directory the marker is split across
+/// two physical rows (`... · /model` / `to change · Chat: New chat`). Every
+/// row is padded to the PTY width, so a soft-wrapped row is byte-indistinguishable
+/// from an ordinary padded row and the wrap cannot be reconstructed reliably.
+/// `/model` sits on the first physical row in both the wrapped and unwrapped
+/// forms. It cannot false-match on its own: the name must be followed by a
+/// ` · `/` • ` separator (so a bare `/model` mention is rejected), and Idle is
+/// only reached after all higher-precedence states (gates, login, busy, the
+/// splash shapes) have failed.
 fn parse_status_row(row: &str) -> Option<(String, Option<String>)> {
     if row.contains("Freebucks") {
         return None;
     }
-    if row.contains("/model to change") {
+    if row.contains("/model") {
         let sep = first_separator(row)?;
         let name = row[..sep].trim();
         if name.is_empty() {
@@ -365,33 +361,6 @@ fn parse_status_row(row: &str) -> Option<(String, Option<String>)> {
         return None;
     }
     Some((name.to_string(), Some(time.to_string())))
-}
-
-/// Reconstruct logical (unwrapped) lines from physical terminal rows. A
-/// terminal wraps by filling the full width, so a row whose content reaches
-/// the widest row and whose last cell is not a space continues on the next
-/// row; a row that is short or ends in padding is a logical line of its own.
-/// vt100 rows are space-padded to the PTY width, which is exactly why fullness
-/// must require a non-space final cell (every padded short row would otherwise
-/// look continuous). The width is taken from the rows themselves — the
-/// snapshot is fixed-width for a given PTY — so callers need not thread `cols`
-/// through. A boundary space that the terminal moved to the continuation row's
-/// first cell is preserved by plain concatenation.
-fn logical_lines(rows: &[String]) -> Vec<String> {
-    let width = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0);
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    for row in rows {
-        cur.push_str(row);
-        let full = width > 0 && row.chars().count() == width && !row.ends_with(' ');
-        if !full {
-            out.push(std::mem::take(&mut cur));
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
 }
 
 /// Byte index of the first status-row separator, ` · ` or ` • `.
@@ -597,6 +566,7 @@ mod tests {
             "splash-list-80x24-focus1" => fixture!("splash-list-80x24-focus1"),
             "idle-120x40" => fixture!("idle-120x40"),
             "idle-midhour-120x40" => fixture!("idle-midhour-120x40"),
+            "idle-max-plan-120x40" => fixture!("idle-max-plan-120x40"),
             "busy-120x40" => fixture!("busy-120x40"),
             "busy-first-instant-120x40" => fixture!("busy-first-instant-120x40"),
             "after-esc" => fixture!("after-esc"),
@@ -873,6 +843,31 @@ mod tests {
         );
     }
 
+    /// The real screen captured via BLINK_DUMP_SCREEN on this plan: rows
+    /// 034/036/037/038/039 byte-for-byte, trailing padding included. The
+    /// status row soft-wraps (`... · /model` / `to change · Chat: New chat`),
+    /// so the literal `/model to change` is on neither row alone — the
+    /// regression the hand-written fixtures never caught. (The full 40-row
+    /// capture is pending; these are the verbatim-quoted rows.)
+    #[test]
+    fn idle_max_plan_fixture_classifies_as_idle() {
+        let rows = load_fixture("idle-max-plan-120x40");
+        // Padding survives the fixture file and `.lines()`.
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|r| r.chars().count() == 120));
+        // The marker really is split across two physical rows.
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("/model") && !r.contains("/model to change")),
+            "fixture must contain the soft-wrapped status row"
+        );
+        assert_eq!(classify(&rows), ScreenState::Idle);
+        assert_eq!(
+            active_model(&rows),
+            Some(("GLM 5.3 Flash".to_string(), None))
+        );
+    }
+
     /// The time-left plan shape must still classify as Idle.
     #[test]
     fn idle_time_left_shapes_classify_as_idle() {
@@ -886,50 +881,6 @@ mod tests {
             ];
             assert_eq!(classify(&rows), ScreenState::Idle, "status: {status}");
         }
-    }
-
-    /// When the working directory is long the status row WRAPS at the PTY
-    /// width, splitting `/model to change` across two physical rows. These are
-    /// the real captured rows — the wrap moved the boundary space to the start
-    /// of the second row — padded full-width the way a vt100 snapshot is.
-    #[test]
-    fn idle_wrapped_status_row_classifies_as_idle() {
-        let row1 = " GLM 5.3 Flash • max · /private/var/folders/kl/8t4rp31969n3ts1h9_xm09k80000gn/T/blink-e2e-42350-1790991429936 · /model";
-        let row2 = " to change · Chat: New chat";
-        let placeholder = "│  ▍Enter a coding task or / for commands";
-        let width = [row1, row2, placeholder]
-            .iter()
-            .map(|s| s.chars().count())
-            .max()
-            .unwrap();
-        let pad = |s: &str| format!("{s:<width$}");
-        let rows = vec![pad(row1), pad(row2), pad(placeholder)];
-        assert_eq!(classify(&rows), ScreenState::Idle);
-        assert_eq!(
-            active_model(&rows),
-            Some(("GLM 5.3 Flash".to_string(), None))
-        );
-    }
-
-    /// A wrapped `<Name> · <N>[hm] left` row must still classify as Idle and
-    /// report its time, so both plan shapes work wrapped and unwrapped.
-    #[test]
-    fn idle_wrapped_time_left_row_classifies_as_idle() {
-        let row1 = " MiMo 2.5 · 58m left · 20.7K (2%)      ✕ End sessi";
-        let row2 = "on";
-        let placeholder = "│  ▍Enter a coding task or / for commands";
-        let width = [row1, row2, placeholder]
-            .iter()
-            .map(|s| s.chars().count())
-            .max()
-            .unwrap();
-        let pad = |s: &str| format!("{s:<width$}");
-        let rows = vec![pad(row1), pad(row2), pad(placeholder)];
-        assert_eq!(classify(&rows), ScreenState::Idle);
-        assert_eq!(
-            active_model(&rows),
-            Some(("MiMo 2.5".to_string(), Some("58m left".to_string())))
-        );
     }
 
     /// Idle must key on a live session status row, not merely the input
@@ -967,8 +918,8 @@ mod tests {
     #[test]
     fn active_model_table() {
         // Shape B (older plans): a `<Name> · <N>[hm] left` status row.
-        // Shape A (current plans): `/model to change` marks the row; the
-        // remaining-time figure may be present or absent.
+        // Shape A (current plans): the `/model` command hint marks the row;
+        // the remaining-time figure may be present or absent.
         type Case<'a> = (&'a str, Option<(&'a str, Option<&'a str>)>);
         let cases: &[Case] = &[
             (
@@ -997,10 +948,14 @@ mod tests {
             // Splash cost lines are not the status row.
             (" Session ended · 25 Freebucks left", None),
             (" 5 Freebucks/hr", None),
-            // No `/model to change`, no time token, no separator, empty name.
+            // No `/model`, no time token, no separator, empty name.
             (" MiMo 2.5 · Balanced · Images", None),
             ("MiMo 2.5 58m left", None),
             (" · 58m left", None),
+            // The `/model` marker alone is not enough: a name plus a separator
+            // is still required.
+            (" /model to change", None),
+            (" /model", None),
             // Transcript-like row: time-shaped text with trailing prose is
             // not the status row.
             (" Thinking · 5m left on the problem", None),
