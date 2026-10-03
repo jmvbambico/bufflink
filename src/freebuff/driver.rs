@@ -44,7 +44,12 @@ pub struct DriverConfig {
     pub cols: u16,
     /// Terminal height in rows (default: 40).
     pub rows: u16,
-    /// Startup timeout waiting for Idle (default: 60s).
+    /// Startup timeout waiting for Idle (default: 25s, env: BLINK_STARTUP_TIMEOUT_S).
+    ///
+    /// Must expire INSIDE omnigent's hard-coded, non-configurable 30 s
+    /// `session/new` deadline, leaving ~5 s for blink's own error to
+    /// serialise and reach the client. Otherwise the client aborts the
+    /// request mid-poll and blink never reports why.
     pub startup_timeout: Duration,
     /// Per-turn timeout (default: 15min, env: BLINK_TURN_TIMEOUT_S).
     pub turn_timeout: Duration,
@@ -79,6 +84,8 @@ impl DriverConfig {
             .unwrap_or(5);
         let submit_timeout =
             parse_submit_timeout(std::env::var("BLINK_SUBMIT_TIMEOUT_S").ok().as_deref());
+        let startup_timeout =
+            parse_startup_timeout(std::env::var("BLINK_STARTUP_TIMEOUT_S").ok().as_deref());
         let model = std::env::var("BLINK_MODEL")
             .ok()
             .map(|s| s.trim().to_string())
@@ -91,7 +98,7 @@ impl DriverConfig {
             manicode_dir: None,
             cols: 120,
             rows: 40,
-            startup_timeout: Duration::from_secs(60),
+            startup_timeout,
             turn_timeout: Duration::from_secs(turn_timeout_secs),
             poll_interval: Duration::from_millis(250),
             exit_timeout: Duration::from_secs(3),
@@ -121,6 +128,67 @@ fn parse_submit_timeout(raw: Option<&str>) -> Duration {
 /// zero so a programmatically built config can never underflow.
 fn remainder_after_nudge(submit_timeout: Duration) -> Duration {
     submit_timeout.saturating_sub(Duration::from_secs(2))
+}
+
+/// Parse `BLINK_STARTUP_TIMEOUT_S`. Default 25 s when the variable is absent or
+/// unparseable — it must expire inside omnigent's hard-coded 30 s `session/new`
+/// deadline, leaving ~5 s for blink's own error to serialise and reach the
+/// client. Floored at 2 s: at the 250 ms poll interval that is at least eight
+/// classification ticks, so the loop cannot expire before it has observed the
+/// screen (and it mirrors the sibling floor).
+fn parse_startup_timeout(raw: Option<&str>) -> Duration {
+    let secs = match raw.and_then(|s| s.parse::<u64>().ok()) {
+        Some(v) => v,
+        None => return Duration::from_secs(25),
+    };
+    if secs < 2 {
+        warn!("BLINK_STARTUP_TIMEOUT_S={secs} is below the 2 s floor; using 2 s");
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
+/// Bounded, single-line tail of a captured screen for error messages. A human
+/// tells "still on the splash" from "stuck on an ad" from the last few rows,
+/// not from the whole buffer; whitespace is collapsed to one line and the home
+/// directory is redacted so the client's error log carries no username.
+fn screen_tail(rows: &[String]) -> String {
+    const MAX_ROWS: usize = 4;
+    const MAX_CHARS: usize = 240;
+
+    let non_empty: Vec<&String> = rows.iter().filter(|r| !r.trim().is_empty()).collect();
+    let start = non_empty.len().saturating_sub(MAX_ROWS);
+    let joined = non_empty[start..]
+        .iter()
+        .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    let joined = if joined.chars().count() > MAX_CHARS {
+        format!("{}…", joined.chars().take(MAX_CHARS).collect::<String>())
+    } else {
+        joined
+    };
+    redact_home(&joined)
+}
+
+/// Redact the current `$HOME` prefix to `~`.
+fn redact_home(s: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) => redact_home_with(s, &home),
+        Err(_) => s.to_string(),
+    }
+}
+
+/// Replace `home` with `~` when non-empty. Split out so the redaction is
+/// unit-testable without mutating the process environment.
+fn redact_home_with(s: &str, home: &str) -> String {
+    if home.is_empty() {
+        s.to_string()
+    } else {
+        s.replace(home, "~")
+    }
 }
 
 /// Session state held by the backend.
@@ -408,18 +476,25 @@ impl FreebuffBackend {
         let mut model_presses: u32 = 0;
         // Previous poll's screen, to spot the collapsed splash expanding.
         let mut prev_was_splash = false;
+        // Last state we already logged: one stderr line per TRANSITION, not per
+        // 250 ms tick (a tick log would be a spin-dump). A silent startup is
+        // why omnigent captured no diagnostics at all.
+        let mut last_state: Option<ScreenState> = None;
 
-        let startup_deadline = Instant::now() + self.cfg.startup_timeout;
+        let startup_start = Instant::now();
+        let startup_deadline = startup_start + self.cfg.startup_timeout;
 
         loop {
             if Instant::now() >= startup_deadline {
                 let snap = pty.screen();
                 let pid = pty.pid().unwrap_or(0);
+                let state = classify(&snap.rows);
                 return Err(anyhow!(
-                    "startup timeout after {:?} pid={}; last screen:\n{}",
+                    "startup timeout after {:?} pid={} state={:?}; last screen: {}",
                     self.cfg.startup_timeout,
                     pid,
-                    snap.text()
+                    state,
+                    screen_tail(&snap.rows)
                 ));
             }
 
@@ -435,6 +510,15 @@ impl FreebuffBackend {
 
             let snap = pty.screen();
             let state = classify(&snap.rows);
+
+            if last_state.as_ref() != Some(&state) {
+                info!(
+                    elapsed_ms = startup_start.elapsed().as_millis(),
+                    state = ?state,
+                    "startup: state transition"
+                );
+                last_state = Some(state.clone());
+            }
 
             // WHY: the expanded list refocuses from the top on every entry,
             // so a stale Down count from an earlier visit would cap the walk early.
@@ -1530,6 +1614,25 @@ mod tests {
             "error should mention timeout: {}",
             err
         );
+        // Fail loudly: the error must name the last observed screen state and
+        // carry a bounded tail of the screen, not just the elapsed time.
+        // The fake's narrow splash box wraps its continuation rows with `│`
+        // borders, so its model rows count as an expanded list.
+        assert!(
+            err.contains("state=ModelList"),
+            "error should name the last observed screen state: {}",
+            err
+        );
+        assert!(
+            err.contains("See all 4 models"),
+            "error should carry a screen tail: {}",
+            err
+        );
+        assert!(
+            !err.contains('\n'),
+            "timeout error must be single-line-ish, not a screen dump: {}",
+            err
+        );
         // Extract pid from error message: "pid=<n>"
         let pid_str = err.split("pid=").nth(1).and_then(|s| {
             s.chars()
@@ -1706,5 +1809,49 @@ mod tests {
         assert_eq!(parse_submit_timeout(Some("0")), Duration::from_secs(2));
         assert_eq!(parse_submit_timeout(Some("30")), Duration::from_secs(30));
         assert_eq!(parse_submit_timeout(None), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn startup_timeout_env_parsing_table() {
+        // Absent falls back to the 25 s default, which expires inside
+        // omnigent's hard-coded 30 s session/new deadline.
+        assert_eq!(parse_startup_timeout(None), Duration::from_secs(25));
+        // A parsed value is used as given.
+        assert_eq!(parse_startup_timeout(Some("25")), Duration::from_secs(25));
+        assert_eq!(parse_startup_timeout(Some("45")), Duration::from_secs(45));
+        // Unparseable values fall back to the default.
+        assert_eq!(parse_startup_timeout(Some("nope")), Duration::from_secs(25));
+        assert_eq!(parse_startup_timeout(Some("-5")), Duration::from_secs(25));
+        // Below the floor clamps up to 2 s (with a warning).
+        assert_eq!(parse_startup_timeout(Some("0")), Duration::from_secs(2));
+        assert_eq!(parse_startup_timeout(Some("1")), Duration::from_secs(2));
+        assert_eq!(parse_startup_timeout(Some("2")), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn screen_tail_is_bounded_and_collapses_whitespace() {
+        // Only the last few non-empty rows survive, joined on one line.
+        let rows: Vec<String> = (0..10).map(|i| format!("row {i}")).collect();
+        assert_eq!(screen_tail(&rows), "row 6 | row 7 | row 8 | row 9");
+
+        // Interior runs of whitespace collapse to single spaces.
+        let rows = vec!["  Not   enough\tFreebucks  ".to_string()];
+        assert_eq!(screen_tail(&rows), "Not enough Freebucks");
+
+        // A long tail is truncated to a bounded, single line.
+        let rows = vec!["x".repeat(500)];
+        let tail = screen_tail(&rows);
+        assert!(tail.chars().count() <= 241, "tail too long: {}", tail.len());
+        assert!(tail.ends_with('…'));
+    }
+
+    #[test]
+    fn redact_home_replaces_the_home_prefix() {
+        assert_eq!(
+            redact_home_with("Directory /Users/alice/proj", "/Users/alice"),
+            "Directory ~/proj"
+        );
+        // An empty home (unset) must not replace everything.
+        assert_eq!(redact_home_with("/tmp/x", ""), "/tmp/x");
     }
 }
