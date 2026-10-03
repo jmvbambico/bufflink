@@ -1512,6 +1512,37 @@ mod tests {
         backend.shutdown().await;
     }
 
+    /// The legacy `user-interrupt` cancellation form (older freebuff builds)
+    /// must still surface as a cancelled turn, so both fake scenarios are
+    /// covered end to end.
+    #[tokio::test]
+    async fn t15_legacy_user_interrupt_cancel_returns_cancelled() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("slow-legacy-interrupt"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+
+        let (tx, _rx) = mpsc::channel(64);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let sink = UpdateSink::new(tx);
+
+        let prompt_fut = backend.prompt(&session_id, "slow count".to_string(), sink, cancel_rx);
+        tokio::pin!(prompt_fut);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cancel_tx.send(true).unwrap();
+
+        let result = timeout(Duration::from_secs(5), prompt_fut).await;
+        assert!(result.is_ok(), "prompt timed out");
+        let result = result.unwrap();
+        assert!(result.is_ok(), "prompt error: {:?}", result.err());
+        assert_eq!(result.unwrap(), StopReason::Cancelled);
+
+        backend.shutdown().await;
+    }
+
     #[tokio::test]
     async fn t4_shutdown_makes_child_exit() {
         let tmp = test_temp_dir();

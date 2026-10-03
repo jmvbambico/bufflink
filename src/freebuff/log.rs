@@ -18,6 +18,10 @@ pub enum LogEvent {
     Finished { output_type: String },
     /// Agent execution failed: `Agent execution failed` with data.error.message
     Failed { message: String },
+    /// User cancelled the turn: `Agent run cancelled by user (abort error)`.
+    /// Captured from a live freebuff run on 2026-10-03; unlike the legacy
+    /// `Agent execution failed` form this line carries no `data.message`.
+    Cancelled,
     /// Any other line.
     Other,
 }
@@ -79,6 +83,15 @@ pub fn parse_log_line(line: &str) -> LogEvent {
         return LogEvent::Failed { message };
     }
 
+    // Cancelled: freebuff's real user-cancellation line. Captured from a live
+    // run on 2026-10-03 — INFO `Agent run cancelled by user (abort error)`
+    // carrying a `data` object with no `message` field, so it never parsed as
+    // `Failed`. Match the stable prefix; the "(abort error)" parenthetical is
+    // incidental.
+    if msg.starts_with("Agent run cancelled by user") {
+        return LogEvent::Cancelled;
+    }
+
     LogEvent::Other
 }
 
@@ -104,13 +117,16 @@ pub enum TurnOutcome {
 /// Determine the turn outcome from a sequence of log events.
 /// Returns None until a Finished event is seen.
 /// Finished{lastMessage} -> Completed
-/// Finished{error} preceded by Failed{"user-interrupt"} -> Interrupted
+/// Finished{error} preceded by a cancellation (Cancelled, or the legacy
+///   Failed{"user-interrupt"}) -> Interrupted
 /// Finished{error} otherwise -> Error{last Failed message or "unknown"}
 pub fn outcome(events: &[LogEvent]) -> Option<TurnOutcome> {
     let mut last_failed_message: Option<String> = None;
+    let mut cancelled = false;
 
     for event in events {
         match event {
+            LogEvent::Cancelled => cancelled = true,
             LogEvent::Failed { message } => {
                 last_failed_message = Some(message.clone());
             }
@@ -118,10 +134,10 @@ pub fn outcome(events: &[LogEvent]) -> Option<TurnOutcome> {
                 if output_type == "lastMessage" {
                     return Some(TurnOutcome::Completed);
                 } else if output_type == "error" {
-                    if let Some(ref msg) = last_failed_message {
-                        if msg == "user-interrupt" {
-                            return Some(TurnOutcome::Interrupted);
-                        }
+                    // A user cancellation is not a failure: freebuff's real
+                    // builds emit Cancelled, older builds Failed{"user-interrupt"}.
+                    if cancelled || last_failed_message.as_deref() == Some("user-interrupt") {
+                        return Some(TurnOutcome::Interrupted);
                     }
                     return Some(TurnOutcome::Error {
                         message: last_failed_message.unwrap_or_else(|| "unknown".to_string()),
@@ -255,6 +271,66 @@ mod tests {
             outcome(&events),
             Some(TurnOutcome::Error {
                 message: "timeout".to_string()
+            })
+        );
+    }
+
+    /// The real cancellation pair captured from a live run on 2026-10-03: an
+    /// INFO `Agent run cancelled by user (abort error)` with no `data.message`,
+    /// then `Main prompt finished` `outputType=error`. The old parser fell
+    /// through to Error{"unknown"} here, so session/cancel never produced
+    /// stopReason=cancelled.
+    #[test]
+    fn outcome_real_cancellation_is_interrupted() {
+        let cancel_line = r#"{"level":30,"timestamp":"2026-10-03T00:00:00.000Z","pid":123,"hostname":"mac","msg":"Agent run cancelled by user (abort error)","data":{"agentType":"main-agent","agentId":"main-agent","runId":"run-1","totalSteps":3,"messageHistory":[]}}"#;
+        let finished_line = r#"{"level":20,"timestamp":"2026-10-03T00:00:01.000Z","pid":123,"hostname":"mac","msg":"Main prompt finished","data":{"outputType":"error"}}"#;
+        assert_eq!(parse_log_line(cancel_line), LogEvent::Cancelled);
+        let events = vec![
+            LogEvent::TurnStarted,
+            parse_log_line(cancel_line),
+            parse_log_line(finished_line),
+        ];
+        assert_eq!(outcome(&events), Some(TurnOutcome::Interrupted));
+    }
+
+    /// The legacy `user-interrupt` failure form still maps to Interrupted.
+    #[test]
+    fn outcome_legacy_user_interrupt_is_interrupted() {
+        let line = r#"{"level":30,"timestamp":"2026-09-19T14:41:06.000Z","pid":88366,"hostname":"mac","msg":"Agent execution failed","data":{"error":{"name":"Error","message":"user-interrupt"}}}"#;
+        let events = vec![
+            parse_log_line(line),
+            LogEvent::Finished {
+                output_type: "error".to_string(),
+            },
+        ];
+        assert_eq!(outcome(&events), Some(TurnOutcome::Interrupted));
+    }
+
+    /// A genuine failure stays an Error and is never misread as a cancellation.
+    #[test]
+    fn outcome_genuine_failure_is_error() {
+        let failed = r#"{"level":30,"timestamp":"2026-09-19T14:41:06.000Z","pid":88366,"hostname":"mac","msg":"Agent execution failed","data":{"error":{"name":"Error","message":"timeout"}}}"#;
+        // Other failure message: Error, not Interrupted.
+        let events = vec![
+            parse_log_line(failed),
+            LogEvent::Finished {
+                output_type: "error".to_string(),
+            },
+        ];
+        assert_eq!(
+            outcome(&events),
+            Some(TurnOutcome::Error {
+                message: "timeout".to_string()
+            })
+        );
+        // No failure event at all: still Error{"unknown"}, not Interrupted.
+        let events = vec![LogEvent::Finished {
+            output_type: "error".to_string(),
+        }];
+        assert_eq!(
+            outcome(&events),
+            Some(TurnOutcome::Error {
+                message: "unknown".to_string()
             })
         );
     }

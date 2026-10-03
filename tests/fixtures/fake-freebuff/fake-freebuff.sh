@@ -289,6 +289,10 @@ case "${FAKE_FREEBUFF_MODE:-}" in
         # Normal flow; idle_prompt shows the placeholder (paste consumed) for
         # 6 s before going busy.
         ;;
+    slow-legacy-interrupt)
+        # Normal flow; the cancel path emits the LEGACY `user-interrupt` form
+        # instead of the real cancellation line (see the *slow* arm below).
+        ;;
     unparsable)
         print_splash
         read -r _
@@ -413,7 +417,16 @@ idle_prompt() {
             while [ $waited -lt 100 ]; do
                 b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' ')
                 if [ "$b" = "1b" ]; then
-                    write_log_line 'Agent execution failed' '{"error":{"name":"Error","message":"user-interrupt"}}'
+                    if [ "$FAKE_FREEBUFF_MODE" = "slow-legacy-interrupt" ]; then
+                        # Legacy freebuff builds: a Failed event whose message
+                        # is exactly "user-interrupt".
+                        write_log_line 'Agent execution failed' '{"error":{"name":"Error","message":"user-interrupt"}}'
+                    else
+                        # Real freebuff (captured 2026-10-03): an INFO
+                        # "Agent run cancelled by user (abort error)" with no
+                        # data.message field.
+                        write_log_line 'Agent run cancelled by user (abort error)' '{"agentType":"main-agent","agentId":"main-agent","runId":"run-1","totalSteps":1,"messageHistory":[]}'
+                    fi
                     write_log_line 'Main prompt finished' '{"outputType":"error"}'
                     break
                 fi
