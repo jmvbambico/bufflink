@@ -256,7 +256,12 @@ async fn e2e_single_launch_pong_cancel_exit() {
         )
         .await
         .unwrap();
-    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        resp["result"]["stopReason"],
+        "end_turn",
+        "unexpected prompt response: {}",
+        serde_json::to_string_pretty(&resp).unwrap()
+    );
     let text = message_text(&updates);
     assert!(text.contains("PONG"));
     for update in &updates {
@@ -291,7 +296,12 @@ async fn e2e_single_launch_pong_cancel_exit() {
     loop {
         let msg = c.next_message(Duration::from_secs(60)).await.unwrap();
         if msg.get("id").and_then(Value::as_u64) == Some(id) {
-            assert_eq!(msg["result"]["stopReason"], "cancelled");
+            assert_eq!(
+                msg["result"]["stopReason"],
+                "cancelled",
+                "cancel produced the wrong response: {}",
+                serde_json::to_string_pretty(&msg).unwrap()
+            );
             break;
         }
     }
@@ -305,7 +315,12 @@ async fn e2e_single_launch_pong_cancel_exit() {
         )
         .await
         .unwrap();
-    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        resp["result"]["stopReason"],
+        "end_turn",
+        "unexpected prompt response: {}",
+        serde_json::to_string_pretty(&resp).unwrap()
+    );
     assert!(message_text(&updates).contains("PING"));
     for update in &updates {
         assert_eq!(update["params"]["sessionId"].as_str(), Some(sid.as_str()));

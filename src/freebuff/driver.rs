@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use tokio::fs;
 use tokio::sync::{watch, Mutex};
@@ -335,7 +335,9 @@ impl FreebuffBackend {
             return Ok(Vec::new());
         }
 
-        let content = fs::read(&log_path).await?;
+        let content = fs::read(&log_path)
+            .await
+            .with_context(|| format!("freebuff: failed to read turn log {}", log_path.display()))?;
         let new_content = &content[*offset as usize..];
         *offset = file_size;
 
@@ -448,12 +450,14 @@ impl FreebuffBackend {
     async fn check_errors(&self, pty: &Pty) -> Result<()> {
         let snap = pty.screen();
         if classify(&snap.rows) == ScreenState::KickedOut {
-            return Err(anyhow!("freebuff: another instance took over this account"));
+            return Err(anyhow!(
+                "freebuff: another instance took over this account during the prompt turn"
+            ));
         }
 
-        if pty.try_wait()?.is_some() {
+        if let Some(status) = pty.try_wait()? {
             return Err(anyhow!(
-                "freebuff child exited unexpectedly; last screen:\n{}",
+                "freebuff child exited during the prompt turn (status {status}); last screen:\n{}",
                 snap.text()
             ));
         }
@@ -1064,7 +1068,9 @@ impl Backend for FreebuffBackend {
                 // Check for cancel
                 if *cancel.borrow() && !cancelled_sent {
                     info!("prompt: cancel requested, sending Esc");
-                    pty.write(CANCEL_KEY.as_bytes()).await?;
+                    pty.write(CANCEL_KEY.as_bytes())
+                        .await
+                        .context("freebuff: failed to send Esc for session/cancel")?;
                     session.cancelled.store(true, Ordering::SeqCst);
                     cancelled_sent = true;
                 }

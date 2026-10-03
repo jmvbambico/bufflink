@@ -843,17 +843,16 @@ mod tests {
         );
     }
 
-    /// The real screen captured via BLINK_DUMP_SCREEN on this plan: rows
-    /// 034/036/037/038/039 byte-for-byte, trailing padding included. The
-    /// status row soft-wraps (`... · /model` / `to change · Chat: New chat`),
-    /// so the literal `/model to change` is on neither row alone — the
-    /// regression the hand-written fixtures never caught. (The full 40-row
-    /// capture is pending; these are the verbatim-quoted rows.)
+    /// The real screen captured via BLINK_DUMP_SCREEN on this plan: all 40
+    /// rows byte-for-byte, trailing padding included. The status row soft-wraps
+    /// (`... · /model` / `to change · Chat: New chat`), so the literal
+    /// `/model to change` is on neither row alone — the regression the
+    /// hand-written fixtures never caught.
     #[test]
     fn idle_max_plan_fixture_classifies_as_idle() {
         let rows = load_fixture("idle-max-plan-120x40");
         // Padding survives the fixture file and `.lines()`.
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 40);
         assert!(rows.iter().all(|r| r.chars().count() == 120));
         // The marker really is split across two physical rows.
         assert!(

@@ -221,6 +221,7 @@ async fn dispatch_request<B: Backend>(
                     send_result(out_tx, id, result).await;
                 }
                 Err(e) => {
+                    warn!(error = %format!("{e:#}"), "session/new failed");
                     send_error(out_tx, id, -32603, e.to_string(), None).await;
                 }
             }
@@ -337,6 +338,7 @@ async fn run_prompt<B: Backend>(
             send_result(&out_tx, id, result).await;
         }
         Err(e) => {
+            warn!(error = %format!("{e:#}"), "session/prompt failed");
             send_error(&out_tx, id, -32603, e.to_string(), None).await;
         }
     }
