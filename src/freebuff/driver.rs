@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use tokio::fs;
 use tokio::sync::{watch, Mutex};
@@ -44,7 +44,12 @@ pub struct DriverConfig {
     pub cols: u16,
     /// Terminal height in rows (default: 40).
     pub rows: u16,
-    /// Startup timeout waiting for Idle (default: 60s).
+    /// Startup timeout waiting for Idle (default: 25s, env: BLINK_STARTUP_TIMEOUT_S).
+    ///
+    /// Must expire INSIDE omnigent's hard-coded, non-configurable 30 s
+    /// `session/new` deadline, leaving ~5 s for blink's own error to
+    /// serialise and reach the client. Otherwise the client aborts the
+    /// request mid-poll and blink never reports why.
     pub startup_timeout: Duration,
     /// Per-turn timeout (default: 15min, env: BLINK_TURN_TIMEOUT_S).
     pub turn_timeout: Duration,
@@ -62,6 +67,11 @@ pub struct DriverConfig {
     /// never hardcoded); unset means Enter on the collapsed splash. A name
     /// that matches nothing (or several rows) fails loudly.
     pub model: Option<String>,
+    /// Path to dump the raw startup screen to on a startup timeout (default:
+    /// None, env: BLINK_DUMP_SCREEN). Unset means the feature is inert — no
+    /// file I/O and no hot-path cost. Set it to capture exactly what the
+    /// classifier sees, so a misclassification can be re-derived from bytes.
+    pub dump_screen: Option<PathBuf>,
 }
 
 impl DriverConfig {
@@ -79,10 +89,15 @@ impl DriverConfig {
             .unwrap_or(5);
         let submit_timeout =
             parse_submit_timeout(std::env::var("BLINK_SUBMIT_TIMEOUT_S").ok().as_deref());
+        let startup_timeout =
+            parse_startup_timeout(std::env::var("BLINK_STARTUP_TIMEOUT_S").ok().as_deref());
         let model = std::env::var("BLINK_MODEL")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let dump_screen = std::env::var_os("BLINK_DUMP_SCREEN")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty());
 
         Self {
             program,
@@ -91,13 +106,14 @@ impl DriverConfig {
             manicode_dir: None,
             cols: 120,
             rows: 40,
-            startup_timeout: Duration::from_secs(60),
+            startup_timeout,
             turn_timeout: Duration::from_secs(turn_timeout_secs),
             poll_interval: Duration::from_millis(250),
             exit_timeout: Duration::from_secs(3),
             settle_timeout: Duration::from_secs(settle_timeout_secs),
             submit_timeout,
             model,
+            dump_screen,
         }
     }
 }
@@ -121,6 +137,98 @@ fn parse_submit_timeout(raw: Option<&str>) -> Duration {
 /// zero so a programmatically built config can never underflow.
 fn remainder_after_nudge(submit_timeout: Duration) -> Duration {
     submit_timeout.saturating_sub(Duration::from_secs(2))
+}
+
+/// Parse `BLINK_STARTUP_TIMEOUT_S`. Default 25 s when the variable is absent or
+/// unparseable — it must expire inside omnigent's hard-coded 30 s `session/new`
+/// deadline, leaving ~5 s for blink's own error to serialise and reach the
+/// client. Floored at 2 s: at the 250 ms poll interval that is at least eight
+/// classification ticks, so the loop cannot expire before it has observed the
+/// screen (and it mirrors the sibling floor).
+fn parse_startup_timeout(raw: Option<&str>) -> Duration {
+    let secs = match raw.and_then(|s| s.parse::<u64>().ok()) {
+        Some(v) => v,
+        None => return Duration::from_secs(25),
+    };
+    if secs < 2 {
+        warn!("BLINK_STARTUP_TIMEOUT_S={secs} is below the 2 s floor; using 2 s");
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
+/// Bounded, single-line tail of a captured screen for error messages. A human
+/// tells "still on the splash" from "stuck on an ad" from the last few rows,
+/// not from the whole buffer; whitespace is collapsed to one line and the home
+/// directory is redacted so the client's error log carries no username.
+fn screen_tail(rows: &[String]) -> String {
+    const MAX_ROWS: usize = 4;
+    const MAX_CHARS: usize = 240;
+
+    let non_empty: Vec<&String> = rows.iter().filter(|r| !r.trim().is_empty()).collect();
+    let start = non_empty.len().saturating_sub(MAX_ROWS);
+    let joined = non_empty[start..]
+        .iter()
+        .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    let joined = if joined.chars().count() > MAX_CHARS {
+        format!("{}…", joined.chars().take(MAX_CHARS).collect::<String>())
+    } else {
+        joined
+    };
+    redact_home(&joined)
+}
+
+/// Redact the current `$HOME` prefix to `~`.
+fn redact_home(s: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) => redact_home_with(s, &home),
+        Err(_) => s.to_string(),
+    }
+}
+
+/// Replace `home` with `~` when it is a real path. Split out so the redaction
+/// is unit-testable without mutating the process environment. A home too short
+/// to be a real directory (`/`, empty, or a single character) is skipped: with
+/// `HOME=/` a naive replace would turn every slash in the bounded tail into
+/// `~`, and with an empty one it would match everywhere.
+fn redact_home_with(s: &str, home: &str) -> String {
+    if home.trim().len() <= 1 {
+        s.to_string()
+    } else {
+        s.replace(home, "~")
+    }
+}
+
+/// Write the raw startup screen to `path` for offline classification
+/// debugging. Preserves every physical row exactly — its trailing padding
+/// included — with its character count, so the wrap decision (a row continues
+/// when `len == width && last cell != space`) can be re-derived from the
+/// bytes. Each row's content is delimited `|<content>|` and prefixed with its
+/// index and length, so trailing spaces survive a text editor and `git diff`.
+/// Returns the raw I/O error; callers must `warn!` and keep their own error.
+fn write_screen_dump(
+    path: &Path,
+    rows: &[String],
+    state: &ScreenState,
+    cols: u16,
+    screen_rows: u16,
+) -> std::io::Result<()> {
+    let mut out = String::new();
+    out.push_str("# blink screen dump\n");
+    out.push_str(&format!("# state: {state:?}\n"));
+    out.push_str(&format!(
+        "# cols: {cols} rows: {screen_rows} count: {}\n",
+        rows.len()
+    ));
+    out.push_str("# format: row NNN len=LLL |<exact content including trailing padding>|\n");
+    for (i, row) in rows.iter().enumerate() {
+        out.push_str(&format!("row {i:03} len={} |{row}|\n", row.chars().count()));
+    }
+    std::fs::write(path, out)
 }
 
 /// Session state held by the backend.
@@ -227,7 +335,9 @@ impl FreebuffBackend {
             return Ok(Vec::new());
         }
 
-        let content = fs::read(&log_path).await?;
+        let content = fs::read(&log_path)
+            .await
+            .with_context(|| format!("freebuff: failed to read turn log {}", log_path.display()))?;
         let new_content = &content[*offset as usize..];
         *offset = file_size;
 
@@ -340,12 +450,14 @@ impl FreebuffBackend {
     async fn check_errors(&self, pty: &Pty) -> Result<()> {
         let snap = pty.screen();
         if classify(&snap.rows) == ScreenState::KickedOut {
-            return Err(anyhow!("freebuff: another instance took over this account"));
+            return Err(anyhow!(
+                "freebuff: another instance took over this account during the prompt turn"
+            ));
         }
 
-        if pty.try_wait()?.is_some() {
+        if let Some(status) = pty.try_wait()? {
             return Err(anyhow!(
-                "freebuff child exited unexpectedly; last screen:\n{}",
+                "freebuff child exited during the prompt turn (status {status}); last screen:\n{}",
                 snap.text()
             ));
         }
@@ -357,16 +469,65 @@ impl FreebuffBackend {
     /// previous focus and the walk would skip a row.
     const MODEL_KEY_SETTLE: Duration = Duration::from_millis(300);
 
+    /// Fail-loud startup-timeout error from the CURRENT screen: names the last
+    /// observed `ScreenState` and a bounded, redacted tail. Every deadline exit
+    /// — top of the poll loop, after blocking work, or a clamped wait expiring
+    /// because the budget ran out — goes through here so the diagnostic never
+    /// degrades to a bare "timed out".
+    fn startup_timeout_error(&self, pty: &Pty) -> anyhow::Error {
+        let snap = pty.screen();
+        let pid = pty.pid().unwrap_or(0);
+        let state = classify(&snap.rows);
+        // Capture the raw screen ONCE for offline classification debugging.
+        // Inert unless BLINK_DUMP_SCREEN is set: unset means no file I/O here.
+        // An I/O failure must never mask the real startup error.
+        if let Some(path) = self.cfg.dump_screen.as_deref() {
+            if let Err(e) =
+                write_screen_dump(path, &snap.rows, &state, self.cfg.cols, self.cfg.rows)
+            {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "startup: could not write BLINK_DUMP_SCREEN dump; keeping the startup error"
+                );
+            }
+        }
+        anyhow!(
+            "startup timeout after {:?} pid={} state={:?}; last screen: {}",
+            self.cfg.startup_timeout,
+            pid,
+            state,
+            screen_tail(&snap.rows)
+        )
+    }
+
     /// Send a startup key, then wait for the screen to change. Fails loudly
     /// when nothing changes: pressing further keys blind could spend
     /// Freebucks on the wrong model.
-    async fn press_and_settle(&self, pty: &Pty, key: Key, before: &str, why: &str) -> Result<()> {
+    ///
+    /// Every blocking wait is clamped to the absolute startup `deadline`, so a
+    /// keypress that starts just before the deadline cannot run past it: the
+    /// settle sleep and the screen-change wait are each bounded by the budget
+    /// that remains at that moment. When a clamp expires because the BUDGET
+    /// ran out (not because the TUI is wedged), the fail-loud startup-timeout
+    /// error is returned rather than a misleading "screen did not change".
+    async fn press_and_settle(
+        &self,
+        pty: &Pty,
+        key: Key,
+        before: &str,
+        why: &str,
+        deadline: Instant,
+    ) -> Result<()> {
         pty.key(key).await?;
-        tokio::time::sleep(Self::MODEL_KEY_SETTLE).await;
-        pty.wait_for(|s| s.text() != before, Duration::from_secs(10))
-            .await
-            .map_err(|e| anyhow!("freebuff: screen did not change after {why}: {e}"))?;
-        Ok(())
+        let settle = Self::MODEL_KEY_SETTLE.min(deadline.saturating_duration_since(Instant::now()));
+        tokio::time::sleep(settle).await;
+        let wait = Duration::from_secs(10).min(deadline.saturating_duration_since(Instant::now()));
+        match pty.wait_for(|s| s.text() != before, wait).await {
+            Ok(_) => Ok(()),
+            Err(_) if Instant::now() >= deadline => Err(self.startup_timeout_error(pty)),
+            Err(e) => Err(anyhow!("freebuff: screen did not change after {why}: {e}")),
+        }
     }
 
     /// Enforce `BLINK_MODEL` against the Idle screen's status row. Within a
@@ -389,11 +550,12 @@ impl FreebuffBackend {
                 "freebuff: cannot read the active model from the idle screen"
             ));
         };
-        if let Err(msg) = check_active_model(target, &active, &left) {
+        if let Err(msg) = check_active_model(target, &active, left.as_deref()) {
             let _ = pty.kill().await;
             return Err(anyhow!(msg));
         }
         if !splash_accept_sent {
+            let left = left.as_deref().unwrap_or("no time left");
             info!(
                 "startup: resumed active hour on '{active}' ({left}) matching BLINK_MODEL={target}"
             );
@@ -408,19 +570,17 @@ impl FreebuffBackend {
         let mut model_presses: u32 = 0;
         // Previous poll's screen, to spot the collapsed splash expanding.
         let mut prev_was_splash = false;
+        // Last state we already logged: one stderr line per TRANSITION, not per
+        // 250 ms tick (a tick log would be a spin-dump). A silent startup is
+        // why omnigent captured no diagnostics at all.
+        let mut last_state: Option<ScreenState> = None;
 
-        let startup_deadline = Instant::now() + self.cfg.startup_timeout;
+        let startup_start = Instant::now();
+        let startup_deadline = startup_start + self.cfg.startup_timeout;
 
         loop {
             if Instant::now() >= startup_deadline {
-                let snap = pty.screen();
-                let pid = pty.pid().unwrap_or(0);
-                return Err(anyhow!(
-                    "startup timeout after {:?} pid={}; last screen:\n{}",
-                    self.cfg.startup_timeout,
-                    pid,
-                    snap.text()
-                ));
+                return Err(self.startup_timeout_error(pty));
             }
 
             // Check if child exited
@@ -436,6 +596,15 @@ impl FreebuffBackend {
             let snap = pty.screen();
             let state = classify(&snap.rows);
 
+            if last_state.as_ref() != Some(&state) {
+                info!(
+                    elapsed_ms = startup_start.elapsed().as_millis(),
+                    state = ?state,
+                    "startup: state transition"
+                );
+                last_state = Some(state.clone());
+            }
+
             // WHY: the expanded list refocuses from the top on every entry,
             // so a stale Down count from an earlier visit would cap the walk early.
             if matches!(state, ScreenState::ModelList) && prev_was_splash {
@@ -443,18 +612,18 @@ impl FreebuffBackend {
             }
             prev_was_splash = matches!(state, ScreenState::ModelSplash);
 
-            // If we've already sent splash accept, check for Idle markers directly
-            // (splash markers may linger in the buffer alongside idle markers)
+            // If we've already sent splash accept, check for Idle markers
+            // directly (splash markers may linger in the buffer alongside idle
+            // markers). Same predicate as `classify`'s Idle: a live session
+            // status row — which need not carry a time figure — plus the
+            // placeholder.
             if splash_accept_sent {
-                let has_time_left = snap
-                    .rows
-                    .iter()
-                    .any(|r| r.contains("·") && (r.contains("h left") || r.contains("m left")));
+                let has_status_row = active_model(&snap.rows).is_some();
                 let has_placeholder = snap
                     .rows
                     .iter()
                     .any(|r| r.contains("Enter a coding task or / for commands"));
-                if has_time_left && has_placeholder {
+                if has_status_row && has_placeholder {
                     self.verify_idle_model(pty, &snap.rows, splash_accept_sent)
                         .await?;
                     info!("startup: reached Idle (idle markers visible)");
@@ -477,6 +646,7 @@ impl FreebuffBackend {
                         Key::Escape,
                         &snap_text,
                         "dismissing session-ended screen",
+                        startup_deadline,
                     )
                     .await?;
                 }
@@ -504,6 +674,7 @@ impl FreebuffBackend {
                                     Key::Enter,
                                     &snap_text,
                                     "accepting the matching model",
+                                    startup_deadline,
                                 )
                                 .await?;
                                 splash_accept_sent = true;
@@ -522,6 +693,7 @@ impl FreebuffBackend {
                                     Key::Down,
                                     &snap_text,
                                     "focusing See all models",
+                                    startup_deadline,
                                 )
                                 .await?;
                                 let expanded_from = pty.screen().text();
@@ -530,6 +702,7 @@ impl FreebuffBackend {
                                     Key::Enter,
                                     &expanded_from,
                                     "expanding the model list",
+                                    startup_deadline,
                                 )
                                 .await?;
                             }
@@ -563,6 +736,7 @@ impl FreebuffBackend {
                                     Key::Enter,
                                     &snap_text,
                                     "accepting the matching model",
+                                    startup_deadline,
                                 )
                                 .await?;
                                 splash_accept_sent = true;
@@ -573,6 +747,7 @@ impl FreebuffBackend {
                                     Key::Down,
                                     &snap_text,
                                     "moving to the next model",
+                                    startup_deadline,
                                 )
                                 .await?;
                                 model_presses += 1;
@@ -619,6 +794,15 @@ impl FreebuffBackend {
                         owner_pid
                     ));
                 }
+                ScreenState::Login => {
+                    info!("startup: interactive login gate detected");
+                    let _ = pty.kill().await;
+                    // AGENTS.md: the agent never logs in or drives the auth
+                    // flow. Fail fast and hand it to the human.
+                    return Err(anyhow!(
+                        "freebuff needs an interactive login: run `freebuff` once in a terminal and log in, then retry"
+                    ));
+                }
                 ScreenState::KickedOut => {
                     let _ = pty.kill().await;
                     return Err(anyhow!("freebuff: another instance took over this account"));
@@ -637,7 +821,19 @@ impl FreebuffBackend {
                 }
             }
 
-            tokio::time::sleep(self.cfg.poll_interval).await;
+            // Re-check the deadline straight after the blocking work above, so
+            // expiry during a settle returns the fail-loud error promptly
+            // instead of after another full iteration.
+            if Instant::now() >= startup_deadline {
+                return Err(self.startup_timeout_error(pty));
+            }
+            // Clamp the inter-poll sleep too: it must not carry us past the
+            // deadline either.
+            let nap = self
+                .cfg
+                .poll_interval
+                .min(startup_deadline.saturating_duration_since(Instant::now()));
+            tokio::time::sleep(nap).await;
         }
     }
 
@@ -872,7 +1068,9 @@ impl Backend for FreebuffBackend {
                 // Check for cancel
                 if *cancel.borrow() && !cancelled_sent {
                     info!("prompt: cancel requested, sending Esc");
-                    pty.write(CANCEL_KEY.as_bytes()).await?;
+                    pty.write(CANCEL_KEY.as_bytes())
+                        .await
+                        .context("freebuff: failed to send Esc for session/cancel")?;
                     session.cancelled.store(true, Ordering::SeqCst);
                     cancelled_sent = true;
                 }
@@ -1314,6 +1512,37 @@ mod tests {
         backend.shutdown().await;
     }
 
+    /// The legacy `user-interrupt` cancellation form (older freebuff builds)
+    /// must still surface as a cancelled turn, so both fake scenarios are
+    /// covered end to end.
+    #[tokio::test]
+    async fn t15_legacy_user_interrupt_cancel_returns_cancelled() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("slow-legacy-interrupt"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+
+        let (tx, _rx) = mpsc::channel(64);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let sink = UpdateSink::new(tx);
+
+        let prompt_fut = backend.prompt(&session_id, "slow count".to_string(), sink, cancel_rx);
+        tokio::pin!(prompt_fut);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cancel_tx.send(true).unwrap();
+
+        let result = timeout(Duration::from_secs(5), prompt_fut).await;
+        assert!(result.is_ok(), "prompt timed out");
+        let result = result.unwrap();
+        assert!(result.is_ok(), "prompt error: {:?}", result.err());
+        assert_eq!(result.unwrap(), StopReason::Cancelled);
+
+        backend.shutdown().await;
+    }
+
     #[tokio::test]
     async fn t4_shutdown_makes_child_exit() {
         let tmp = test_temp_dir();
@@ -1530,6 +1759,25 @@ mod tests {
             "error should mention timeout: {}",
             err
         );
+        // Fail loudly: the error must name the last observed screen state and
+        // carry a bounded tail of the screen, not just the elapsed time.
+        // The fake's narrow splash box wraps its continuation rows with `│`
+        // borders, so its model rows count as an expanded list.
+        assert!(
+            err.contains("state=ModelList"),
+            "error should name the last observed screen state: {}",
+            err
+        );
+        assert!(
+            err.contains("See all 4 models"),
+            "error should carry a screen tail: {}",
+            err
+        );
+        assert!(
+            !err.contains('\n'),
+            "timeout error must be single-line-ish, not a screen dump: {}",
+            err
+        );
         // Extract pid from error message: "pid=<n>"
         let pid_str = err.split("pid=").nth(1).and_then(|s| {
             s.chars()
@@ -1706,5 +1954,155 @@ mod tests {
         assert_eq!(parse_submit_timeout(Some("0")), Duration::from_secs(2));
         assert_eq!(parse_submit_timeout(Some("30")), Duration::from_secs(30));
         assert_eq!(parse_submit_timeout(None), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn startup_timeout_env_parsing_table() {
+        // Absent falls back to the 25 s default, which expires inside
+        // omnigent's hard-coded 30 s session/new deadline.
+        assert_eq!(parse_startup_timeout(None), Duration::from_secs(25));
+        // A parsed value is used as given.
+        assert_eq!(parse_startup_timeout(Some("25")), Duration::from_secs(25));
+        assert_eq!(parse_startup_timeout(Some("45")), Duration::from_secs(45));
+        // Unparseable values fall back to the default.
+        assert_eq!(parse_startup_timeout(Some("nope")), Duration::from_secs(25));
+        assert_eq!(parse_startup_timeout(Some("-5")), Duration::from_secs(25));
+        // Below the floor clamps up to 2 s (with a warning).
+        assert_eq!(parse_startup_timeout(Some("0")), Duration::from_secs(2));
+        assert_eq!(parse_startup_timeout(Some("1")), Duration::from_secs(2));
+        assert_eq!(parse_startup_timeout(Some("2")), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn screen_tail_is_bounded_and_collapses_whitespace() {
+        // Only the last few non-empty rows survive, joined on one line.
+        let rows: Vec<String> = (0..10).map(|i| format!("row {i}")).collect();
+        assert_eq!(screen_tail(&rows), "row 6 | row 7 | row 8 | row 9");
+
+        // Interior runs of whitespace collapse to single spaces.
+        let rows = vec!["  Not   enough\tFreebucks  ".to_string()];
+        assert_eq!(screen_tail(&rows), "Not enough Freebucks");
+
+        // A long tail is truncated to a bounded, single line.
+        let rows = vec!["x".repeat(500)];
+        let tail = screen_tail(&rows);
+        assert!(tail.chars().count() <= 241, "tail too long: {}", tail.len());
+        assert!(tail.ends_with('…'));
+    }
+
+    #[test]
+    fn redact_home_replaces_the_home_prefix() {
+        assert_eq!(
+            redact_home_with("Directory /Users/alice/proj", "/Users/alice"),
+            "Directory ~/proj"
+        );
+        // An empty home (unset) must not replace everything.
+        assert_eq!(redact_home_with("/tmp/x", ""), "/tmp/x");
+        // A home too short to be real must be skipped, not mangle every slash.
+        assert_eq!(redact_home_with("/a/b/c", "/"), "/a/b/c");
+        assert_eq!(redact_home_with("/a/b/c", "x"), "/a/b/c");
+    }
+
+    /// The startup budget must bound the WHOLE startup, not just the gaps
+    /// between blocking calls. `hang-splash` never reaches Idle, and a
+    /// `BLINK_MODEL` matching no listed row keeps the walk pressing keys; each
+    /// press would otherwise block ~10 s in `press_and_settle` waiting for a
+    /// screen change that never comes. With the waits clamped to the deadline
+    /// the whole call must return close to `startup_timeout`, fail-loud.
+    #[tokio::test]
+    async fn t13_startup_wait_is_bounded_by_startup_timeout() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let mut cfg = test_config(&temp_dir, Some("hang-splash"));
+        cfg.model = Some("deepseek-v4-pro".to_string());
+        let startup_timeout = Duration::from_secs(2);
+        cfg.startup_timeout = startup_timeout;
+        let backend = FreebuffBackend::new(cfg);
+
+        let start = std::time::Instant::now();
+        let result = backend.new_session(temp_dir.clone()).await;
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("startup must time out").to_string();
+        assert!(
+            err.contains("state="),
+            "error should carry the last observed screen state: {}",
+            err
+        );
+        // A single unclamped settle would be ~10.3 s; the budget plus a small
+        // tolerance is the bound the reviewer asked us to prove.
+        assert!(
+            elapsed < startup_timeout + Duration::from_secs(1),
+            "startup ran {elapsed:?}, past the {startup_timeout:?} budget: {err}"
+        );
+    }
+
+    /// The dump must preserve every row's exact content and length, trailing
+    /// padding included, so the wrap rule can be re-derived from the bytes.
+    /// One short padded row plus one genuinely full row proves the distinction.
+    #[test]
+    fn screen_dump_round_trips_rows_and_lengths() {
+        let tmp = test_temp_dir();
+        let path = tmp.0.join("dump.txt");
+        let padded_short = format!("short padded row{}", " ".repeat(4));
+        let full = "z".repeat(120);
+        let rows = vec![padded_short.clone(), full.clone()];
+
+        write_screen_dump(&path, &rows, &ScreenState::Unknown, 120, 40).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# state: Unknown"), "{text}");
+        assert!(text.contains("# cols: 120 rows: 40 count: 2"), "{text}");
+
+        let mut dumped: Vec<(usize, usize, String)> = Vec::new();
+        for line in text.lines().filter(|l| l.starts_with("row ")) {
+            let rest = line.strip_prefix("row ").unwrap();
+            let (idx, rest) = rest.split_once(' ').unwrap();
+            let (len_field, rest) = rest.split_once(' ').unwrap();
+            let len: usize = len_field.strip_prefix("len=").unwrap().parse().unwrap();
+            let start = rest.find('|').unwrap() + 1;
+            let end = rest.rfind('|').unwrap();
+            // The delimiters bracket exactly `len` chars.
+            assert_eq!(end - start, len, "line: {line}");
+            dumped.push((idx.parse().unwrap(), len, rest[start..end].to_string()));
+        }
+
+        assert_eq!(dumped.len(), 2);
+        assert_eq!(dumped[0].0, 0);
+        assert_eq!(dumped[0].1, padded_short.chars().count());
+        assert_eq!(dumped[0].2, padded_short);
+        assert!(
+            dumped[0].2.ends_with("    "),
+            "trailing padding must survive"
+        );
+        assert_eq!(dumped[1].0, 1);
+        assert_eq!(dumped[1].1, 120);
+        assert_eq!(dumped[1].2, full);
+    }
+
+    /// An unwritable BLINK_DUMP_SCREEN path must not replace the real startup
+    /// error — the write only warns.
+    #[tokio::test]
+    async fn t14_unwritable_dump_path_keeps_original_startup_error() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let mut cfg = test_config(&temp_dir, Some("hang-splash"));
+        cfg.startup_timeout = Duration::from_secs(1);
+        // Parent directory does not exist: the dump write fails.
+        let bad = temp_dir.join("no-such-dir").join("dump.txt");
+        cfg.dump_screen = Some(bad.clone());
+        let backend = FreebuffBackend::new(cfg);
+
+        let result = backend.new_session(temp_dir.clone()).await;
+        let err = result.expect_err("startup must time out").to_string();
+        assert!(
+            err.contains("startup timeout"),
+            "original error must survive a dump failure: {err}"
+        );
+        assert!(
+            err.contains("state="),
+            "original error must survive a dump failure: {err}"
+        );
+        assert!(!bad.exists(), "dump must not have been written");
     }
 }
