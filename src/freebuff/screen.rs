@@ -18,7 +18,12 @@ pub enum ScreenState {
     FreebucksGate { message: String },
     /// "Freebuff is already running" dialog with Take over / Exit buttons.
     AlreadyRunning,
-    /// Idle prompt ready for input: status shows "· <n>h/m left" and input placeholder visible.
+    /// Interactive login gate: "Press ENTER to login ...". A hard precondition
+    /// the agent must NOT satisfy itself — the human logs in (AGENTS.md: never
+    /// reuse credentials, never auto-dismiss an interstitial).
+    Login,
+    /// Idle prompt ready for input: a live session status row (active model,
+    /// optionally with "· <n>h/m left") and input placeholder visible.
     Idle,
     /// Generating a reply: status bar shows "thinking... <N>s" or "working... <N>s".
     Busy { elapsed_s: Option<u32> },
@@ -33,7 +38,7 @@ pub const SPLASH_ACCEPT_KEY: &str = "\r";
 
 /// Classify the current screen state from a list of text rows (ANSI already stripped).
 pub fn classify(rows: &[String]) -> ScreenState {
-    // Precedence: FreebucksGate > AlreadyRunning > SessionEnded > KickedOut > Busy > ModelList > ModelSplash > Idle > Booting > Unknown
+    // Precedence: FreebucksGate > AlreadyRunning > Login > SessionEnded > KickedOut > Busy > ModelList > ModelSplash > Idle > Booting > Unknown
 
     // Check for FreebucksGate first (inside the model box)
     for row in rows {
@@ -48,6 +53,14 @@ pub fn classify(rows: &[String]) -> ScreenState {
     for row in rows {
         if row.contains("Freebuff is already running") {
             return ScreenState::AlreadyRunning;
+        }
+    }
+
+    // Check for the interactive login gate. A hard precondition: the human
+    // logs in, the agent never drives it.
+    for row in rows {
+        if row.contains("Press ENTER to login") || row.contains("Press Enter to login") {
+            return ScreenState::Login;
         }
     }
 
@@ -95,16 +108,19 @@ pub fn classify(rows: &[String]) -> ScreenState {
         return ScreenState::ModelSplash;
     }
 
-    // Check for Idle: status bar has "· <n>h left" or "· <n>m left" AND
-    // (input placeholder visible OR "✕ End session" visible) AND not Busy
-    let has_time_left = rows
-        .iter()
-        .any(|r| r.contains("·") && (r.contains("h left") || r.contains("m left")));
+    // Check for Idle: a live session status row (active model, carrying
+    // `/model to change`; the `N[hm] left` figure is present on some plans and
+    // absent on others, e.g. `GLM 5.3 Flash • max · ...`) AND an input
+    // affordance (placeholder or "✕ End session"). Keying on the status row —
+    // not a time figure, and not merely the placeholder — keeps this specific
+    // enough that screens matched earlier in the precedence chain (splash,
+    // login) are never misread as Idle.
+    let has_status_row = active_model(rows).is_some();
     let has_placeholder = rows
         .iter()
         .any(|r| r.contains("Enter a coding task or / for commands"));
     let has_end_session = rows.iter().any(|r| r.contains("✕ End session"));
-    if has_time_left && (has_placeholder || has_end_session) {
+    if has_status_row && (has_placeholder || has_end_session) {
         return ScreenState::Idle;
     }
 
@@ -283,20 +299,38 @@ pub fn match_model(target: &str, names: &[String]) -> ModelMatch {
     }
 }
 
-/// Active model and time left from the Idle screen's status row, e.g.
-/// ` MiMo 2.5 · 58m left … ✕ End session` -> `("MiMo 2.5", "58m left")`.
-/// The name is the trimmed text before the first ` · `; the time is the
-/// `\d+[hm] left` fragment. Rows mentioning Freebucks are splash cost lines,
-/// not the status row. Returns None when no row parses: within a running
-/// hour freebuff skips the splash and resumes on the hour's model, so the
-/// status row is the only place the active model is shown — callers must
-/// fail loudly rather than assume the requested model is active.
-pub fn active_model(rows: &[String]) -> Option<(String, String)> {
+/// Active model and (optional) time left from the Idle screen's status row.
+/// Two shapes are accepted: current plans mark the row with `/model to change`
+/// and may report no remaining time (e.g. `GLM 5.3 Flash • max · /dir ·
+/// /model to change · Chat: New chat`), while older plans carry a
+/// `\d+[hm] left` figure. The name is the trimmed text before the first ` · `
+/// or ` • `; the time is the `\d+[hm] left` fragment when present. Rows
+/// mentioning Freebucks are splash cost lines, not the status row. Returns
+/// None when no row parses: within a running hour freebuff skips the splash
+/// and resumes on the hour's model, so the status row is the only place the
+/// active model is shown — callers must fail loudly rather than assume the
+/// requested model is active.
+pub fn active_model(rows: &[String]) -> Option<(String, Option<String>)> {
     for row in rows {
         if row.contains("Freebucks") {
             continue;
         }
-        if !row.contains('·') || !row.contains("left") {
+        // Shape A: current plans mark the status row with `/model to change`;
+        // the remaining-time figure may be absent (`• max`) or present.
+        if row.contains("/model to change") {
+            let Some(sep) = first_separator(row) else {
+                continue;
+            };
+            let name = row[..sep].trim();
+            if name.is_empty() {
+                continue;
+            }
+            return Some((name.to_string(), time_left_anywhere(row)));
+        }
+        // Shape B: older plans carry `<Name> · <N>[hm] left`: the time
+        // fragment sits immediately after the separator, so anything else
+        // there (a mode word, a transcript line) is not the status row.
+        if !row.contains('·') {
             continue;
         }
         let Some(sep) = row.find(" · ") else {
@@ -306,9 +340,6 @@ pub fn active_model(rows: &[String]) -> Option<(String, String)> {
         if name.is_empty() {
             continue;
         }
-        // The status row is `<Name> · <N>[hm] left`: the time fragment sits
-        // immediately after the separator, so anything else there (a mode
-        // word, a transcript line) is not the status row.
         let after = row[sep + " · ".len()..].trim_start();
         let Some(time) = time_left_at_start(after) else {
             continue;
@@ -320,7 +351,38 @@ pub fn active_model(rows: &[String]) -> Option<(String, String)> {
         if !(rest.is_empty() || rest.starts_with('·') || rest.starts_with('✕')) {
             continue;
         }
-        return Some((name.to_string(), time.to_string()));
+        return Some((name.to_string(), Some(time.to_string())));
+    }
+    None
+}
+
+/// Byte index of the first status-row separator, ` · ` or ` • `.
+fn first_separator(row: &str) -> Option<usize> {
+    [row.find(" · "), row.find(" • ")]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+/// The first `\d+[hm] left` fragment anywhere in the row, if present.
+fn time_left_anywhere(row: &str) -> Option<String> {
+    let bytes = row.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i < bytes.len() && (bytes[i] == b'h' || bytes[i] == b'm') {
+            let unit_end = i + 1;
+            if row[unit_end..].starts_with(" left") {
+                return Some(row[start..unit_end + " left".len()].to_string());
+            }
+        }
     }
     None
 }
@@ -350,12 +412,19 @@ fn time_left_at_start(s: &str) -> Option<&str> {
 /// Decide whether an already-running hour satisfies `BLINK_MODEL`, using the
 /// same [`match_model`] rule as the splash: against a single active name the
 /// outcome is match or already-running error (never ambiguous).
-pub fn check_active_model(target: &str, active: &str, time_left: &str) -> Result<(), String> {
+pub fn check_active_model(
+    target: &str,
+    active: &str,
+    time_left: Option<&str>,
+) -> Result<(), String> {
     match match_model(target, &[active.to_string()]) {
         ModelMatch::One(_) => Ok(()),
-        _ => Err(format!(
-            "freebuff: an hour on '{active}' is already running ({time_left}); requested '{target}' — wait for it to end or unset BLINK_MODEL"
-        )),
+        _ => {
+            let time = time_left.map(|t| format!(" ({t})")).unwrap_or_default();
+            Err(format!(
+                "freebuff: an hour on '{active}' is already running{time}; requested '{target}' — wait for it to end or unset BLINK_MODEL"
+            ))
+        }
     }
 }
 
@@ -746,41 +815,107 @@ mod tests {
         assert_eq!(classify(&rows), ScreenState::Idle);
     }
 
+    /// Regression guard for the production bug: this account's ready-session
+    /// status row carries `• max` with NO `h left`/`m left` figure, so the old
+    /// Idle predicate could never match and `session/new` burned the whole
+    /// budget. The row below is the real captured one.
+    #[test]
+    fn idle_plan_without_time_left_classifies_as_idle() {
+        let rows = vec![
+            "  GLM 5.3 Flash • max · /private/var/folders/abc/blink-e2e-42350-1 · /model to change · Chat: New chat"
+                .to_string(),
+            "╭────────────────────────────────────────╮".to_string(),
+            "│  ▍Enter a coding task or / for commands  │".to_string(),
+            "╰────────────────────────────────────────╯".to_string(),
+        ];
+        assert_eq!(classify(&rows), ScreenState::Idle);
+        assert_eq!(
+            active_model(&rows),
+            Some(("GLM 5.3 Flash".to_string(), None))
+        );
+    }
+
+    /// The time-left plan shape must still classify as Idle.
+    #[test]
+    fn idle_time_left_shapes_classify_as_idle() {
+        for status in [
+            " GLM 5.3 Flash · 1h left                    ✕ End session",
+            " MiMo 2.5 · 58m left                    ✕ End session",
+        ] {
+            let rows = vec![
+                status.to_string(),
+                "│  ▍Enter a coding task or / for commands  │".to_string(),
+            ];
+            assert_eq!(classify(&rows), ScreenState::Idle, "status: {status}");
+        }
+    }
+
+    /// Idle must key on a live session status row, not merely the input
+    /// placeholder: a bare box must NOT be read as Idle.
+    #[test]
+    fn idle_requires_a_status_row_not_just_a_placeholder() {
+        let rows = vec!["│  ▍Enter a coding task or / for commands  │".to_string()];
+        assert_ne!(classify(&rows), ScreenState::Idle);
+        assert_eq!(classify(&rows), ScreenState::Unknown);
+    }
+
+    #[test]
+    fn login_gate_classifies_as_login() {
+        for text in ["Press ENTER to login to continue", "Press Enter to login"] {
+            let rows = vec![String::new(), text.to_string()];
+            assert_eq!(classify(&rows), ScreenState::Login, "text: {text}");
+        }
+    }
+
     #[test]
     fn active_model_reads_both_idle_fixtures() {
         let rows = load_fixture("idle-midhour-120x40");
         assert_eq!(classify(&rows), ScreenState::Idle);
         assert_eq!(
             active_model(&rows),
-            Some(("MiMo 2.5".to_string(), "58m left".to_string()))
+            Some(("MiMo 2.5".to_string(), Some("58m left".to_string())))
         );
         let rows = load_fixture("idle-120x40");
         assert_eq!(
             active_model(&rows),
-            Some(("GLM 5.3 Flash".to_string(), "1h left".to_string()))
+            Some(("GLM 5.3 Flash".to_string(), Some("1h left".to_string())))
         );
     }
 
     #[test]
     fn active_model_table() {
-        // Multi-segment status rows (usage suffix) still parse.
-        let cases: &[(&str, Option<(&str, &str)>)] = &[
+        // Shape B (older plans): a `<Name> · <N>[hm] left` status row.
+        // Shape A (current plans): `/model to change` marks the row; the
+        // remaining-time figure may be present or absent.
+        type Case<'a> = (&'a str, Option<(&'a str, Option<&'a str>)>);
+        let cases: &[Case] = &[
             (
                 " GLM 5.3 Flash · 59m left · 16.4K (2%)      ✕ End session",
-                Some(("GLM 5.3 Flash", "59m left")),
+                Some(("GLM 5.3 Flash", Some("59m left"))),
             ),
             (
                 " MiMo 2.5 · 58m left                    ✕ End session",
-                Some(("MiMo 2.5", "58m left")),
+                Some(("MiMo 2.5", Some("58m left"))),
             ),
             (
                 " GLM 5.3 Flash · 1h left                    ✕ End session",
-                Some(("GLM 5.3 Flash", "1h left")),
+                Some(("GLM 5.3 Flash", Some("1h left"))),
+            ),
+            // Real captured status row on a plan that reports no remaining
+            // time (`• max`).
+            (
+                "  GLM 5.3 Flash • max · /private/var/folders/abc/blink-e2e-42350-1 · /model to change · Chat: New chat",
+                Some(("GLM 5.3 Flash", None)),
+            ),
+            // Shape A with a time figure still reports it.
+            (
+                " MiMo 2.5 · 58m left · /model to change",
+                Some(("MiMo 2.5", Some("58m left"))),
             ),
             // Splash cost lines are not the status row.
             (" Session ended · 25 Freebucks left", None),
             (" 5 Freebucks/hr", None),
-            // No time-left token, no separator, empty name.
+            // No `/model to change`, no time token, no separator, empty name.
             (" MiMo 2.5 · Balanced · Images", None),
             ("MiMo 2.5 58m left", None),
             (" · 58m left", None),
@@ -791,7 +926,7 @@ mod tests {
         ];
         for (input, expected) in cases {
             let rows = vec![input.to_string()];
-            let expected = expected.map(|(n, t)| (n.to_string(), t.to_string()));
+            let expected = expected.map(|(n, t)| (n.to_string(), t.map(|t| t.to_string())));
             assert_eq!(active_model(&rows), expected, "input: {input}");
         }
         // Splash fixtures carry no status row.
@@ -814,20 +949,29 @@ mod tests {
     fn check_active_model_table() {
         // Match reuses the match_model rule (normalised substring).
         assert_eq!(
-            check_active_model("mimo-2.5", "MiMo 2.5", "58m left"),
+            check_active_model("mimo-2.5", "MiMo 2.5", Some("58m left")),
             Ok(())
         );
         assert_eq!(
-            check_active_model("glm-5.3-flash", "GLM 5.3 Flash", "1h left"),
+            check_active_model("glm-5.3-flash", "GLM 5.3 Flash", Some("1h left")),
             Ok(())
         );
         assert_eq!(
-            check_active_model("deepseek-v4-pro", "MiMo 2.5", "58m left"),
+            check_active_model("deepseek-v4-pro", "MiMo 2.5", Some("58m left")),
             Err("freebuff: an hour on 'MiMo 2.5' is already running (58m left); requested 'deepseek-v4-pro' — wait for it to end or unset BLINK_MODEL".to_string())
         );
         assert_eq!(
-            check_active_model("mimo", "GLM 5.3 Flash", "1h left"),
+            check_active_model("mimo", "GLM 5.3 Flash", Some("1h left")),
             Err("freebuff: an hour on 'GLM 5.3 Flash' is already running (1h left); requested 'mimo' — wait for it to end or unset BLINK_MODEL".to_string())
+        );
+        // Model enforcement must still fire when the plan reports no time.
+        assert_eq!(
+            check_active_model("deepseek-v4-pro", "GLM 5.3 Flash", None),
+            Err("freebuff: an hour on 'GLM 5.3 Flash' is already running; requested 'deepseek-v4-pro' — wait for it to end or unset BLINK_MODEL".to_string())
+        );
+        assert_eq!(
+            check_active_model("glm-5.3-flash", "GLM 5.3 Flash", None),
+            Ok(())
         );
     }
 

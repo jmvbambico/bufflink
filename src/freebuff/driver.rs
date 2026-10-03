@@ -495,11 +495,12 @@ impl FreebuffBackend {
                 "freebuff: cannot read the active model from the idle screen"
             ));
         };
-        if let Err(msg) = check_active_model(target, &active, &left) {
+        if let Err(msg) = check_active_model(target, &active, left.as_deref()) {
             let _ = pty.kill().await;
             return Err(anyhow!(msg));
         }
         if !splash_accept_sent {
+            let left = left.as_deref().unwrap_or("no time left");
             info!(
                 "startup: resumed active hour on '{active}' ({left}) matching BLINK_MODEL={target}"
             );
@@ -556,18 +557,18 @@ impl FreebuffBackend {
             }
             prev_was_splash = matches!(state, ScreenState::ModelSplash);
 
-            // If we've already sent splash accept, check for Idle markers directly
-            // (splash markers may linger in the buffer alongside idle markers)
+            // If we've already sent splash accept, check for Idle markers
+            // directly (splash markers may linger in the buffer alongside idle
+            // markers). Same predicate as `classify`'s Idle: a live session
+            // status row — which need not carry a time figure — plus the
+            // placeholder.
             if splash_accept_sent {
-                let has_time_left = snap
-                    .rows
-                    .iter()
-                    .any(|r| r.contains("·") && (r.contains("h left") || r.contains("m left")));
+                let has_status_row = active_model(&snap.rows).is_some();
                 let has_placeholder = snap
                     .rows
                     .iter()
                     .any(|r| r.contains("Enter a coding task or / for commands"));
-                if has_time_left && has_placeholder {
+                if has_status_row && has_placeholder {
                     self.verify_idle_model(pty, &snap.rows, splash_accept_sent)
                         .await?;
                     info!("startup: reached Idle (idle markers visible)");
@@ -736,6 +737,15 @@ impl FreebuffBackend {
                     return Err(anyhow!(
                         "freebuff: already running (owner pid: {})",
                         owner_pid
+                    ));
+                }
+                ScreenState::Login => {
+                    info!("startup: interactive login gate detected");
+                    let _ = pty.kill().await;
+                    // AGENTS.md: the agent never logs in or drives the auth
+                    // flow. Fail fast and hand it to the human.
+                    return Err(anyhow!(
+                        "freebuff needs an interactive login: run `freebuff` once in a terminal and log in, then retry"
                     ));
                 }
                 ScreenState::KickedOut => {
