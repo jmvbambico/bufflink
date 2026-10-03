@@ -111,7 +111,11 @@ Environment: `BLINK_FREEBUFF_BIN` (default `freebuff`),
 only). `BLINK_DUMP_SCREEN` is a file path; when set, a startup timeout writes
 the raw screen there — every physical row with its exact length and trailing
 padding, so a misclassification can be re-derived from the bytes. Unset, it is
-inert. The startup budget defaults to 25 s so it expires inside the client's
+inert. The dump is deliberately verbatim and unredacted — it reproduces whatever
+the TUI was showing, including the working-directory path — so point it at a
+private regular file, not a shared or world-readable one. Enabling it also puts a
+synchronous write on the timeout path, which can delay the error past the nominal
+budget if the destination is slow. The startup budget defaults to 25 s so it expires inside the client's
 hard-coded 30 s `session/new` deadline, with room to report why a slow splash
 never settled.
 
