@@ -114,17 +114,20 @@ pub fn parse_log_line(line: &str) -> LogEvent {
     LogEvent::Other
 }
 
-/// Does `msg` BEGIN with one of freebuff's no-auth-token emissions?
+/// Is `msg` exactly one of freebuff's no-auth-token emissions?
 ///
-/// Anchored at the start of the trimmed message, so a phrase merely quoted or
-/// embedded in surrounding text (a `User message: "..."` echo, a relayed
-/// warning) does NOT match — only the structured emission itself does. ASCII
-/// case-insensitive and matched as a PREFIX, so cosmetics are tolerated:
-/// leading/trailing whitespace, different capitalisation, and a trailing
-/// punctuation change all still match. The anchors omit the genuine lines'
-/// trailing full stop so a dropped period does not defeat detection; the
-/// second anchor is the full sentence so chat text that merely opens with
-/// `No authentication token found` is left alone.
+/// Two conditions, both required, so neither a leading label/quote nor any
+/// trailing explanation can satisfy the match:
+///   1. ANCHORED at offset 0 of the trimmed message — a phrase merely quoted or
+///      embedded in surrounding text does not begin the message, so it fails.
+///   2. The anchor must reach the END of the message: only a full stop and/or
+///      whitespace may follow. `... CODEBUFF_API_KEY (quoted in a report)` is
+///      explanatory text, not the emission, and is rejected.
+///
+/// ASCII case-insensitive, and the anchors omit the genuine lines' trailing
+/// full stop so that a dropped period (or an extra one) is still tolerated.
+/// All slicing is checked (`str::get`), so a multibyte boundary can never
+/// panic.
 fn is_no_auth_token(msg: &str) -> bool {
     const ANCHORS: [&str; 3] = [
         "[ads] No auth token available",
@@ -132,17 +135,21 @@ fn is_no_auth_token(msg: &str) -> bool {
         "[freebuff-session] No auth token; skipping free-session admission",
     ];
     let msg = msg.trim();
-    ANCHORS
-        .iter()
-        .any(|a| starts_with_ignore_ascii_case(msg, a))
+    ANCHORS.iter().any(|a| {
+        strip_prefix_ignore_ascii_case(msg, a)
+            .is_some_and(|rest| rest.chars().all(|c| c == '.' || c.is_whitespace()))
+    })
 }
 
-/// ASCII-case-insensitive `str::starts_with` that never panics: `str::get`
+/// ASCII-case-insensitive `str::strip_prefix` that never panics: `str::get`
 /// returns None when `needle.len()` is past the end or would split a multibyte
-/// character, so a non-prefix can never be misread.
-fn starts_with_ignore_ascii_case(hay: &str, needle: &str) -> bool {
-    hay.get(..needle.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(needle))
+/// character, so a non-prefix can never be misread and the slice can never
+/// land mid-character.
+fn strip_prefix_ignore_ascii_case<'a>(hay: &'a str, needle: &str) -> Option<&'a str> {
+    match hay.get(..needle.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(needle) => hay.get(needle.len()..),
+        _ => None,
+    }
 }
 
 /// Parse step number from "Start agent <model> step N" or "End agent <model> step N"
@@ -528,6 +535,21 @@ mod tests {
         ];
         for line in genuine {
             assert_eq!(parse_log_line(line), LogEvent::NoAuthToken, "line: {line}");
+        }
+    }
+
+    /// The suffix guard: an anchor that is merely the START of a longer message
+    /// (trailing explanation) is not the emission and must NOT match. A prefix
+    /// match alone would accept these and kill a healthy session.
+    #[test]
+    fn auth_phrase_followed_by_explanatory_text_is_not_flagged() {
+        let explained = [
+            r#"{"level":30,"msg":"No authentication token found. Please run the login flow or set CODEBUFF_API_KEY (quoted in a report)","data":{}}"#,
+            r#"{"level":30,"msg":"[ads] No auth token available — as seen in the incident report","data":{}}"#,
+            r#"{"level":30,"msg":"[freebuff-session] No auth token; skipping free-session admission because of x","data":{}}"#,
+        ];
+        for line in explained {
+            assert_eq!(parse_log_line(line), LogEvent::Other, "line: {line}");
         }
     }
 }
