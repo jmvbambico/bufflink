@@ -271,6 +271,20 @@ case "${FAKE_FREEBUFF_MODE:-}" in
         # Block forever
         while true; do sleep 1; done
         ;;
+    no-auth)
+        # freebuff with no usable auth token: within ~50 ms it writes the
+        # signature to its own log and then goes silent forever. No login
+        # screen ever appears, so the screen classifier only ever sees Booting.
+        TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%S.000Z")
+        CHAT_DIR="$CHATS_DIR/$TIMESTAMP"
+        mkdir -p "$CHAT_DIR"
+        write_log_line '[ads] No auth token available' '{}'
+        write_log_line 'No authentication token found. Please run the login flow or set CODEBUFF_API_KEY.' '{}'
+        write_log_line '[chat-runtime] Freebuff session over; holding queued messages until rejoin' '{}'
+        write_log_line '[freebuff-session] No auth token; skipping free-session admission' '{}'
+        # Block forever, like the real binary with no token.
+        while true; do sleep 1; done
+        ;;
     hang-splash)
         print_splash
         sleep 60

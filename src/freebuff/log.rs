@@ -22,6 +22,15 @@ pub enum LogEvent {
     /// Captured from a live freebuff run on 2026-10-03; unlike the legacy
     /// `Agent execution failed` form this line carries no `data.message`.
     Cancelled,
+    /// The child never obtained a usable auth token. freebuff writes this
+    /// signature to its own log within ~50 ms of launch and then goes silent
+    /// forever: no login screen ever appears, so a startup poll burns its whole
+    /// budget with nothing to classify. Captured from a real incident (2026-10)
+    /// reproducing `[ads] No auth token available`,
+    /// `No authentication token found. Please run the login flow or set
+    /// CODEBUFF_API_KEY.` and `[freebuff-session] No auth token; skipping
+    /// free-session admission`.
+    NoAuthToken,
     /// Any other line.
     Other,
 }
@@ -92,6 +101,17 @@ pub fn parse_log_line(line: &str) -> LogEvent {
         return LogEvent::Cancelled;
     }
 
+    // NoAuthToken: the child has no usable auth token and will never reach a
+    // screen the startup loop can act on. Match only the distinctive phrases
+    // freebuff writes for this state — a false fast-fail on a healthy boot is
+    // worse than waiting out the budget, so generic chatter is left out.
+    if msg.contains("No auth token")
+        || msg.contains("No authentication token found")
+        || msg.contains("skipping free-session admission")
+    {
+        return LogEvent::NoAuthToken;
+    }
+
     LogEvent::Other
 }
 
@@ -152,6 +172,13 @@ pub fn outcome(events: &[LogEvent]) -> Option<TurnOutcome> {
     }
 
     None
+}
+
+/// True when `events` carries the no-auth-token signature. The startup loop
+/// uses this to fail fast instead of polling to the deadline when the child
+/// will never reach Idle.
+pub fn saw_auth_failure(events: &[LogEvent]) -> bool {
+    events.iter().any(|e| matches!(e, LogEvent::NoAuthToken))
 }
 
 #[cfg(test)]
@@ -386,5 +413,47 @@ mod tests {
             }
         );
         assert_eq!(outcome(&events), Some(TurnOutcome::Interrupted));
+    }
+
+    /// The distinctive auth-failure phrases each parse to NoAuthToken.
+    #[test]
+    fn parse_log_line_no_auth_token_phrases() {
+        let lines = [
+            r#"{"level":40,"timestamp":"2026-10-07T09:15:00.000Z","pid":4242,"hostname":"mac","msg":"[ads] No auth token available","data":{}}"#,
+            r#"{"level":40,"timestamp":"2026-10-07T09:15:00.001Z","pid":4242,"hostname":"mac","msg":"No authentication token found. Please run the login flow or set CODEBUFF_API_KEY.","data":{}}"#,
+            r#"{"level":40,"timestamp":"2026-10-07T09:15:00.003Z","pid":4242,"hostname":"mac","msg":"[freebuff-session] No auth token; skipping free-session admission","data":{}}"#,
+        ];
+        for line in lines {
+            assert_eq!(parse_log_line(line), LogEvent::NoAuthToken, "line: {line}");
+        }
+        // The non-diagnostic chatter line from the same burst must NOT match:
+        // a false fast-fail on a healthy boot is the failure to avoid.
+        let chatter = r#"{"level":30,"timestamp":"2026-10-07T09:15:00.002Z","pid":4242,"hostname":"mac","msg":"[chat-runtime] Freebuff session over; holding queued messages until rejoin","data":{}}"#;
+        assert_eq!(parse_log_line(chatter), LogEvent::Other);
+        assert!(!saw_auth_failure(&[parse_log_line(chatter)]));
+    }
+
+    /// The real incident's four-line burst is detected from a fixture.
+    #[test]
+    fn auth_failure_fixture_is_detected() {
+        let content = include_str!("../../tests/fixtures/log/log-auth-failure.jsonl");
+        let events: Vec<LogEvent> = content.lines().map(parse_log_line).collect();
+        assert!(
+            saw_auth_failure(&events),
+            "auth-failure fixture must be detected"
+        );
+    }
+
+    /// The false-positive guard: a healthy startup log — including lines that
+    /// mention auth and session admission without the failure wording — must
+    /// NOT trip the detector.
+    #[test]
+    fn healthy_startup_fixture_is_not_flagged() {
+        let content = include_str!("../../tests/fixtures/log/log-healthy-startup.jsonl");
+        let events: Vec<LogEvent> = content.lines().map(parse_log_line).collect();
+        assert!(
+            !saw_auth_failure(&events),
+            "healthy startup fixture must not be flagged: {events:?}"
+        );
     }
 }

@@ -1,0 +1,4 @@
+{"level":40,"timestamp":"2026-10-07T09:15:00.000Z","pid":4242,"hostname":"mac","msg":"[ads] No auth token available","data":{}}
+{"level":40,"timestamp":"2026-10-07T09:15:00.001Z","pid":4242,"hostname":"mac","msg":"No authentication token found. Please run the login flow or set CODEBUFF_API_KEY.","data":{}}
+{"level":30,"timestamp":"2026-10-07T09:15:00.002Z","pid":4242,"hostname":"mac","msg":"[chat-runtime] Freebuff session over; holding queued messages until rejoin","data":{}}
+{"level":40,"timestamp":"2026-10-07T09:15:00.003Z","pid":4242,"hostname":"mac","msg":"[freebuff-session] No auth token; skipping free-session admission","data":{}}
