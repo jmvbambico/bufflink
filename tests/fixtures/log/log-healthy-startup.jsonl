@@ -1,0 +1,5 @@
+{"level":30,"timestamp":"2026-10-07T09:15:00.000Z","pid":4242,"hostname":"mac","msg":"Starting freebuff","data":{}}
+{"level":30,"timestamp":"2026-10-07T09:15:00.010Z","pid":4242,"hostname":"mac","msg":"Loaded auth token from keychain","data":{}}
+{"level":30,"timestamp":"2026-10-07T09:15:00.020Z","pid":4242,"hostname":"mac","msg":"[freebuff-session] Free session admission granted; 25 Freebucks","data":{}}
+{"level":30,"timestamp":"2026-10-07T09:15:00.030Z","pid":4242,"hostname":"mac","msg":"[chat-runtime] Freebuff session ready","data":{}}
+{"level":30,"timestamp":"2026-10-07T09:15:00.040Z","pid":4242,"hostname":"mac","msg":"[ads] Ad service initialised","data":{}}

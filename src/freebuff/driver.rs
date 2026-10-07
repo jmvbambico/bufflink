@@ -19,7 +19,7 @@ use crate::acp::{
 use crate::freebuff::chats::{
     chats_dir, instance_owner, newest_new_chat, snapshot, CHAT_MESSAGES, LOG,
 };
-use crate::freebuff::log::{outcome, parse_log_line, LogEvent, TurnOutcome};
+use crate::freebuff::log::{outcome, parse_log_line, saw_auth_failure, LogEvent, TurnOutcome};
 use crate::freebuff::screen::{
     active_model, check_active_model, classify, input_box_is_empty, input_box_text, match_model,
     model_rows, pasted_chip_chars, plan_select_step, ModelMatch, ScreenState, SelectStep,
@@ -564,7 +564,18 @@ impl FreebuffBackend {
     }
 
     /// Handle startup sequence after spawning freebuff.
-    async fn run_startup(&self, pty: &Arc<Pty>, _cwd: &Path) -> Result<()> {
+    ///
+    /// `chats_dir` and `initial_snapshot` are threaded in so the poll loop can
+    /// locate the newly created chat dir and inspect its log READ-ONLY for the
+    /// no-auth-token signature (a child with no token writes it within ~50 ms
+    /// and then never shows a login screen to classify).
+    async fn run_startup(
+        &self,
+        pty: &Arc<Pty>,
+        _cwd: &Path,
+        chats_dir: &Path,
+        initial_snapshot: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
         let mut splash_accept_sent = false;
         // Down presses sent while walking the expanded model list.
         let mut model_presses: u32 = 0;
@@ -574,6 +585,14 @@ impl FreebuffBackend {
         // 250 ms tick (a tick log would be a spin-dump). A silent startup is
         // why omnigent captured no diagnostics at all.
         let mut last_state: Option<ScreenState> = None;
+
+        // Read-only auth-failure detection. A child with no usable auth token
+        // writes the signature to its own log within ~50 ms of launch and then
+        // goes silent forever: no login screen ever appears, so `classify` only
+        // ever sees Booting/Unknown and the poll would burn the whole budget.
+        // The chat dir is located lazily and only ever read.
+        let mut auth_chat_dir: Option<PathBuf> = None;
+        let mut auth_log_offset: u64 = 0;
 
         let startup_start = Instant::now();
         let startup_deadline = startup_start + self.cfg.startup_timeout;
@@ -591,6 +610,32 @@ impl FreebuffBackend {
                     status,
                     snap.text()
                 ));
+            }
+
+            // Fail fast when the child booted without a usable auth token: it
+            // writes the signature to its own log within milliseconds and never
+            // reaches a screen the classifier can act on, so waiting out the
+            // budget would only yield a generic startup timeout. Read-only:
+            // freebuff's state is never touched. Never key on a "no screen
+            // change" heuristic — the splash may legitimately wait for input
+            // (docs/research/captures/probe-report-2026-09-19.md).
+            if auth_chat_dir.is_none() {
+                if let Some(dir) = newest_new_chat(chats_dir, initial_snapshot)? {
+                    info!(chat_dir = %dir.display(), "startup: located chat dir");
+                    auth_chat_dir = Some(dir);
+                }
+            }
+            if let Some(dir) = auth_chat_dir.as_deref() {
+                let events = self.read_log_events(dir, &mut auth_log_offset).await?;
+                if saw_auth_failure(&events) {
+                    let _ = pty.kill().await;
+                    // AGENTS.md: the agent never drives freebuff's auth flow.
+                    // Name both cause and remedy so an operator can act without
+                    // reading any log.
+                    return Err(anyhow!(
+                        "freebuff is not logged in (no auth token): run `freebuff` once in a terminal and log in, or set CODEBUFF_API_KEY"
+                    ));
+                }
             }
 
             let snap = pty.screen();
@@ -963,7 +1008,10 @@ impl Backend for FreebuffBackend {
             let child_pid = pty.pid().unwrap_or(0);
 
             // Run startup sequence
-            if let Err(e) = this.run_startup(&pty, &cwd).await {
+            if let Err(e) = this
+                .run_startup(&pty, &cwd, &chats_dir_path, &initial_snapshot)
+                .await
+            {
                 let _ = pty.kill().await;
                 return Err(e);
             }
@@ -1599,6 +1647,35 @@ mod tests {
         assert!(
             err.contains("already running"),
             "error should mention already running: {}",
+            err
+        );
+    }
+
+    /// Regression guard for the confirmed incident: a child with no usable auth
+    /// token writes the signature to its own log within milliseconds and then
+    /// goes silent forever (no login screen ever appears). startup must fail
+    /// fast with an actionable error instead of polling to the deadline.
+    #[tokio::test]
+    async fn t16_startup_fails_fast_when_no_auth_token() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("no-auth"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let result = backend.new_session(temp_dir.clone()).await;
+        assert!(
+            result.is_err(),
+            "new_session should fail when the child has no auth token"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not logged in") && err.contains("CODEBUFF_API_KEY"),
+            "error should name both cause and remedy: {}",
+            err
+        );
+        assert!(
+            !err.contains("startup timeout"),
+            "must fail fast, not time out: {}",
             err
         );
     }
