@@ -139,6 +139,51 @@ fn remainder_after_nudge(submit_timeout: Duration) -> Duration {
     submit_timeout.saturating_sub(Duration::from_secs(2))
 }
 
+/// Whether `state` is a terminal gate: a screen that means this launch (or any
+/// prompt submitted into it) can never be consumed, however long we wait, so
+/// waiting out a timeout buys nothing.
+///
+/// Deliberately excludes the transient states (`Busy`, `Booting`,
+/// `ModelSplash`, `ModelList`, `Unknown`) and `SessionEnded`, which startup
+/// resolves with a single Esc — none is final.
+fn is_terminal_gate(state: &ScreenState) -> bool {
+    matches!(
+        state,
+        ScreenState::FreebucksGate { .. }
+            | ScreenState::AlreadyRunning
+            | ScreenState::Login
+            | ScreenState::KickedOut
+    )
+}
+
+/// Map a terminal gate to the operator-facing error, or `None` when the state
+/// is not terminal. Shared by the STARTUP loop and the PROMPT-submit wait so
+/// the two paths can never describe the same gate differently. `AlreadyRunning`
+/// resolves the owner pid from `manicode_dir` (read-only).
+fn terminal_gate_error(state: &ScreenState, manicode_dir: &Path) -> Option<anyhow::Error> {
+    match state {
+        ScreenState::FreebucksGate { message } => {
+            Some(anyhow!("freebuff: not enough Freebucks — {}", message))
+        }
+        ScreenState::AlreadyRunning => {
+            let owner_pid = instance_owner(manicode_dir)
+                .map(|(_, pid)| pid.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            Some(anyhow!(
+                "freebuff: already running (owner pid: {})",
+                owner_pid
+            ))
+        }
+        ScreenState::Login => Some(anyhow!(
+            "freebuff needs an interactive login: run `freebuff` once in a terminal and log in, then retry"
+        )),
+        ScreenState::KickedOut => Some(anyhow!(
+            "freebuff: another instance took over this account"
+        )),
+        _ => None,
+    }
+}
+
 /// Parse `BLINK_STARTUP_TIMEOUT_S`. Default 25 s when the variable is absent or
 /// unparseable — it must expire inside omnigent's hard-coded 30 s `session/new`
 /// deadline, leaving ~5 s for blink's own error to serialise and reach the
@@ -630,10 +675,12 @@ impl FreebuffBackend {
                 if saw_auth_failure(&events) {
                     let _ = pty.kill().await;
                     // AGENTS.md: the agent never drives freebuff's auth flow.
-                    // Name both cause and remedy so an operator can act without
-                    // reading any log.
+                    // The log signature cannot prove a single cause, so state
+                    // what was OBSERVED and the checks to make — never present
+                    // CODEBUFF_API_KEY (paid accounts only) as the remedy to a
+                    // free-tier user.
                     return Err(anyhow!(
-                        "freebuff is not logged in (no auth token): run `freebuff` once in a terminal and log in, or set CODEBUFF_API_KEY"
+                        "freebuff reported no auth token in its log: first check whether `freebuff` is logged in (run it once in a terminal) — another running freebuff instance can produce the same symptom"
                     ));
                 }
             }
@@ -823,34 +870,32 @@ impl FreebuffBackend {
                         splash_accept_sent = true;
                     }
                 }
-                ScreenState::FreebucksGate { message } => {
+                // Terminal gates: the shared helper builds the error so the
+                // prompt path cannot drift from these messages. Login is a hard
+                // precondition the agent never satisfies (AGENTS.md: it never
+                // logs in or drives the auth flow).
+                ScreenState::FreebucksGate { .. } => {
                     info!("startup: freebucks gate detected");
                     let _ = pty.kill().await;
-                    return Err(anyhow!("freebuff: not enough Freebucks — {}", message));
+                    return Err(terminal_gate_error(&state, &self.manicode_dir())
+                        .expect("FreebucksGate is terminal (see is_terminal_gate)"));
                 }
                 ScreenState::AlreadyRunning => {
                     info!("startup: already running dialog detected");
                     let _ = pty.kill().await;
-                    let owner_pid = instance_owner(&self.manicode_dir())
-                        .map(|(_, pid)| pid.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    return Err(anyhow!(
-                        "freebuff: already running (owner pid: {})",
-                        owner_pid
-                    ));
+                    return Err(terminal_gate_error(&state, &self.manicode_dir())
+                        .expect("AlreadyRunning is terminal (see is_terminal_gate)"));
                 }
                 ScreenState::Login => {
                     info!("startup: interactive login gate detected");
                     let _ = pty.kill().await;
-                    // AGENTS.md: the agent never logs in or drives the auth
-                    // flow. Fail fast and hand it to the human.
-                    return Err(anyhow!(
-                        "freebuff needs an interactive login: run `freebuff` once in a terminal and log in, then retry"
-                    ));
+                    return Err(terminal_gate_error(&state, &self.manicode_dir())
+                        .expect("Login is terminal (see is_terminal_gate)"));
                 }
                 ScreenState::KickedOut => {
                     let _ = pty.kill().await;
-                    return Err(anyhow!("freebuff: another instance took over this account"));
+                    return Err(terminal_gate_error(&state, &self.manicode_dir())
+                        .expect("KickedOut is terminal (see is_terminal_gate)"));
                 }
                 ScreenState::Idle => {
                     self.verify_idle_model(pty, &snap.rows, splash_accept_sent)
@@ -931,9 +976,14 @@ impl FreebuffBackend {
 
         // Wait for freebuff to go Busy, or for the paste to be consumed (input
         // box back to the placeholder and no pasted-text chip), up to submit_timeout.
+        // A terminal gate also resolves the wait: it means the prompt will
+        // never be consumed, so the caller must fail fast rather than burn the
+        // whole timeout before classifying.
         let submit_timeout = self.cfg.submit_timeout;
         let pred = move |s: &ScreenSnapshot| {
-            matches!(classify(&s.rows), ScreenState::Busy { .. })
+            let state = classify(&s.rows);
+            is_terminal_gate(&state)
+                || matches!(state, ScreenState::Busy { .. })
                 || (!input_box_text(&s.rows)
                     .map(|t| t.contains(&preview))
                     .unwrap_or(false)
@@ -973,7 +1023,16 @@ impl FreebuffBackend {
                 ));
             }
         };
-        if matches!(classify(&resolved.rows), ScreenState::Busy { .. }) {
+        // A terminal gate resolves the wait immediately (see the predicate):
+        // fail fast with the shared, specific error instead of reporting a
+        // generic timeout. The teardown mirrors the startup fatal paths.
+        let state = classify(&resolved.rows);
+        if let Some(err) = terminal_gate_error(&state, &self.manicode_dir()) {
+            info!(state = ?state, "prompt: terminal gate after submit; failing fast");
+            let _ = pty.kill().await;
+            return Err(err);
+        }
+        if matches!(state, ScreenState::Busy { .. }) {
             info!("prompt: freebuff went busy");
         } else {
             info!("prompt: paste consumed; proceeding to the turn loop");
@@ -1651,10 +1710,10 @@ mod tests {
         );
     }
 
-    /// Regression guard for the confirmed incident: a child with no usable auth
-    /// token writes the signature to its own log within milliseconds and then
-    /// goes silent forever (no login screen ever appears). startup must fail
-    /// fast with an actionable error instead of polling to the deadline.
+    /// Fail-fast guard for the v0.3.1 no-auth signature. The log line cannot
+    /// prove a single cause (a second freebuff instance produces the same
+    /// lines), so the error states what was OBSERVED and the checks to make,
+    /// and never recommends CODEBUFF_API_KEY, which is for paid accounts only.
     #[tokio::test]
     async fn t16_startup_fails_fast_when_no_auth_token() {
         let tmp = test_temp_dir();
@@ -1669,8 +1728,16 @@ mod tests {
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("not logged in") && err.contains("CODEBUFF_API_KEY"),
-            "error should name both cause and remedy: {}",
+            err.contains("no auth token")
+                && err.contains("logged in")
+                && err.contains("run it once in a terminal")
+                && err.contains("another running freebuff instance"),
+            "error should state the observation and the checks to make: {}",
+            err
+        );
+        assert!(
+            !err.contains("CODEBUFF_API_KEY"),
+            "must not hand a free-tier user the paid-only API key: {}",
             err
         );
         assert!(
@@ -1678,6 +1745,131 @@ mod tests {
             "must fail fast, not time out: {}",
             err
         );
+    }
+
+    /// The 2026-10-07 incident: startup reached Idle, then freebuff showed the
+    /// Freebucks gate when the prompt was SUBMITTED. The submit wait must
+    /// resolve the moment the gate is on screen and return the specific error
+    /// instead of burning the whole submit_timeout and reporting the generic one.
+    #[tokio::test]
+    async fn t17_prompt_fails_fast_on_freebucks_gate() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let mut cfg = test_config(&temp_dir, Some("prompt-gate"));
+        cfg.submit_timeout = Duration::from_secs(10);
+        let submit_timeout = cfg.submit_timeout;
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+
+        let start = Instant::now();
+        let (result, _updates) = run_prompt_collect(&backend, &session_id, "hello").await;
+        let elapsed = start.elapsed();
+
+        let err = result
+            .expect_err("prompt must not succeed on the Freebucks gate")
+            .to_string();
+        assert!(
+            err.contains("not enough Freebucks"),
+            "must report the specific gate error: {}",
+            err
+        );
+        // The gate text is the real captured screen, reused by the fake via
+        // docs/research/captures/freebucks-gate-80x24.txt.
+        assert!(
+            err.contains("Not enough Freebucks — 5 Freebucks/hr against 0 left."),
+            "error should carry the captured gate message: {}",
+            err
+        );
+        assert!(
+            !err.contains("neither went busy"),
+            "must not fall through to the generic timeout: {}",
+            err
+        );
+        // The point of the change: the wait resolves as soon as the gate is on
+        // screen, WELL under the 10 s submit_timeout.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "fast-fail should be well under the {submit_timeout:?} submit_timeout, got {elapsed:?}"
+        );
+
+        backend.shutdown().await;
+    }
+
+    /// The generic submit-timeout error (with its screen dump) stays reachable
+    /// for a genuine non-gate stall: the screen is not terminal and the prompt
+    /// was not consumed. The dump is what made the 2026-10-07 incident
+    /// solvable, so it must survive the fail-fast change.
+    #[tokio::test]
+    async fn t18_prompt_stall_keeps_generic_timeout_with_screen_dump() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let mut cfg = test_config(&temp_dir, Some("prompt-stall"));
+        cfg.submit_timeout = Duration::from_secs(3);
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+
+        let (result, _updates) = run_prompt_collect(&backend, &session_id, "hello-stall").await;
+        let err = result
+            .expect_err("prompt must time out on a non-gate stall")
+            .to_string();
+        assert!(
+            err.contains("neither went busy nor consumed the prompt"),
+            "a non-gate stall keeps the generic error: {}",
+            err
+        );
+        assert!(
+            err.contains("hello-stall"),
+            "the generic error must keep its screen dump: {}",
+            err
+        );
+        assert!(
+            !err.contains("not enough Freebucks"),
+            "no gate on screen, so no gate error: {}",
+            err
+        );
+
+        backend.shutdown().await;
+    }
+
+    /// `is_terminal_gate` (the cheap predicate check) and `terminal_gate_error`
+    /// (the message) must agree: every terminal state maps to an error and no
+    /// transient state does. Guards the two from drifting.
+    #[test]
+    fn terminal_gate_helper_matches_is_terminal_gate() {
+        let dir = Path::new("/nonexistent-manicode-dir");
+        let terminal = [
+            ScreenState::FreebucksGate {
+                message: "Not enough Freebucks — 5 Freebucks/hr against 0 left.".to_string(),
+            },
+            ScreenState::AlreadyRunning,
+            ScreenState::Login,
+            ScreenState::KickedOut,
+        ];
+        for state in &terminal {
+            assert!(is_terminal_gate(state), "{state:?} should be terminal");
+            assert!(
+                terminal_gate_error(state, dir).is_some(),
+                "{state:?} should map to an error"
+            );
+        }
+        let transient = [
+            ScreenState::Booting,
+            ScreenState::ModelSplash,
+            ScreenState::ModelList,
+            ScreenState::SessionEnded,
+            ScreenState::Idle,
+            ScreenState::Busy { elapsed_s: Some(3) },
+            ScreenState::Unknown,
+        ];
+        for state in &transient {
+            assert!(!is_terminal_gate(state), "{state:?} must not be terminal");
+            assert!(
+                terminal_gate_error(state, dir).is_none(),
+                "{state:?} must not map to an error"
+            );
+        }
     }
 
     #[tokio::test]
