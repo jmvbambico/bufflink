@@ -299,6 +299,11 @@ case "${FAKE_FREEBUFF_MODE:-}" in
     chip)
         # Normal flow; idle_prompt shows the chip and reads without echo.
         ;;
+    prompt-gate|prompt-stall)
+        # Normal startup flow reaching Idle; the gate/stall only appears once a
+        # prompt is submitted. Handled in idle_prompt below. Opt-in so no
+        # existing test changes behaviour.
+        ;;
     slow-busy)
         # Normal flow; idle_prompt shows the placeholder (paste consumed) for
         # 6 s before going busy.
@@ -417,6 +422,33 @@ idle_prompt() {
     if [ "$line" = "/exit" ]; then
         print_exit
         exit 0
+    fi
+    if [ "$FAKE_FREEBUFF_MODE" = "prompt-gate" ]; then
+        # Real incident (2026-10-07): freebuff showed the Freebucks gate when
+        # the prompt was SUBMITTED, i.e. after startup had already reached Idle.
+        # Re-draw the gate (the real captured screen, ANSI and all) and block;
+        # the prompt is never consumed.
+        printf '\033[2J\033[H'
+        GATE_CAPTURE="$(dirname "$0")/../../../docs/research/captures/freebucks-gate-80x24.txt"
+        if [ -f "$GATE_CAPTURE" ]; then
+            cat "$GATE_CAPTURE"
+        else
+            print_gate_splash
+        fi
+        while true; do sleep 1; done
+    fi
+    if [ "$FAKE_FREEBUFF_MODE" = "prompt-stall" ]; then
+        # The prompt neither goes busy nor is consumed: re-draw an idle screen
+        # that still shows the submitted text in the box, then block. Forces the
+        # generic submit timeout, whose screen dump blink must keep.
+        printf '\033[2J\033[H'
+        printf '  Freebuff will run commands on your behalf to help you build.\n\n'
+        printf '  Directory %s\n\n' "$CWD"
+        printf 'GLM 5.3 Flash · 59m left · 16.4K (2%%)      ✕ End session\n'
+        printf '╭────╮\n'
+        printf '│  ▍%s  │\n' "$line"
+        printf '╰────╯\n'
+        while true; do sleep 1; done
     fi
     TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%S.000Z")
     CHAT_DIR="$CHATS_DIR/$TIMESTAMP"
