@@ -102,17 +102,47 @@ pub fn parse_log_line(line: &str) -> LogEvent {
     }
 
     // NoAuthToken: the child has no usable auth token and will never reach a
-    // screen the startup loop can act on. Match only the distinctive phrases
-    // freebuff writes for this state — a false fast-fail on a healthy boot is
-    // worse than waiting out the budget, so generic chatter is left out.
-    if msg.contains("No auth token")
-        || msg.contains("No authentication token found")
-        || msg.contains("skipping free-session admission")
-    {
+    // screen the startup loop can act on. Match is ANCHORED (see
+    // `is_no_auth_token`): an unanchored `contains` would fire when a prompt or
+    // relayed message merely quotes one of these phrases — e.g. a task ABOUT
+    // this bug — and kill a healthy session, which is strictly worse than the
+    // slow timeout it replaces.
+    if is_no_auth_token(msg) {
         return LogEvent::NoAuthToken;
     }
 
     LogEvent::Other
+}
+
+/// Does `msg` BEGIN with one of freebuff's no-auth-token emissions?
+///
+/// Anchored at the start of the trimmed message, so a phrase merely quoted or
+/// embedded in surrounding text (a `User message: "..."` echo, a relayed
+/// warning) does NOT match — only the structured emission itself does. ASCII
+/// case-insensitive and matched as a PREFIX, so cosmetics are tolerated:
+/// leading/trailing whitespace, different capitalisation, and a trailing
+/// punctuation change all still match. The anchors omit the genuine lines'
+/// trailing full stop so a dropped period does not defeat detection; the
+/// second anchor is the full sentence so chat text that merely opens with
+/// `No authentication token found` is left alone.
+fn is_no_auth_token(msg: &str) -> bool {
+    const ANCHORS: [&str; 3] = [
+        "[ads] No auth token available",
+        "No authentication token found. Please run the login flow or set CODEBUFF_API_KEY",
+        "[freebuff-session] No auth token; skipping free-session admission",
+    ];
+    let msg = msg.trim();
+    ANCHORS
+        .iter()
+        .any(|a| starts_with_ignore_ascii_case(msg, a))
+}
+
+/// ASCII-case-insensitive `str::starts_with` that never panics: `str::get`
+/// returns None when `needle.len()` is past the end or would split a multibyte
+/// character, so a non-prefix can never be misread.
+fn starts_with_ignore_ascii_case(hay: &str, needle: &str) -> bool {
+    hay.get(..needle.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(needle))
 }
 
 /// Parse step number from "Start agent <model> step N" or "End agent <model> step N"
@@ -455,5 +485,49 @@ mod tests {
             !saw_auth_failure(&events),
             "healthy startup fixture must not be flagged: {events:?}"
         );
+    }
+
+    /// The hard guard against the reviewer's false-positive: a healthy log that
+    /// merely QUOTES the auth-failure phrases inside other messages (a prompt
+    /// or relayed warning) must NOT trip the detector. The prompts for this
+    /// very change contain these strings; matching them would make blink kill
+    /// its own healthy session.
+    #[test]
+    fn quoted_auth_phrases_fixture_is_not_flagged() {
+        let content = include_str!("../../tests/fixtures/log/log-healthy-startup-quoted.jsonl");
+        let events: Vec<LogEvent> = content.lines().map(parse_log_line).collect();
+        assert!(
+            !saw_auth_failure(&events),
+            "quoted auth phrases must not be detected: {events:?}"
+        );
+    }
+
+    /// The anchoring itself: leading text defeats the match, while cosmetics at
+    /// or after the start of a genuine emission are tolerated.
+    #[test]
+    fn auth_phrase_matching_is_anchored_but_drift_tolerant() {
+        // Embedded/quoted: a label or quote character precedes the phrase, so
+        // no anchor matches.
+        let embedded = [
+            r#"{"level":30,"msg":"User message: No auth token available","data":{}}"#,
+            r#"{"level":30,"msg":"Assistant: \"No authentication token found. Please run the login flow or set CODEBUFF_API_KEY.\"","data":{}}"#,
+            r#"{"level":30,"msg":"see [freebuff-session] No auth token; skipping free-session admission","data":{}}"#,
+            r#"{"level":30,"msg":"the [ads] No auth token available error","data":{}}"#,
+        ];
+        for line in embedded {
+            assert_eq!(parse_log_line(line), LogEvent::Other, "line: {line}");
+        }
+        // Genuine emissions survive trivial drift: surrounding whitespace,
+        // different capitalisation, and a dropped trailing period.
+        let genuine = [
+            r#"{"level":40,"msg":"  [ads] No auth token available  ","data":{}}"#,
+            r#"{"level":40,"msg":"[ADS] no auth token available","data":{}}"#,
+            r#"{"level":40,"msg":"No authentication token found. Please run the login flow or set CODEBUFF_API_KEY","data":{}}"#,
+            r#"{"level":40,"msg":"No authentication token found. Please run the login flow or set CODEBUFF_API_KEY.","data":{}}"#,
+            r#"{"level":40,"msg":"[freebuff-session] No auth token; skipping free-session admission.","data":{}}"#,
+        ];
+        for line in genuine {
+            assert_eq!(parse_log_line(line), LogEvent::NoAuthToken, "line: {line}");
+        }
     }
 }

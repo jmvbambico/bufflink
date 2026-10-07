@@ -1,0 +1,5 @@
+{"level":30,"timestamp":"2026-10-07T09:20:00.000Z","pid":4242,"hostname":"mac","msg":"User message: No auth token available","data":{}}
+{"level":30,"timestamp":"2026-10-07T09:20:00.001Z","pid":4242,"hostname":"mac","msg":"User message: \"[ads] No auth token available\"","data":{}}
+{"level":30,"timestamp":"2026-10-07T09:20:00.002Z","pid":4242,"hostname":"mac","msg":"Assistant: I saw \"No authentication token found. Please run the login flow or set CODEBUFF_API_KEY.\" in the log","data":{}}
+{"level":30,"timestamp":"2026-10-07T09:20:00.003Z","pid":4242,"hostname":"mac","msg":"Relayed warning: [freebuff-session] No auth token; skipping free-session admission","data":{}}
+{"level":30,"timestamp":"2026-10-07T09:20:00.004Z","pid":4242,"hostname":"mac","msg":"Loaded auth token from keychain","data":{}}
