@@ -372,6 +372,118 @@ case "${FAKE_FREEBUFF_MODE:-}" in
             idle_prompt || break
         done
         ;;
+    list)
+        # 0.2.x-shaped model picker, interactive: blink drives it with Up/Down
+        # and Enter. Enter on a model row is an Enter-guard violation, so the
+        # fake exits 1 to prove blink never sends Enter on a model row.
+        MODEL_NAMES=(
+            'GLM 5.3 Flash' 'MiMo 2.6 Pro' 'MiMo 2.6 Flash' 'GPT-6 Luna' 'GPT-6.1 Sol'
+            'DeepSeek V4.1 Flash' 'Solar Pro 4' 'Solar Mini 4' 'Muse Spark 1.3' 'Gemini 3.8 Flash'
+        )
+        MODEL_COSTS=(5 10 3 8 12 15 10 4 6 7)
+        N=${#MODEL_NAMES[@]}
+        expanded=0
+        focus=0            # 0..N-1 model index; N = the toggle row (expanded only)
+        focus_toggle=0     # collapsed: 1 means focus on the See-all toggle
+        scroll=0
+        V=$(( (${LINES:-40} - 8) / 2 ))
+        [ "$V" -lt 1 ] && V=1
+        [ "$V" -gt "$N" ] && V=$N
+
+        stty raw -echo 2>/dev/null || true
+
+        draw() {
+            printf '\033[2J\033[H'
+            printf '████████████████████████████████████████\r\n'
+            printf '█                                                      █\r\n'
+            printf '█   F  R  E  E  B  U  F  F                            █\r\n'
+            printf '█                                                      █\r\n'
+            printf '████████████████████████████████████████\r\n'
+            printf '\r\nStart coding for free\r\n\r\n'
+            if [ "$expanded" -eq 0 ]; then
+                if [ "$focus_toggle" -eq 1 ]; then
+                    printf '│   %s · Deep reasoning · Reasoning: max · Images · NEW │\r\n' "${MODEL_NAMES[0]}"
+                else
+                    printf '│ › %s · Deep reasoning · Reasoning: max · Images · NEW │\r\n' "${MODEL_NAMES[0]}"
+                fi
+                printf '│                               %d Freebucks/hr                                │\r\n' "${MODEL_COSTS[0]}"
+                printf '↓  See all %d models\r\n' "$N"
+            else
+                end=$(( scroll + V ))
+                [ "$end" -gt "$N" ] && end=$N
+                i=$scroll
+                while [ "$i" -lt "$end" ]; do
+                    if [ "$i" -eq "$focus" ]; then
+                        printf '│ › %s · Deep reasoning · Reasoning: max · Images · NEW │\r\n' "${MODEL_NAMES[$i]}"
+                    else
+                        printf '│   %s · Deep reasoning · Reasoning: max · Images · NEW │\r\n' "${MODEL_NAMES[$i]}"
+                    fi
+                    printf '│                               %d Freebucks/hr                                │\r\n' "${MODEL_COSTS[$i]}"
+                    i=$(( i + 1 ))
+                done
+                printf '↑  Show fewer\r\n'
+            fi
+        }
+
+        draw
+        while true; do
+            # Read one byte reliably: `read -n 1` cannot capture '\r' (Enter),
+            # so use `dd bs=1 count=1` which passes every byte through.
+            c=$(dd bs=1 count=1 2>/dev/null) || break
+            [ -n "$c" ] || break # EOF: the PTY was closed.
+            case "$c" in
+                $'\x1b')
+                    c2=$(dd bs=1 count=1 2>/dev/null) || continue
+                    [ "$c2" = "[" ] || continue
+                    c3=$(dd bs=1 count=1 2>/dev/null) || continue
+                    case "$c3" in
+                        B)
+                            if [ "$expanded" -eq 0 ]; then
+                                focus_toggle=1
+                            elif [ "$focus" -lt "$N" ]; then
+                                focus=$(( focus + 1 ))
+                                if [ "$focus" -ge $(( scroll + V )) ]; then
+                                    scroll=$(( focus - V + 1 ))
+                                fi
+                            fi
+                            ;;
+                        A)
+                            if [ "$expanded" -eq 0 ]; then
+                                focus_toggle=0
+                            elif [ "$focus" -gt 0 ]; then
+                                focus=$(( focus - 1 ))
+                                if [ "$focus" -lt "$scroll" ]; then
+                                    scroll=$focus
+                                fi
+                            fi
+                            ;;
+                    esac
+                    ;;
+                $'\r')
+                    if [ "$expanded" -eq 0 ]; then
+                        if [ "$focus_toggle" -eq 1 ]; then
+                            expanded=1
+                            focus=0
+                            scroll=0
+                        else
+                            printf 'freebuff: Enter on a model row starts a session and spends Freebucks\n' >&2
+                            exit 1
+                        fi
+                    elif [ "$focus" -eq "$N" ]; then
+                        expanded=0
+                        focus_toggle=0
+                    else
+                        printf 'freebuff: Enter on a model row starts a session and spends Freebucks\n' >&2
+                        exit 1
+                    fi
+                    ;;
+                q|Q)
+                    exit 0
+                    ;;
+            esac
+            draw
+        done
+        ;;
 esac
 
 # Normal mode: print splash and wait for Enter
