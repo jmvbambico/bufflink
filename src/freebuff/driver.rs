@@ -22,9 +22,10 @@ use crate::freebuff::chats::{
 use crate::freebuff::log::{outcome, parse_log_line, saw_auth_failure, LogEvent, TurnOutcome};
 use crate::freebuff::screen::{
     active_model, check_active_model, classify, input_box_is_empty, input_box_text, match_model,
-    model_rows, nav_ring, pasted_chip_chars, plan_select_step, ModelMatch, ScreenState, SelectStep,
-    SPLASH_ACCEPT_KEY,
+    model_rows, nav_ring, pasted_chip_chars, plan_select_step, resolve_model_id, ModelMatch,
+    ScreenState, SelectStep, SPLASH_ACCEPT_KEY,
 };
+use crate::freebuff::settings::{settings_path, SettingsPin};
 use crate::freebuff::transcript::{diff, parse_messages, Block, Cursor, Delta, Message};
 use crate::freebuff::{CANCEL_KEY, EXIT_COMMAND};
 use crate::pty::{Key, Pty, PtyConfig, ScreenSnapshot};
@@ -61,11 +62,13 @@ pub struct DriverConfig {
     pub settle_timeout: Duration,
     /// Time to wait after Enter for freebuff to go busy or consume the paste (default: 30s, env: BLINK_SUBMIT_TIMEOUT_S).
     pub submit_timeout: Duration,
-    /// Model to select on the splash (default: None -> freebuff's default,
-    /// env: BLINK_MODEL). A name or id fragment matched case-insensitively
-    /// against the splash's display names (the lineup rotates, so ids are
-    /// never hardcoded); unset means Enter on the collapsed splash. A name
-    /// that matches nothing (or several rows) fails loudly.
+    /// Model to use (default: None -> freebuff's default, env: BLINK_MODEL).
+    /// freebuff 0.2.x has no boot picker; bufflink pins this value into
+    /// `freebuffModel` in the manicode `settings.json` before launch and
+    /// restores the user's original on shutdown. A provider-prefixed id
+    /// (`z-ai/glm-5.3-flash`), a bare id or a display name is accepted and
+    /// resolved to a canonical id when known; an unknown value is written
+    /// as-is and reported clearly if it does not match the running model.
     pub model: Option<String>,
     /// Path to dump the raw startup screen to on a startup timeout (default:
     /// None, env: BLINK_DUMP_SCREEN). Unset means the feature is inert — no
@@ -296,6 +299,10 @@ struct Session {
 pub struct FreebuffBackend {
     cfg: DriverConfig,
     session: Mutex<Option<Session>>,
+    /// Active model pin on freebuff's `settings.json`, if any. Held so the
+    /// user's original `freebuffModel`/`freebuffModelKey` can be restored on
+    /// shutdown (or on a failed launch).
+    settings_pin: Mutex<Option<SettingsPin>>,
 }
 
 impl FreebuffBackend {
@@ -304,6 +311,7 @@ impl FreebuffBackend {
         Self {
             cfg,
             session: Mutex::new(None),
+            settings_pin: Mutex::new(None),
         }
     }
 
@@ -313,6 +321,35 @@ impl FreebuffBackend {
             .manicode_dir
             .clone()
             .unwrap_or_else(crate::freebuff::chats::manicode_dir)
+    }
+
+    /// Pin `BLINK_MODEL` into freebuff's `settings.json` before launch.
+    ///
+    /// freebuff 0.2.x has no boot model picker; it reads the active model from
+    /// `freebuffModel` at startup. The requested value is resolved to a
+    /// canonical catalog id when known (a display name or bare fragment still
+    /// works), but an unknown-yet-plausible id is written as-is so the running
+    /// model can be checked against it later and reported clearly. Fails loudly
+    /// if the settings file is missing/unparseable or the id is malformed.
+    async fn apply_model_pin(&self, target: &str) -> Result<()> {
+        let id = resolve_model_id(target).unwrap_or(target).to_string();
+        let mut guard = self.settings_pin.lock().await;
+        let pin =
+            guard.get_or_insert_with(|| SettingsPin::new(settings_path(&self.manicode_dir())));
+        pin.pin(&id, None)
+            .with_context(|| format!("freebuff: cannot pin BLINK_MODEL='{target}'"))
+    }
+
+    /// Restore the user's original settings after a pin. A no-op when nothing
+    /// was pinned. Errors are logged, not propagated: shutdown must proceed.
+    async fn restore_settings_pin(&self) {
+        let mut guard = self.settings_pin.lock().await;
+        if let Some(pin) = guard.as_mut() {
+            if let Err(e) = pin.restore() {
+                warn!(error = %format!("{e:#}"), "failed to restore freebuff settings");
+            }
+        }
+        *guard = None;
     }
 
     /// Build PtyConfig from DriverConfig and cwd.
@@ -1073,9 +1110,22 @@ impl Backend for FreebuffBackend {
             // Snapshot chats dir before launch
             let initial_snapshot = snapshot(&chats_dir_path)?;
 
+            // Pin BLINK_MODEL into settings.json before freebuff starts: 0.2.x
+            // reads the active model from there, so a resumed hour only counts
+            // as a match if the pin is already in place.
+            if let Some(target) = this.cfg.model.clone() {
+                this.apply_model_pin(&target).await?;
+            }
+
             // Spawn freebuff in PTY
             let pty_config = this.build_pty_config(&cwd);
-            let pty = Arc::new(Pty::spawn(pty_config).await?);
+            let pty = match Pty::spawn(pty_config).await {
+                Ok(pty) => Arc::new(pty),
+                Err(e) => {
+                    this.restore_settings_pin().await;
+                    return Err(e);
+                }
+            };
             let child_pid = pty.pid().unwrap_or(0);
 
             // Run startup sequence
@@ -1084,6 +1134,7 @@ impl Backend for FreebuffBackend {
                 .await
             {
                 let _ = pty.kill().await;
+                this.restore_settings_pin().await;
                 return Err(e);
             }
 
@@ -1312,6 +1363,7 @@ impl Backend for FreebuffBackend {
 
             let Some(session) = session else {
                 info!("shutdown: no session to shut down");
+                this.restore_settings_pin().await;
                 return;
             };
 
@@ -1351,6 +1403,9 @@ impl Backend for FreebuffBackend {
                 }
             }
             let _ = pty.kill().await;
+
+            // Put the user's settings back now that freebuff has exited.
+            this.restore_settings_pin().await;
 
             info!("shutdown: complete");
         }
@@ -1534,6 +1589,92 @@ mod tests {
         assert_eq!(id1, id2);
 
         // Cleanup
+        backend.shutdown().await;
+    }
+
+    /// Seed `manicode_dir/settings.json` with a realistic freebuff settings file.
+    fn write_settings(manicode_dir: &Path, value: serde_json::Value) {
+        let path = settings_path(manicode_dir);
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    fn read_settings(manicode_dir: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(settings_path(manicode_dir)).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn settings_pin_is_written_on_start_and_restored_on_shutdown() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(
+            &temp_dir,
+            serde_json::json!({
+                "mode": "DEFAULT",
+                "adsEnabled": true,
+                "freebuffModel": "mimo/mimo-v2.5",
+                "freebuffModelKey": "m-00032eaeec"
+            }),
+        );
+
+        // 'z-ai/glm-5.3-flash' is the model the fake's splash offers, so the
+        // launch reaches Idle; the pin still has to change the settings file.
+        let mut cfg = test_config(&temp_dir, None);
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        let backend = FreebuffBackend::new(cfg);
+
+        // The pin is applied before launch: while the session is up the
+        // settings file carries the requested model and no stale pick key.
+        let _session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+        let pinned = read_settings(&temp_dir);
+        assert_eq!(pinned["freebuffModel"], "z-ai/glm-5.3-flash");
+        assert!(pinned.get("freebuffModelKey").is_none());
+        assert_eq!(pinned["mode"], "DEFAULT");
+        assert_eq!(pinned["adsEnabled"], true);
+
+        // Shutdown puts the user's originals back.
+        backend.shutdown().await;
+        let restored = read_settings(&temp_dir);
+        assert_eq!(restored["freebuffModel"], "mimo/mimo-v2.5");
+        assert_eq!(restored["freebuffModelKey"], "m-00032eaeec");
+        assert_eq!(restored["mode"], "DEFAULT");
+    }
+
+    #[tokio::test]
+    async fn model_pin_without_settings_file_fails_loudly() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        assert!(!settings_path(&temp_dir).exists());
+
+        let mut cfg = test_config(&temp_dir, None);
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        let backend = FreebuffBackend::new(cfg);
+
+        let err = backend.new_session(temp_dir.clone()).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("settings not found"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !settings_path(&temp_dir).exists(),
+            "a missing settings file must not be created"
+        );
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_model_id_is_rejected_before_launch() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+
+        let mut cfg = test_config(&temp_dir, None);
+        cfg.model = Some("GLM 5.3 Flash!!".to_string());
+        let backend = FreebuffBackend::new(cfg);
+
+        let err = backend.new_session(temp_dir.clone()).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid BLINK_MODEL"),
+            "unexpected error: {err:#}"
+        );
         backend.shutdown().await;
     }
 
@@ -2294,6 +2435,12 @@ mod tests {
     async fn t13_startup_wait_is_bounded_by_startup_timeout() {
         let tmp = test_temp_dir();
         let temp_dir = tmp.0.clone();
+        // BLINK_MODEL is incidental to this test; the settings file must exist
+        // so the model pin succeeds and the startup-timeout path is reached.
+        write_settings(
+            &temp_dir,
+            serde_json::json!({ "freebuffModel": "z-ai/glm-5.3-flash" }),
+        );
         let mut cfg = test_config(&temp_dir, Some("hang-splash"));
         cfg.model = Some("deepseek-v4-pro".to_string());
         let startup_timeout = Duration::from_secs(2);
