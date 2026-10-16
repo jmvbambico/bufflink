@@ -12,7 +12,8 @@
 //! read-modify-write a `serde_json::Value` object so keys bufflink does not own
 //! survive untouched, copy the original file to
 //! `settings.json.blink-backup` before the first write of each run (refreshed,
-//! so it always reflects the value actually being replaced), and never create a
+//! so it always reflects the value actually being replaced, and removed once the
+//! originals are restored so it does not linger as litter), and never create a
 //! fresh settings file that would discard user state — a missing or unparseable
 //! file is a loud error, not something to paper over.
 
@@ -22,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{Map, Value};
+use tracing::warn;
 
 /// File name of freebuff's settings, relative to the manicode directory.
 pub const SETTINGS_FILE: &str = "settings.json";
@@ -211,10 +213,12 @@ impl SettingsPin {
     /// everything else — including keys freebuff changed mid-session — intact.
     /// A no-op when nothing was pinned or the file has since vanished.
     ///
-    /// On failure the pin is RETAINED (`applied` stays true, the original values
-    /// are kept) so a later shutdown path can retry; a non-object or unreadable
-    /// file is an error, never a silent success. Every error names the
-    /// `settings.json.blink-backup` last-resort copy.
+    /// On SUCCESS the now-redundant `settings.json.blink-backup` is removed so it
+    /// does not linger in the user's config dir as litter; on FAILURE the pin is
+    /// RETAINED (`applied` stays true, the original values are kept) and the
+    /// backup is LEFT IN PLACE as the user's only recovery path. A non-object or
+    /// unreadable file is an error, never a silent success, and every error names
+    /// the `settings.json.blink-backup` last-resort copy.
     pub fn restore(&mut self) -> Result<()> {
         if !self.applied {
             return Ok(());
@@ -270,6 +274,19 @@ impl SettingsPin {
             )
         })?;
         self.applied = false;
+        // The originals are back, so the last-resort backup is now redundant:
+        // remove it so it does not linger in the user's config dir as litter. A
+        // failure to remove it is logged, never fatal — the restore itself
+        // succeeded, and a leftover backup only makes a later restore a no-op.
+        if let Err(e) = fs::remove_file(&self.backup_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    error = %e,
+                    path = %self.backup_path.display(),
+                    "restored freebuff settings but could not remove the redundant backup"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -563,6 +580,31 @@ mod tests {
         assert_eq!(restored["freebuffModel"], "orig/model");
         assert_eq!(restored["freebuffModelKey"], "m-orig");
         assert!(!pin.is_applied());
+    }
+
+    /// A successful restore removes the redundant `settings.json.blink-backup`
+    /// so it does not linger in the user's config dir as litter, and restoring
+    /// twice is harmless.
+    #[test]
+    fn restore_removes_the_backup_and_is_idempotent() {
+        let (_dir, path) = temp_settings(Some(json!({
+            "freebuffModel": "z-ai/glm-5.3-flash",
+            "mode": "DEFAULT"
+        })));
+        let backup = backup_path(&path);
+        let mut pin = SettingsPin::new(path.clone());
+        pin.pin("mimo/mimo-v2.5", None).unwrap();
+        assert!(backup.exists(), "the pin must have captured a backup");
+
+        pin.restore().unwrap();
+        assert!(
+            !backup.exists(),
+            "a successful restore must remove the redundant backup"
+        );
+
+        // Idempotent: a second restore is a harmless no-op.
+        pin.restore().unwrap();
+        assert!(!backup.exists());
     }
 
     #[test]
