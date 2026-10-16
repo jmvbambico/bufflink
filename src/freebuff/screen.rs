@@ -52,24 +52,16 @@ pub const SPLASH_ACCEPT_KEY: &str = "\r";
 
 /// Classify the current screen state from a list of text rows (ANSI already stripped).
 pub fn classify(rows: &[String]) -> ScreenState {
-    // Precedence: HoursGate > FreebucksGate > AlreadyRunning > Login > SessionEnded > KickedOut > Busy > ModelList > ModelSplash > Idle > Booting > Unknown
+    // Precedence: FreebucksGate > HoursGate > AlreadyRunning > Login > SessionEnded > KickedOut > Busy > ModelList > ModelSplash > Idle > Booting > Unknown
+    //
+    // Both terminal gates sit ahead of the picker states (ModelList/ModelSplash):
+    // a gate renders modally over the session — and can render OVER the picker
+    // when the user picks an unaffordable model — so it must win there. Each gate
+    // is keyed on its FULL shape rather than a bare phrase a per-model picker
+    // warning also carries, so a healthy picker is never misread as a terminal
+    // gate and a fine session never aborts as unaffordable.
 
-    // Check for the freebuff 0.2.x HOURS gate first: 0.2.29 bills a session in
-    // hours and refuses a turn with `Not enough hours for <Model>: an hour on it
-    // takes N hours.` Keyed on the phrase alone so a renamed model or a
-    // different figure still classifies; the model and figure are parsed out
-    // where possible and the raw line is always carried.
-    for row in rows {
-        if let Some((model, hours, message)) = parse_hours_gate(row) {
-            return ScreenState::HoursGate {
-                model,
-                hours,
-                message,
-            };
-        }
-    }
-
-    // Check for FreebucksGate next (inside the model box). A v0.2.x picker can
+    // Check for FreebucksGate first (inside the model box). A v0.2.x picker can
     // also show a per-model insufficient-balance warning, so require the gate's
     // fuller message shape (`... against 0 left ...` / `Enter opens plans`)
     // rather than the bare phrase, or the picker would be misread as the gate.
@@ -79,6 +71,27 @@ pub fn classify(rows: &[String]) -> ScreenState {
         {
             return ScreenState::FreebucksGate {
                 message: row.trim().to_string(),
+            };
+        }
+    }
+
+    // Check for the freebuff 0.2.x HOURS gate: 0.2.29 bills a session in hours
+    // and refuses a turn with `Not enough hours for <Model>: an hour on it takes
+    // N hours.` A v0.2.x picker can show the SAME phrase as a per-model
+    // affordability warning label, so — exactly like FreebucksGate above —
+    // require the gate's fuller shape (the shortfall sentence) before calling it
+    // terminal. The model and figure are parsed where possible and the raw line
+    // is always carried, so a renamed model or a different figure still
+    // classifies; the shape may soft-wrap, so it is matched screen-wide.
+    if has_hours_gate_shape(rows) {
+        if let Some((model, hours, message)) = rows.iter().find_map(|r| parse_hours_gate(r)) {
+            // The figure can sit on a different physical row than the marker
+            // when the gate soft-wraps, so fall back to a screen-wide search.
+            let hours = hours.or_else(|| rows.iter().find_map(|r| parse_takes_hours(r)));
+            return ScreenState::HoursGate {
+                model,
+                hours,
+                message,
             };
         }
     }
@@ -224,14 +237,30 @@ fn parse_busy_elapsed(row: &str) -> Option<u32> {
     None
 }
 
+/// Whether the screen carries the hours gate's FULL, distinctive shape rather
+/// than a bare `Not enough hours for` phrase. A v0.2.x model picker can show
+/// that phrase as a per-model affordability warning LABEL — which is why
+/// `FreebucksGate` likewise requires its fuller message shape — so the marker
+/// alone must never be read as the terminal gate. The genuine gate (the verbatim
+/// `0229-real-hours-gate-120x40` frame, and the fake's `hours-gate` screen) also
+/// emits the shortfall sentence `an hour on it takes N hours.`; a picker label
+/// does not. The marker and the sentence may soft-wrap onto different rows, so
+/// both are matched screen-wide.
+fn has_hours_gate_shape(rows: &[String]) -> bool {
+    let has_marker = rows.iter().any(|r| r.contains("Not enough hours for"));
+    let has_shortfall = rows.iter().any(|r| r.contains("an hour on it takes"));
+    has_marker && has_shortfall
+}
+
 /// Parse the freebuff 0.2.x HOURS gate from a single row. Detected by the
 /// `Not enough hours for` phrase (the shape 0.2.29 emits: `Not enough hours for
-/// <Model>: an hour on it takes N hours.`). The model name — the text between
-/// the phrase and the first `:` — and the hours figure (from `takes N hour(s)`)
-/// are returned when they parse, else `None`, so the caller still surfaces the
-/// raw line rather than a vague error. Returns `None` when the row carries no
-/// gate at all. Deliberately tolerant: neither the model nor the figure is
-/// hardcoded.
+/// <Model>: an hour on it takes N hours.`). Callers must gate this on
+/// [`has_hours_gate_shape`] so a per-model picker warning label is not read as
+/// the terminal gate. The model name — the text between the phrase and the first
+/// `:` — and the hours figure (from `takes N hour(s)`) are returned when they
+/// parse, else `None`, so the caller still surfaces the raw line rather than a
+/// vague error. Returns `None` when the row carries no gate at all. Deliberately
+/// tolerant: neither the model nor the figure is hardcoded.
 fn parse_hours_gate(row: &str) -> Option<(Option<String>, Option<u32>, String)> {
     const MARKER: &str = "Not enough hours for";
     let idx = row.find(MARKER)?;
@@ -1771,8 +1800,13 @@ mod tests {
             ScreenState::HoursGate { hours, .. } => assert_eq!(hours, Some(1)),
             other => panic!("expected HoursGate, got {other:?}"),
         }
-        // Parsing fails: STILL a gate, raw line carried, never a vague error.
-        match gate("Not enough hours for") {
+        // Parsing fails: STILL a gate (the shortfall sentence is present but its
+        // figures do not parse), raw line carried, never a vague error.
+        let rows = vec![
+            "Not enough hours for".to_string(),
+            "an hour on it takes hours.".to_string(),
+        ];
+        match classify(&rows) {
             ScreenState::HoursGate {
                 model,
                 hours,
@@ -1784,6 +1818,47 @@ mod tests {
             }
             other => panic!("expected HoursGate, got {other:?}"),
         }
+    }
+
+    /// BLOCKING regression: a model-picker screen whose rows carry a per-model
+    /// `Not enough hours for <Model>` affordability warning label must NOT be
+    /// read as the terminal hours gate. The bare phrase alone no longer
+    /// classifies as a gate — only the gate's full shape (its shortfall
+    /// sentence) does — so a healthy picker is never aborted as unaffordable.
+    #[test]
+    fn v0229_picker_per_model_hours_warning_is_not_the_hours_gate() {
+        // An expanded picker (2+ model boxes + a `Show fewer` toggle) whose
+        // second model shows the warning label instead of a plain price.
+        let rows: Vec<String> = [
+            "                    UNLIMITED",
+            "                    ┌────────────────────────────────────────────────┐",
+            "                    │ › GLM 5.3 Flash · Deep reasoning · Images      │",
+            "                    │                      5 Freebucks/hr · Recommended │",
+            "                    └────────────────────────────────────────────────┘",
+            "                    ┌────────────────────────────────────────────────┐",
+            "                    │   MiMo Fast · Smart & Fast · Images            │",
+            "                    │            Not enough hours for MiMo Fast      │",
+            "                    └────────────────────────────────────────────────┘",
+            "                    ↑  Show fewer",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // The fixture really does carry the phrase; only the shape is missing.
+        assert!(
+            rows.iter().any(|r| r.contains("Not enough hours for")),
+            "the picker warning label must be present for this test to bite"
+        );
+        let state = classify(&rows);
+        assert!(
+            !matches!(state, ScreenState::HoursGate { .. }),
+            "a per-model picker warning label must not be the terminal gate: {state:?}"
+        );
+        assert!(
+            matches!(state, ScreenState::ModelList | ScreenState::ModelSplash),
+            "the picker must still classify as a picker state: {state:?}"
+        );
     }
 
     /// The older Freebucks gate must still classify as ITS gate, never the new

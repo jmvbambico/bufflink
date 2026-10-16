@@ -211,6 +211,26 @@ fn terminal_gate_error(state: &ScreenState, manicode_dir: &Path) -> Option<anyho
     }
 }
 
+/// A failed settings restore, carrying the backup path captured while the pin
+/// was still held. Keeping the path in the value (rather than re-reading it off
+/// the pin later) means an operator message always names a real file even when a
+/// concurrent restore cleared the pin in between.
+struct PinRestoreFailure {
+    error: anyhow::Error,
+    backup: Option<PathBuf>,
+}
+
+/// Display the backup path for an operator message, NEVER an empty string: an
+/// error that says "the original settings remain in the backup at " is worse
+/// than useless. A path unknown because the pin was already restored is named as
+/// such rather than silently blanked.
+fn backup_display(backup: Option<&Path>) -> String {
+    match backup {
+        Some(path) => path.display().to_string(),
+        None => "<unknown: the pin had already been restored>".to_string(),
+    }
+}
+
 /// Parse `BLINK_STARTUP_TIMEOUT_S`. Default 25 s when the variable is absent or
 /// unparseable — it must expire inside omnigent's hard-coded 30 s `session/new`
 /// deadline, leaving ~5 s for blink's own error to serialise and reach the
@@ -368,15 +388,26 @@ impl FreebuffBackend {
     /// nothing was pinned. Success clears the pin; failure KEEPS it — it holds
     /// the user's original model, so dropping it here would silently hijack the
     /// user's choice forever. Returns the restore error so a caller can fold it
-    /// into the error that is already on its way out.
-    async fn try_restore_pin(&self) -> Result<()> {
+    /// into the error that is already on its way out, alongside the backup path
+    /// captured WHILE the pin was still held: a concurrent successful restore
+    /// clears the pin, so re-reading the path after the lock is released can come
+    /// back empty — an error that names no file is worse than useless.
+    async fn try_restore_pin(&self) -> std::result::Result<(), PinRestoreFailure> {
         let mut guard = self.settings_pin.lock().await;
-        match guard.as_mut().map(|pin| pin.restore()) {
-            None | Some(Ok(())) => {
-                *guard = None;
-                Ok(())
+        match guard.as_mut() {
+            None => Ok(()),
+            Some(pin) => {
+                // Capture the backup path BEFORE the pin (and its path) can be
+                // dropped, so the message always names a real file.
+                let backup = Some(pin.backup_path().to_path_buf());
+                match pin.restore() {
+                    Ok(()) => {
+                        *guard = None;
+                        Ok(())
+                    }
+                    Err(error) => Err(PinRestoreFailure { error, backup }),
+                }
             }
-            Some(Err(e)) => Err(e),
         }
     }
 
@@ -388,16 +419,10 @@ impl FreebuffBackend {
     /// the artefact that holds the user's original model if no further exit path
     /// runs before the process dies, and the warning names that exact file.
     async fn restore_settings_pin(&self) {
-        if let Err(e) = self.try_restore_pin().await {
-            let backup = self
-                .settings_pin
-                .lock()
-                .await
-                .as_ref()
-                .map(|pin| pin.backup_path().display().to_string())
-                .unwrap_or_default();
+        if let Err(failure) = self.try_restore_pin().await {
+            let backup = backup_display(failure.backup.as_deref());
             warn!(
-                error = %format!("{e:#}"),
+                error = %format!("{:#}", failure.error),
                 backup = %backup,
                 "failed to restore freebuff settings; keeping the pin to retry on shutdown \
                  — the user's original model is preserved in the backup file"
@@ -415,14 +440,9 @@ impl FreebuffBackend {
     async fn fold_restore_error(&self, err: anyhow::Error) -> anyhow::Error {
         match self.try_restore_pin().await {
             Ok(()) => err,
-            Err(restore_err) => {
-                let backup = self
-                    .settings_pin
-                    .lock()
-                    .await
-                    .as_ref()
-                    .map(|pin| pin.backup_path().display().to_string())
-                    .unwrap_or_default();
+            Err(failure) => {
+                let backup = backup_display(failure.backup.as_deref());
+                let restore_err = failure.error;
                 anyhow!(
                     "{err:#}; additionally, the user's freebuff settings were NOT restored: \
                      {restore_err:#}. The original settings remain in the backup at {backup}"
@@ -1521,6 +1541,37 @@ impl Backend for FreebuffBackend {
     }
 }
 
+/// Last-resort settings restore when the backend itself is dropped.
+///
+/// The `prompt`/`new_session` funnels run `fold_restore_error` on any `Result`,
+/// but a CANCELLED or ABORTED future never returns a `Result` — cancellation
+/// drops the future and the funnel never executes. `session/cancel` does not drop
+/// the future (it only flips the cancel `watch`, and the turn loop returns
+/// through the funnel), and the ACP abort path on stdin EOF calls
+/// `shutdown()` immediately afterwards, which restores — so the funnel covers
+/// those. This drop guard covers the residue: a backend dropped WITHOUT
+/// `shutdown()` ever running. `SettingsPin::restore` is synchronous (std `fs`)
+/// and idempotent, and `try_lock` keeps a drop on a contended mutex from blocking
+/// or panicking. If it cannot restore, the on-disk `settings.json.blink-backup`
+/// remains the documented recovery path.
+impl Drop for FreebuffBackend {
+    fn drop(&mut self) {
+        let Ok(mut guard) = self.settings_pin.try_lock() else {
+            return;
+        };
+        if let Some(pin) = guard.as_mut() {
+            if let Err(e) = pin.restore() {
+                warn!(
+                    error = %format!("{e:#}"),
+                    backup = %backup_display(Some(pin.backup_path())),
+                    "last-resort settings restore on drop failed; keeping the pin's backup as \
+                     the recovery path"
+                );
+            }
+        }
+    }
+}
+
 // Helper to allow cloning a reference to the session for the prompt future
 impl Session {
     fn clone_session_ref(&self) -> SessionRef {
@@ -2024,6 +2075,41 @@ mod tests {
         assert_eq!(restored["freebuffModel"], "mimo/mimo-v2.5");
         assert_eq!(restored["freebuffModelKey"], "m-00032eaeec");
         assert!(backend.settings_pin.lock().await.is_none());
+    }
+
+    /// A backend dropped WITHOUT `shutdown()` (the future-less last resort) must
+    /// still put the user's settings back: a cancellation/abort path that never
+    /// ran the restore funnel must not leave the user's live settings modified.
+    #[tokio::test]
+    async fn settings_pin_is_restored_on_drop_without_shutdown() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(
+            &temp_dir,
+            serde_json::json!({
+                "freebuffModel": "mimo/mimo-v2.5",
+                "freebuffModelKey": "m-00032eaeec",
+                "mode": "DEFAULT"
+            }),
+        );
+        let original_bytes = std::fs::read(settings_path(&temp_dir)).unwrap();
+
+        let cfg = test_config(&temp_dir, None);
+        let backend = FreebuffBackend::new(cfg);
+        backend.apply_model_pin("z-ai/glm-5.3-flash").await.unwrap();
+        assert_eq!(
+            read_settings(&temp_dir)["freebuffModel"],
+            "z-ai/glm-5.3-flash"
+        );
+
+        // Drop without ever calling shutdown(): the guard must restore.
+        drop(backend);
+
+        assert_eq!(
+            std::fs::read(settings_path(&temp_dir)).unwrap(),
+            original_bytes,
+            "dropping the backend must restore the user's settings"
+        );
     }
 
     #[tokio::test]
