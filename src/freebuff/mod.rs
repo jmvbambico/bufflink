@@ -4,6 +4,7 @@
 
 pub mod chats;
 pub mod driver;
+pub mod enumerate;
 pub mod log;
 pub mod screen;
 pub mod settings;
