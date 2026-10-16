@@ -1,0 +1,69 @@
+[
+  {
+    "id": "divider-1700000000000",
+    "variant": "ai",
+    "content": "",
+    "blocks": [
+      {
+        "type": "mode-divider",
+        "mode": "LITE"
+      }
+    ],
+    "timestamp": "08:12 AM"
+  },
+  {
+    "id": "user-1700000000000",
+    "variant": "user",
+    "content": "Reply with exactly the single word PONG and nothing else.",
+    "timestamp": "08:12 AM"
+  },
+  {
+    "id": "ai-1700000000200-multifx",
+    "variant": "ai",
+    "content": "",
+    "blocks": [
+      {
+        "type": "text",
+        "content": "First I check the environment.",
+        "textType": "reasoning",
+        "thinkingCollapseState": "preview",
+        "thinkingId": "think-multi-1",
+        "thinkingOpen": false
+      },
+      {
+        "type": "tool",
+        "toolCallId": "tool-call-1",
+        "toolName": "run_terminal_command",
+        "input": {
+          "command": "echo freebuff-ok",
+          "process_type": "foreground",
+          "timeout_seconds": 30
+        },
+        "output": "freebuff-ok\n",
+        "agentId": "main-agent",
+        "includeToolCall": true,
+        "isCollapsed": false
+      },
+      {
+        "type": "text",
+        "content": "The command printed the marker; now I summarise.",
+        "textType": "reasoning",
+        "thinkingCollapseState": "preview",
+        "thinkingId": "think-multi-2",
+        "thinkingOpen": false
+      },
+      {
+        "type": "text",
+        "content": "freebuff-ok",
+        "textType": "text"
+      }
+    ],
+    "timestamp": "08:14 AM",
+    "completionTime": "12s",
+    "credits": 0,
+    "metadata": {
+      "allowInlineAds": true
+    },
+    "isComplete": true
+  }
+]
