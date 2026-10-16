@@ -2216,6 +2216,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_two_turns_cancel_on_second_turn_returns_cancelled() {
+        use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        async fn send(w: &mut (impl AsyncWriteExt + Unpin), v: serde_json::Value) {
+            let mut s = v.to_string();
+            s.push('\n');
+            w.write_all(s.as_bytes()).await.unwrap();
+            w.flush().await.unwrap();
+        }
+        async fn read_msg(r: &mut (impl AsyncBufRead + Unpin)) -> serde_json::Value {
+            let mut buf = String::new();
+            loop {
+                buf.clear();
+                let n = r.read_line(&mut buf).await.unwrap();
+                assert!(n > 0, "eof");
+                if !buf.trim().is_empty() {
+                    return serde_json::from_str(buf.trim()).unwrap();
+                }
+            }
+        }
+
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, None);
+        let backend = Arc::new(FreebuffBackend::new(cfg));
+
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (server_r, server_w) = tokio::io::split(server);
+        let serve = tokio::spawn(crate::acp::serve(
+            Arc::clone(&backend),
+            BufReader::new(server_r),
+            server_w,
+        ));
+        let (client_r, mut client_w) = tokio::io::split(client);
+        let mut client_r = BufReader::new(client_r);
+
+        send(
+            &mut client_w,
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}),
+        )
+        .await;
+        assert_eq!(read_msg(&mut client_r).await["id"], 1);
+
+        send(
+            &mut client_w,
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":temp_dir.to_string_lossy(),"mcpServers":[]}}),
+        )
+        .await;
+        let sid = read_msg(&mut client_r).await["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Turn 1 completes normally.
+        send(
+            &mut client_w,
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":sid,"prompt":[{"type":"text","text":"hello there"}]}}),
+        )
+        .await;
+        loop {
+            let m = read_msg(&mut client_r).await;
+            if m.get("id").and_then(serde_json::Value::as_u64) == Some(3) {
+                assert_eq!(m["result"]["stopReason"], "end_turn");
+                break;
+            }
+        }
+
+        // Turn 2 is slow; cancel it shortly after it starts.
+        send(
+            &mut client_w,
+            serde_json::json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":sid,"prompt":[{"type":"text","text":"slow count"}]}}),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        send(
+            &mut client_w,
+            serde_json::json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}}),
+        )
+        .await;
+        let m = timeout(Duration::from_secs(15), async {
+            loop {
+                let m = read_msg(&mut client_r).await;
+                if m.get("id").and_then(serde_json::Value::as_u64) == Some(4) {
+                    return m;
+                }
+            }
+        })
+        .await
+        .expect("turn 2 did not answer within 15s");
+        assert_eq!(m["result"]["stopReason"], "cancelled", "got {m}");
+
+        drop(client_w);
+        drop(client_r);
+        let _ = timeout(Duration::from_secs(5), serve).await;
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn t_multi_turn_cancel_on_second_turn_returns_cancelled() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, None);
+        let backend = FreebuffBackend::new(cfg);
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+
+        // Turn 1 completes normally.
+        let (r1, _u1) = run_prompt_collect(&backend, &session_id, "hello there").await;
+        assert_eq!(r1.unwrap(), StopReason::EndTurn);
+
+        // Turn 2 is slow; cancel it.
+        let (tx, _rx) = mpsc::channel(64);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let sink = UpdateSink::new(tx);
+        let prompt_fut = backend.prompt(&session_id, "slow count".to_string(), sink, cancel_rx);
+        tokio::pin!(prompt_fut);
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        cancel_tx.send(true).unwrap();
+        let result = timeout(Duration::from_secs(10), prompt_fut).await;
+        assert!(result.is_ok(), "prompt timed out");
+        let result = result.unwrap();
+        assert!(result.is_ok(), "prompt error: {:?}", result.err());
+        assert_eq!(result.unwrap(), StopReason::Cancelled);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn t3_prompt_slow_count_with_cancel_returns_cancelled() {
         let tmp = test_temp_dir();
         let temp_dir = tmp.0.clone();
