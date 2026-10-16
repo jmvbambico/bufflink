@@ -195,6 +195,11 @@ impl SettingsPin {
     /// Restore the user's original `freebuffModel` / `freebuffModelKey`, leaving
     /// everything else — including keys freebuff changed mid-session — intact.
     /// A no-op when nothing was pinned or the file has since vanished.
+    ///
+    /// On failure the pin is RETAINED (`applied` stays true, the original values
+    /// are kept) so a later shutdown path can retry; a non-object or unreadable
+    /// file is an error, never a silent success. Every error names the
+    /// `settings.json.blink-backup` last-resort copy.
     pub fn restore(&mut self) -> Result<()> {
         if !self.applied {
             return Ok(());
@@ -208,23 +213,30 @@ impl SettingsPin {
             Err(e) => {
                 return Err(e).with_context(|| {
                     format!(
-                        "failed to read freebuff settings at {} during restore",
-                        self.path.display()
+                        "failed to read freebuff settings at {} during restore: the user's original model was NOT restored (backup at {})",
+                        self.path.display(),
+                        self.backup_path.display()
                     )
                 })
             }
         };
         let mut obj = match serde_json::from_slice::<Value>(&raw) {
             Ok(Value::Object(map)) => map,
-            Ok(_) => {
-                self.applied = false;
-                return Ok(());
-            }
+            // Valid JSON but not an object: the original model was NOT restored.
+            // This is an error, never a silent success — and the pin is kept
+            // (`applied` stays true) so a later shutdown can retry.
+            Ok(_) => bail!(
+                "freebuff settings at {} is not a JSON object during restore: the user's original model was NOT restored. \
+                 Retry at shutdown, or restore it manually from the backup at {}",
+                self.path.display(),
+                self.backup_path.display()
+            ),
             Err(e) => {
                 return Err(e).with_context(|| {
                     format!(
-                        "freebuff settings at {} is not valid JSON during restore",
-                        self.path.display()
+                        "freebuff settings at {} is not valid JSON during restore: the user's original model was NOT restored (backup at {})",
+                        self.path.display(),
+                        self.backup_path.display()
                     )
                 })
             }
@@ -473,6 +485,41 @@ mod tests {
         let mut pin = SettingsPin::new(path.clone());
         let err = pin.pin("mimo/mimo-v2.5", None).unwrap_err();
         assert!(format!("{err:#}").contains("not a JSON object"));
+    }
+
+    /// A valid-JSON-but-non-object settings file must be an ERROR (never a
+    /// silent success), and the pin — the only holder of the user's original
+    /// model — must survive for a later retry.
+    #[test]
+    fn restore_non_object_settings_is_an_error_and_keeps_the_pin() {
+        let (_dir, path) = temp_settings(Some(json!({
+            "freebuffModel": "orig/model",
+            "freebuffModelKey": "m-orig",
+            "mode": "DEFAULT"
+        })));
+        let mut pin = SettingsPin::new(path.clone());
+        pin.pin("mimo/mimo-v2.5", None).unwrap();
+        assert!(pin.is_applied());
+
+        fs::write(&path, b"[1,2,3]").unwrap();
+        let err = pin.restore().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not a JSON object"), "unexpected: {msg}");
+        assert!(msg.contains("blink-backup"), "must name the backup: {msg}");
+        // Retained, not discarded: a later shutdown can retry.
+        assert!(pin.is_applied());
+
+        // Once the file is an object again, the retry restores the original.
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({ "mode": "DEFAULT" })).unwrap(),
+        )
+        .unwrap();
+        pin.restore().unwrap();
+        let restored = read_json(&path);
+        assert_eq!(restored["freebuffModel"], "orig/model");
+        assert_eq!(restored["freebuffModelKey"], "m-orig");
+        assert!(!pin.is_applied());
     }
 
     #[test]

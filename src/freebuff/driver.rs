@@ -342,14 +342,24 @@ impl FreebuffBackend {
 
     /// Restore the user's original settings after a pin. A no-op when nothing
     /// was pinned. Errors are logged, not propagated: shutdown must proceed.
+    ///
+    /// A failed restore KEEPS the pin — it holds the user's original model, so
+    /// dropping it here would silently hijack the user's choice forever. It is
+    /// retained for a later shutdown path to retry; only success (or no pin)
+    /// clears it. The pinned settings backup is the last-resort manual restore.
     async fn restore_settings_pin(&self) {
         let mut guard = self.settings_pin.lock().await;
-        if let Some(pin) = guard.as_mut() {
-            if let Err(e) = pin.restore() {
-                warn!(error = %format!("{e:#}"), "failed to restore freebuff settings");
+        let outcome = guard.as_mut().map(|pin| pin.restore());
+        match outcome {
+            // Nothing was pinned, or the originals are back: the pin is done.
+            None | Some(Ok(())) => *guard = None,
+            Some(Err(e)) => {
+                warn!(
+                    error = %format!("{e:#}"),
+                    "failed to restore freebuff settings; keeping the pin to retry on shutdown"
+                );
             }
         }
-        *guard = None;
     }
 
     /// Build PtyConfig from DriverConfig and cwd.
@@ -1637,6 +1647,48 @@ mod tests {
         assert_eq!(restored["freebuffModel"], "mimo/mimo-v2.5");
         assert_eq!(restored["freebuffModelKey"], "m-00032eaeec");
         assert_eq!(restored["mode"], "DEFAULT");
+    }
+
+    /// A restore that fails (settings.json became a non-object) must NOT drop
+    /// the pin: the user's original model is retained and a later shutdown
+    /// retries it, so their choice is never silently hijacked.
+    #[tokio::test]
+    async fn failed_restore_keeps_the_pin_for_a_later_shutdown() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(
+            &temp_dir,
+            serde_json::json!({
+                "freebuffModel": "mimo/mimo-v2.5",
+                "freebuffModelKey": "m-00032eaeec",
+                "mode": "DEFAULT"
+            }),
+        );
+        let mut cfg = test_config(&temp_dir, None);
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        let backend = FreebuffBackend::new(cfg);
+
+        backend.new_session(temp_dir.clone()).await.unwrap();
+
+        // Valid JSON, but not an object: restore fails.
+        std::fs::write(settings_path(&temp_dir), b"[1,2,3]").unwrap();
+        backend.shutdown().await;
+        assert!(
+            backend.settings_pin.lock().await.is_some(),
+            "a failed restore must keep the pin so the original can be recovered"
+        );
+
+        // Recover the file; the next shutdown retries and restores the original.
+        std::fs::write(
+            settings_path(&temp_dir),
+            serde_json::to_vec_pretty(&serde_json::json!({ "mode": "DEFAULT" })).unwrap(),
+        )
+        .unwrap();
+        backend.shutdown().await;
+        let restored = read_settings(&temp_dir);
+        assert_eq!(restored["freebuffModel"], "mimo/mimo-v2.5");
+        assert_eq!(restored["freebuffModelKey"], "m-00032eaeec");
+        assert!(backend.settings_pin.lock().await.is_none());
     }
 
     #[tokio::test]

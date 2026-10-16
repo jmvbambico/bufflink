@@ -527,6 +527,16 @@ fn is_toggle_line(text: &str) -> bool {
     text.contains("See all ") || text.contains("Show fewer")
 }
 
+/// Whether `row` is the picker toggle line AND carries the `›` focus marker on
+/// that same line. The freebuff 0.2.x renderer marks a focused toggle only by
+/// colour/bold (which the PTY layer strips), so this is not the only way to
+/// establish toggle focus — but when a renderer does emit a marker, it is
+/// positive evidence that the toggle, not a model row, holds focus.
+pub fn toggle_row_has_focus_marker(row: &str) -> bool {
+    let text = strip_frame(row);
+    text.contains('›') && is_toggle_line(&text)
+}
+
 /// `N` from an `N Freebucks/hr` price fragment.
 fn parse_price_per_hour(text: &str) -> Option<u32> {
     let idx = text.find("Freebucks/hr")?;

@@ -8,8 +8,14 @@
 //! The freebuff binary is injected through `PtyConfig.program` (default
 //! `freebuff`, overridable with `BLINK_FREEBUFF_BIN`). No freebuff backend is
 //! called and no credentials are reused.
+//!
+//! `--list-models` prints one model id per line and og consumes that list as
+//! pinnable ids, so a display name must never be emitted as one: an unmapped
+//! name is dropped from the plain output (and flagged on stderr / in `--json`).
 
-use crate::freebuff::screen::{classify, model_rows, ScreenState};
+use crate::freebuff::screen::{
+    classify, model_rows, nav_ring, parse_catalog, toggle_row_has_focus_marker, ScreenState,
+};
 use crate::pty::{Key, Pty};
 use anyhow::{anyhow, Result};
 use serde::Serialize;
@@ -27,14 +33,17 @@ const MAX_DOWN_PRESSES: u32 = 100;
 pub enum IdSource {
     /// The display name matched a known entry in the lineup map.
     Mapped,
-    /// No mapping existed; the display name was used as a best-effort id.
-    BestEffort,
+    /// No mapping existed; the entry carries no id (`id: null`).
+    Unmapped,
 }
 
 /// One catalog entry, in picker order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CatalogEntry {
-    pub id: String,
+    /// Canonical freebuff model id, or `None` when the display name had no
+    /// known mapping (the lineup rotated). `None` serialises as `"id":null` so
+    /// the entry stays visible in `--json` without a name-shaped fake id.
+    pub id: Option<String>,
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
@@ -48,10 +57,12 @@ pub struct CatalogEntry {
     pub id_source: IdSource,
 }
 
-/// Map a display name to a model id. Unknown names are emitted anyway with the
-/// display name as a best-effort id (`IdSource::BestEffort`): silently dropping
-/// a model is worse than an imperfect id because the lineup rotates.
-pub fn map_display_name(name: &str) -> (String, IdSource) {
+/// Map a display name to a model id. A name with no known mapping yields
+/// `(None, IdSource::Unmapped)`: the lineup rotates, but a display name is NOT
+/// a model id, and emitting one would break og (it would offer the name as a
+/// pinnable id that fails at dispatch). The unmapped entry is still reported in
+/// `--json` and named on stderr by [`unmapped_warning`].
+pub fn map_display_name(name: &str) -> (Option<String>, IdSource) {
     const LINEUP: &[(&str, &str)] = &[
         ("GLM 5.3 Flash", "z-ai/glm-5.3-flash"),
         ("MiMo 2.6 Pro", "mimo/mimo-v2.6-pro"),
@@ -66,10 +77,65 @@ pub fn map_display_name(name: &str) -> (String, IdSource) {
     ];
     for &(display, id) in LINEUP {
         if display == name {
-            return (id.to_string(), IdSource::Mapped);
+            return (Some(id.to_string()), IdSource::Mapped);
         }
     }
-    (name.to_string(), IdSource::BestEffort)
+    (None, IdSource::Unmapped)
+}
+
+/// Whether `id` is a well-formed freebuff model id: lowercase ASCII letters and
+/// digits with `.`, `_`, `-`, `/` separators, starting alphanumeric, 2..=128
+/// bytes. This is the shape freebuff itself accepts — a provider-prefixed id
+/// (`z-ai/glm-5.3-flash`), a bare path (`mimo/mimo-v2.6-pro`) or an opaque
+/// picker key (`m-79293c5b7d`) all pass; a display name such as
+/// `Claude Fable 5.1` (spaces, uppercase) never does.
+pub fn is_well_formed_model_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if bytes.len() < 2 || bytes.len() > 128 {
+        return false;
+    }
+    let first = bytes[0];
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return false;
+    }
+    bytes.iter().all(|b| {
+        b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(*b, b'.' | b'_' | b'-' | b'/')
+    })
+}
+
+/// The ids `--list-models` prints, one per line: only entries with a mapped,
+/// well-formed id. An unmapped (or malformed) entry is omitted so og is never
+/// offered an unusable id; it is still named by [`unmapped_warning`] and kept
+/// in the `--json` catalog.
+pub fn plain_model_ids(catalog: &[CatalogEntry]) -> Vec<&str> {
+    catalog
+        .iter()
+        .filter_map(|e| e.id.as_deref())
+        .filter(|id| is_well_formed_model_id(id))
+        .collect()
+}
+
+/// Display names with no known id mapping, in picker order.
+pub fn unmapped_display_names(catalog: &[CatalogEntry]) -> Vec<&str> {
+    catalog
+        .iter()
+        .filter(|e| e.id.is_none())
+        .map(|e| e.display_name.as_str())
+        .collect()
+}
+
+/// A single stderr line naming every unmapped display name, or `None` when all
+/// entries mapped. Pure so `main` and the tests share the exact wording: a
+/// rotation is visible in og's setup output without corrupting stdout.
+pub fn unmapped_warning(catalog: &[CatalogEntry]) -> Option<String> {
+    let names = unmapped_display_names(catalog);
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "blink: warning: no model id known for display name(s): {} — omitted from --list-models so og is never offered an unusable id; see --list-models --json (\"id\":null) for the full lineup",
+        names.join(", ")
+    ))
 }
 
 /// Parse the price (Freebucks/hr) from a cost line such as `5 Freebucks/hr`
@@ -94,18 +160,50 @@ pub fn price_per_hour_from_cost_line(line: &str) -> Option<u64> {
 }
 
 /// `true` only when the parsed screen proves focus is on the See-all /
-/// Show-fewer toggle row: no model row carries the `›` marker and a toggle
-/// row is visible.
+/// Show-fewer toggle row.
 ///
-/// Pressing Enter on a model row starts a session and SPENDS Freebucks, so
-/// this is a hard refusal point: Enter is refused unless this returns `true`.
+/// Pressing Enter on a model row starts a session and SPENDS Freebucks, so this
+/// is a hard refusal point: Enter is refused unless this returns `true`. It
+/// FAILS CLOSED — the previous form inferred safety from the ABSENCE of a
+/// focused model (`all()` over a model-row list is vacuously true when the list
+/// is EMPTY), so a partially rendered / mid-clear / scrolled frame, or any
+/// future row-shape change, could let Enter reach a focused model row.
+///
+/// Enter is allowed only when all of these hold:
+/// (a) the toggle row is rendered AND is positively the focused stop — the
+///     toggle line itself carries the `›` marker, or (the real 0.2.x renderer
+///     marks a focused toggle by colour, which the PTY layer strips) the parse
+///     proves it structurally below;
+/// (b) no model row is focused, established from a NON-EMPTY parse;
+/// (c) the screen parses coherently at all ([`nav_ring`] recognises the picker).
 pub fn focus_is_on_toggle(rows: &[String]) -> bool {
-    let models = model_rows(rows);
-    let no_model_focused = models.iter().all(|m| !m.focused);
-    let toggle_visible = rows
-        .iter()
-        .any(|r| r.contains("See all") || r.contains("Show fewer"));
-    no_model_focused && toggle_visible
+    // (c) The screen must be recognisable as the 0.2.x picker: a model row or
+    //     the toggle must be present. A blank/garbled/partial frame is None.
+    let Some(ring) = nav_ring(rows) else {
+        return false;
+    };
+    // (a) The toggle row must actually be rendered.
+    if ring.toggle_index.is_none() {
+        return false;
+    }
+
+    // (a) Explicit evidence: the toggle line itself carries the focus marker.
+    let toggle_marked = rows.iter().any(|r| toggle_row_has_focus_marker(r));
+    // (b) Independent "no model focused" reads, so a single parser missing a
+    //     focus marker cannot alone fail open.
+    let no_row_focused = model_rows(rows).iter().all(|m| !m.focused);
+    let catalog = parse_catalog(rows);
+    if catalog.entries.is_empty() {
+        // No model row parsed at all. `all()` here would be vacuously true, so
+        // this is exactly the empty-parse case that must NOT pass: only an
+        // explicit toggle marker (and no focused row either parser can see)
+        // proves focus.
+        return toggle_marked && no_row_focused;
+    }
+    // (b) With a NON-EMPTY parse, `!focused` is meaningful: the picker is a
+    //     single-focus ring, so no focused model row means the toggle holds it.
+    let no_entry_focused = catalog.entries.iter().all(|e| !e.focused);
+    no_entry_focused && no_row_focused
 }
 
 /// Send `Enter` only when the guard confirms focus is on the toggle row.
@@ -300,6 +398,8 @@ pub async fn enumerate_catalog(pty: &Pty) -> Result<Vec<CatalogEntry>> {
             CatalogEntry {
                 id,
                 display_name: name,
+                // `id` is `None` for an unmapped name; the entry is kept so the
+                // rotation is visible in `--json` / the stderr warning.
                 section: None,
                 price_per_hour: price,
                 recommended: None,
@@ -367,6 +467,20 @@ mod tests {
         content.lines().map(|s| s.to_string()).collect()
     }
 
+    /// Build a catalog entry exactly the way `enumerate_catalog` does.
+    fn entry(display_name: &str, price: u64) -> CatalogEntry {
+        let (id, id_source) = map_display_name(display_name);
+        CatalogEntry {
+            id,
+            display_name: display_name.to_string(),
+            section: None,
+            price_per_hour: Some(price),
+            recommended: None,
+            available: None,
+            id_source,
+        }
+    }
+
     #[test]
     fn map_display_name_covers_the_lineup() {
         let cases = [
@@ -392,16 +506,46 @@ mod tests {
         ];
         for (name, (id, source)) in cases {
             let (got_id, got_source) = map_display_name(name);
-            assert_eq!(got_id, id, "name: {name}");
+            assert_eq!(got_id.as_deref(), Some(id), "name: {name}");
             assert_eq!(got_source, source, "name: {name}");
         }
     }
 
     #[test]
-    fn map_display_name_unmapped_uses_best_effort_id() {
-        let (id, source) = map_display_name("Unknown New Model");
-        assert_eq!(id, "Unknown New Model");
-        assert_eq!(source, IdSource::BestEffort);
+    fn map_display_name_unmapped_has_no_id() {
+        // `Claude Fable 5.1` is in freebuff's lineup (0.2.27) but has no entry in
+        // this module's LINEUP map: it must yield NO id, never the name itself.
+        for name in ["Unknown New Model", "Claude Fable 5.1"] {
+            let (id, source) = map_display_name(name);
+            assert_eq!(id, None, "name: {name}");
+            assert_eq!(source, IdSource::Unmapped, "name: {name}");
+        }
+    }
+
+    #[test]
+    fn is_well_formed_model_id_table() {
+        // Real 0.2.x ids: provider-prefixed, bare, opaque key, dotted segment.
+        for ok in [
+            "z-ai/glm-5.3-flash",
+            "mimo/mimo-v2.6-pro",
+            "openai/gpt-6-luna",
+            "m-79293c5b7d",
+            "ab",
+        ] {
+            assert!(is_well_formed_model_id(ok), "should accept {ok}");
+        }
+        // Display names (spaces, uppercase, too short) are never ids.
+        for bad in [
+            "Claude Fable 5.1",
+            "GLM 5.3 Flash",
+            "a",
+            "",
+            "-glm",
+            "glm 5",
+        ] {
+            assert!(!is_well_formed_model_id(bad), "should reject {bad:?}");
+        }
+        assert!(!is_well_formed_model_id(&"a".repeat(129)));
     }
 
     #[test]
@@ -453,6 +597,128 @@ mod tests {
         assert!(!focus_is_on_toggle(&rows));
     }
 
+    /// The money-safety regression: an EMPTY parse used to read as "nothing is
+    /// focused" (`all()` is vacuously true), so this guard FAILED OPEN. Every
+    /// unparseable / partial / blank frame must refuse Enter.
+    #[test]
+    fn focus_is_on_toggle_fails_closed_on_unparseable_screens() {
+        // Empty and blank/whitespace-only frames.
+        assert!(!focus_is_on_toggle(&[]));
+        assert!(!focus_is_on_toggle(&["".to_string(), "   ".to_string()]));
+        // Garbled / mid-clear frame: chrome but no recognisable picker shape.
+        let garbled = vec![
+            String::new(),
+            "some half-rendered garbage".to_string(),
+            "⎘ Copy invite link  Open Earn ↵".to_string(),
+        ];
+        assert!(!focus_is_on_toggle(&garbled));
+        // A model box with no toggle row: not a toggle frame.
+        let no_toggle = vec![
+            "│   Unknown Model · something │".to_string(),
+            "│   5 Freebucks/hr              │".to_string(),
+        ];
+        assert!(!focus_is_on_toggle(&no_toggle));
+    }
+
+    /// A frame where only the toggle parses (e.g. the model box is cut off mid
+    /// render) has NO focus marker anywhere: with no model rows parsed, the
+    /// "no model focused" read is vacuous, so it must refuse.
+    #[test]
+    fn focus_is_on_toggle_fails_closed_when_no_model_row_parses() {
+        assert!(!focus_is_on_toggle(&["↓  See all 3 models".to_string()]));
+        assert!(!focus_is_on_toggle(&["↑  Show fewer".to_string()]));
+        // Even a model-shaped row that the parser cannot read (no ` · ` tagline
+        // separator) leaves the parse empty -> refuse.
+        let cut_off = vec![
+            "│ › GLM 5.3 Flash".to_string(),
+            "↓  See all 3 models".to_string(),
+        ];
+        assert!(!focus_is_on_toggle(&cut_off));
+    }
+
+    /// Positive evidence: the toggle line itself carries the `›` focus marker.
+    /// (The real 0.2.x renderer marks a focused toggle only by colour, which the
+    /// PTY layer strips, so this is a forward-compatible path, not the only one.)
+    #[test]
+    fn focus_is_on_toggle_accepts_an_explicitly_focused_toggle() {
+        assert!(focus_is_on_toggle(&["›  ↓  See all 3 models".to_string()]));
+        // Corroborated by an unfocused model box.
+        assert!(focus_is_on_toggle(&[
+            "│   MiMo 2.6 Pro · Balanced │".to_string(),
+            "›  ↑  Show fewer".to_string(),
+        ]));
+        // A model row focused AND a marked toggle cannot co-occur; the focused
+        // model wins and the guard refuses.
+        assert!(!focus_is_on_toggle(&[
+            "│ › MiMo 2.6 Pro · Balanced │".to_string(),
+            "›  ↓  See all 3 models".to_string(),
+        ]));
+    }
+
+    /// Documented deviation: the real 0.2.x picker draws the toggle with the
+    /// focus colour/bold (stripped by the PTY layer) instead of `›`, so a frame
+    /// with a parsed-but-unfocused model box plus the toggle IS the
+    /// toggle-focused frame and must be accepted — otherwise the picker could
+    /// never be expanded. Verified against the 0.2.x bundle renderer.
+    #[test]
+    fn focus_is_on_toggle_accepts_the_colour_only_toggle_frame() {
+        let rows = vec![
+            "│   GLM 5.3 Flash · Deep reasoning · Images │".to_string(),
+            "│              5 Freebucks/hr               │".to_string(),
+            "↓  See all 12 models".to_string(),
+        ];
+        assert!(focus_is_on_toggle(&rows));
+    }
+
+    #[test]
+    fn plain_model_ids_omits_unmapped_and_keeps_mapped() {
+        let catalog = vec![
+            entry("GLM 5.3 Flash", 5),
+            entry("Claude Fable 5.1", 15),
+            entry("MiMo 2.6 Pro", 10),
+        ];
+        assert_eq!(
+            plain_model_ids(&catalog),
+            vec!["z-ai/glm-5.3-flash", "mimo/mimo-v2.6-pro"],
+            "only well-formed mapped ids, one per line"
+        );
+    }
+
+    /// The reviewer's scenario: the fixture lineup includes `Claude Fable 5.1`,
+    /// which this module cannot map. It must be absent from the plain
+    /// one-id-per-line output, marked (`"id":null`) in JSON, and warned on
+    /// stderr — a display name is never emitted as an id.
+    #[test]
+    fn unmapped_display_name_is_dropped_flagged_and_warned() {
+        let catalog = vec![entry("GLM 5.3 Flash", 5), entry("Claude Fable 5.1", 15)];
+
+        // Plain output: the unmapped entry is gone; the name is NOT an id line.
+        let plain = plain_model_ids(&catalog);
+        assert_eq!(plain, vec!["z-ai/glm-5.3-flash"]);
+        assert!(!plain.contains(&"Claude Fable 5.1"));
+
+        // JSON: present but marked, with the display name preserved.
+        #[derive(serde::Serialize)]
+        struct Payload {
+            schema: u32,
+            models: Vec<CatalogEntry>,
+        }
+        let json = serde_json::to_string(&Payload {
+            schema: 1u32,
+            models: catalog.clone(),
+        })
+        .expect("serialise");
+        assert!(json.contains("\"id\":null"));
+        assert!(json.contains("\"display_name\":\"Claude Fable 5.1\""));
+        assert!(!json.contains("\"id\":\"Claude Fable 5.1\""));
+
+        // stderr: a one-line warning naming the rotation.
+        let warning = unmapped_warning(&catalog).expect("warning");
+        assert!(warning.contains("Claude Fable 5.1"));
+        assert!(!warning.contains("GLM 5.3 Flash"));
+        assert!(unmapped_warning(&[entry("GLM 5.3 Flash", 5)]).is_none());
+    }
+
     #[test]
     fn advertised_total_parses_bare_and_bordered_rows() {
         // The fake emits the toggle line bare; the real splash wraps it in a
@@ -477,7 +743,7 @@ mod tests {
     #[test]
     fn json_output_omits_unknown_fields() {
         let entry = CatalogEntry {
-            id: "z-ai/glm-5.3-flash".to_string(),
+            id: Some("z-ai/glm-5.3-flash".to_string()),
             display_name: "GLM 5.3 Flash".to_string(),
             section: None,
             price_per_hour: Some(5),
@@ -503,27 +769,6 @@ mod tests {
         assert!(!s.contains("section"));
         assert!(!s.contains("recommended"));
         assert!(!s.contains("available"));
-        assert!(!s.contains("id_source"));
-    }
-
-    #[test]
-    fn json_output_best_effort_entry_uses_display_name_as_id() {
-        let (id, source) = map_display_name("Unknown New Model");
-        assert_eq!(id, "Unknown New Model");
-        assert_eq!(source, IdSource::BestEffort);
-        let entry = CatalogEntry {
-            id,
-            display_name: "Unknown New Model".to_string(),
-            section: None,
-            price_per_hour: None,
-            recommended: None,
-            available: None,
-            id_source: IdSource::BestEffort,
-        };
-        let s = serde_json::to_string(&entry).expect("serialise");
-        assert!(s.contains("\"id\":\"Unknown New Model\""));
-        assert!(s.contains("\"display_name\":\"Unknown New Model\""));
-        assert!(!s.contains("price_per_hour"));
         assert!(!s.contains("id_source"));
     }
 
@@ -582,7 +827,10 @@ mod tests {
 
         let catalog = result?;
         assert_eq!(catalog.len(), 10);
-        let ids: Vec<&str> = catalog.iter().map(|e| e.id.as_str()).collect();
+        let ids: Vec<&str> = catalog
+            .iter()
+            .map(|e| e.id.as_deref().expect("lineup id mapped"))
+            .collect();
         assert_eq!(
             ids,
             [

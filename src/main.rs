@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bufflink::acp::{serve, Backend};
-use bufflink::freebuff::enumerate::{enumerate_catalog, CatalogEntry};
+use bufflink::freebuff::enumerate::{
+    enumerate_catalog, plain_model_ids, unmapped_warning, CatalogEntry,
+};
 use bufflink::freebuff::{DriverConfig, FreebuffBackend};
 use bufflink::pty::{Pty, PtyConfig};
 use serde::Serialize;
@@ -173,6 +175,13 @@ async fn run_list_models(json: bool) -> Result<()> {
     let _ = pty.kill().await;
     let catalog = catalog.context("freebuff: failed to enumerate the model catalog")?;
 
+    // A display name with no known id (the lineup rotated) is never an id: flag
+    // it on stderr so a rotation is visible in og's setup output. stdout stays
+    // clean (protocol/data only).
+    if let Some(warning) = unmapped_warning(&catalog) {
+        eprintln!("{warning}");
+    }
+
     if json {
         let payload = CatalogJson {
             schema: 1u32,
@@ -180,8 +189,9 @@ async fn run_list_models(json: bool) -> Result<()> {
         };
         println!("{}", serde_json::to_string(&payload)?);
     } else {
-        for entry in &catalog {
-            println!("{}", entry.id);
+        // og consumes this as pinnable ids: emit ONLY well-formed ids.
+        for id in plain_model_ids(&catalog) {
+            println!("{id}");
         }
     }
     Ok(())
