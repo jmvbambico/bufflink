@@ -152,10 +152,29 @@ fn remainder_after_nudge(submit_timeout: Duration) -> Duration {
 fn is_terminal_gate(state: &ScreenState) -> bool {
     matches!(
         state,
-        ScreenState::FreebucksGate { .. }
+        ScreenState::HoursGate { .. }
+            | ScreenState::FreebucksGate { .. }
             | ScreenState::AlreadyRunning
             | ScreenState::Login
             | ScreenState::KickedOut
+    )
+}
+
+/// Human error for the freebuff 0.2.x hours gate. Names the model and the
+/// shortfall when both parsed, and otherwise carries the raw gate line, so the
+/// error is never empty or vague. Always explains that bufflink surfaces the
+/// gate rather than pressing Enter (AGENTS.md: never auto-dismiss an
+/// interstitial; Enter could start a session the user cannot afford).
+fn hours_gate_error(model: Option<&str>, hours: Option<u32>, message: &str) -> anyhow::Error {
+    let head = match (model, hours) {
+        (Some(m), Some(h)) => {
+            format!("freebuff: not enough hours for '{m}' — an hour on it takes {h} hours")
+        }
+        (Some(m), None) => format!("freebuff: not enough hours for '{m}'"),
+        _ => format!("freebuff: not enough hours — {message}"),
+    };
+    anyhow!(
+        "{head}; freebuff refused the turn. Choose a cheaper model with /model or visit https://freebuff.com/plans"
     )
 }
 
@@ -165,6 +184,11 @@ fn is_terminal_gate(state: &ScreenState) -> bool {
 /// resolves the owner pid from `manicode_dir` (read-only).
 fn terminal_gate_error(state: &ScreenState, manicode_dir: &Path) -> Option<anyhow::Error> {
     match state {
+        ScreenState::HoursGate {
+            model,
+            hours,
+            message,
+        } => Some(hours_gate_error(model.as_deref(), *hours, message)),
         ScreenState::FreebucksGate { message } => {
             Some(anyhow!("freebuff: not enough Freebucks — {}", message))
         }
@@ -942,6 +966,12 @@ impl FreebuffBackend {
                 // prompt path cannot drift from these messages. Login is a hard
                 // precondition the agent never satisfies (AGENTS.md: it never
                 // logs in or drives the auth flow).
+                ScreenState::HoursGate { .. } => {
+                    info!("startup: hours gate detected");
+                    let _ = pty.kill().await;
+                    return Err(terminal_gate_error(&state, &self.manicode_dir())
+                        .expect("HoursGate is terminal (see is_terminal_gate)"));
+                }
                 ScreenState::FreebucksGate { .. } => {
                     info!("startup: freebucks gate detected");
                     let _ = pty.kill().await;
@@ -1902,6 +1932,44 @@ mod tests {
         );
     }
 
+    /// The v0.2.29 drift seen live: freebuff bills in hours and refuses with
+    /// `Not enough hours for <Model>`. Startup must fail FAST with a clear
+    /// error naming the model and the shortfall, instead of an opaque null.
+    #[tokio::test]
+    async fn t19_startup_fails_fast_on_hours_gate() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("hours-gate"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let start = Instant::now();
+        let result = backend.new_session(temp_dir.clone()).await;
+        let elapsed = start.elapsed();
+
+        let err = result
+            .expect_err("startup must fail on the hours gate")
+            .to_string();
+        assert!(
+            err.contains("not enough hours"),
+            "must name the gate: {err}"
+        );
+        assert!(err.contains("MiMo Fast"), "must name the model: {err}");
+        assert!(
+            err.contains("takes 2 hours"),
+            "must name the shortfall: {err}"
+        );
+        assert!(
+            !err.contains("startup timeout"),
+            "must fail fast, not time out: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "fast-fail should be well under the {elapsed:?} it took"
+        );
+
+        backend.shutdown().await;
+    }
+
     #[tokio::test]
     async fn t6_fake_freebuff_mode_running_errors_with_already_running() {
         let tmp = test_temp_dir();
@@ -2049,6 +2117,11 @@ mod tests {
     fn terminal_gate_helper_matches_is_terminal_gate() {
         let dir = Path::new("/nonexistent-manicode-dir");
         let terminal = [
+            ScreenState::HoursGate {
+                model: Some("MiMo Fast".to_string()),
+                hours: Some(2),
+                message: "Not enough hours for MiMo Fast: an hour on it takes 2 hours.".to_string(),
+            },
             ScreenState::FreebucksGate {
                 message: "Not enough Freebucks — 5 Freebucks/hr against 0 left.".to_string(),
             },
@@ -2079,6 +2152,46 @@ mod tests {
                 "{state:?} must not map to an error"
             );
         }
+    }
+
+    /// The hours gate's operator error names the model and the shortfall when
+    /// both parsed, and otherwise carries the raw gate line — never empty or
+    /// vague — and never tells the caller bufflink will retry.
+    #[test]
+    fn hours_gate_error_names_model_and_shortfall_or_falls_back_to_raw_line() {
+        let dir = Path::new("/nonexistent-manicode-dir");
+
+        let parsed = ScreenState::HoursGate {
+            model: Some("MiMo Fast".to_string()),
+            hours: Some(2),
+            message: "│ Not enough hours for MiMo Fast: an hour on it takes 2 hours. │".to_string(),
+        };
+        assert!(is_terminal_gate(&parsed));
+        let err = terminal_gate_error(&parsed, dir)
+            .expect("HoursGate is terminal")
+            .to_string();
+        assert!(err.contains("not enough hours"), "{err}");
+        assert!(err.contains("MiMo Fast"), "must name the model: {err}");
+        assert!(
+            err.contains("takes 2 hours"),
+            "must name the shortfall: {err}"
+        );
+        assert!(err.contains("/model"), "must point at the remedy: {err}");
+        assert!(!err.contains("retry"), "must not imply a retry: {err}");
+
+        // Parsing failed: the raw gate line is carried so the error is never vague.
+        let unparsed = ScreenState::HoursGate {
+            model: None,
+            hours: None,
+            message: "Not enough hours for something".to_string(),
+        };
+        let err = terminal_gate_error(&unparsed, dir)
+            .expect("HoursGate is terminal")
+            .to_string();
+        assert!(
+            err.contains("Not enough hours for something"),
+            "must carry the raw gate line: {err}"
+        );
     }
 
     #[tokio::test]

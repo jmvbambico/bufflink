@@ -78,6 +78,25 @@ Start coding for free
 EOF
 }
 
+# Print the freebuff 0.2.x HOURS gate (bills a session in hours; a turn is
+# refused). Mirrors the real interstitial captured on 2026-10-16 (v0.2.29).
+print_hours_gate() {
+    cat <<'EOF'
+████████████████████████████████████████
+█                                                      █
+█   F  R  E  E  B  U  F  F                            █
+█                                                      █
+████████████████████████████████████████
+
+┌──────────────────────────────────────────────────────┐
+│ Not enough hours for MiMo Fast: an hour on it takes 2 hours.
+│ Choose another model with /model or visit https://freebuff.com/plans. │
+│ Enter: retry  Esc: back to draft                     │
+└──────────────────────────────────────────────────────┘
+ MiMo Fast · /model to change
+EOF
+}
+
 # Print already running dialog
 print_already_running() {
     cat <<'EOF'
@@ -264,6 +283,12 @@ case "${FAKE_FREEBUFF_MODE:-}" in
     gate)
         print_gate_splash
         # Block forever
+        while true; do sleep 1; done
+        ;;
+    hours-gate)
+        print_hours_gate
+        # Block forever: the real interstitial waits for Enter/Esc, which
+        # bufflink must NOT send (AGENTS.md: never auto-dismiss an interstitial).
         while true; do sleep 1; done
         ;;
     running)

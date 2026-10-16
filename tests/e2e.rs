@@ -41,6 +41,29 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// The model the e2e run pins through bufflink's normal `BLINK_MODEL` ->
+/// `settings.json` path. freebuff otherwise picks its own default (currently
+/// `MiMo Fast`, which bills 2 hours/hour), and the test account has 1 hour, so
+/// without an explicit pin the run can never pass. `z-ai/glm-5.3-flash` (GLM
+/// 5.3 Flash) is the cheapest commonly-available model and the one the user's
+/// own settings.json already selects — pinning it here makes the run
+/// deterministic AND exercises the settings-pin path.
+const E2E_PINNED_MODEL: &str = "z-ai/glm-5.3-flash";
+
+/// Path to freebuff's live `settings.json` — the file a `BLINK_MODEL` pin
+/// rewrites and restores. Mirrors `chats::manicode_dir()`: `$BLINK_MANICODE_DIR`
+/// when set, else `$HOME/.config/manicode`.
+fn manicode_settings_path() -> PathBuf {
+    let base = match std::env::var("BLINK_MANICODE_DIR") {
+        Ok(dir) => PathBuf::from(dir),
+        Err(_) => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".config").join("manicode")
+        }
+    };
+    base.join("settings.json")
+}
+
 impl AcpClient {
     pub async fn spawn() -> Result<Self> {
         let workdir = std::env::temp_dir().join(format!(
@@ -63,6 +86,11 @@ impl AcpClient {
             Ok(log) => cmd.env("RUST_LOG", log),
             Err(_) => cmd.env("RUST_LOG", "info"),
         };
+        // Pin an inexpensive model through bufflink's normal BLINK_MODEL ->
+        // settings.json path so the run is deterministic (freebuff's default
+        // model costs more hours than the test account has) and the settings
+        // pin is exercised.
+        cmd.env("BLINK_MODEL", E2E_PINNED_MODEL);
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
@@ -217,6 +245,13 @@ async fn e2e_single_launch_pong_cancel_exit() {
         return;
     }
 
+    // The BLINK_MODEL pin rewrites the user's live settings.json and restores
+    // the original on shutdown. The user runs freebuff interactively, so this
+    // test must leave that file byte-identical: capture it before anything
+    // spawns and compare after the child has exited.
+    let settings_path = manicode_settings_path();
+    let settings_before = std::fs::read(&settings_path).ok();
+
     eprintln!("[e2e +{}ms] spawn", t0.elapsed().as_millis());
     let mut c = AcpClient::spawn().await.unwrap();
 
@@ -330,6 +365,18 @@ async fn e2e_single_launch_pong_cancel_exit() {
     c.close_stdin().await;
     let st = c.wait_exit(Duration::from_secs(10)).await;
     assert!(st.is_some() && st.unwrap().success());
+
+    // The pin was restored on shutdown: the user's settings.json is untouched.
+    eprintln!(
+        "[e2e +{}ms] verify settings restored",
+        t0.elapsed().as_millis()
+    );
+    assert_eq!(
+        std::fs::read(&settings_path).ok(),
+        settings_before,
+        "bufflink must leave {} exactly as it found it",
+        settings_path.display()
+    );
 
     eprintln!("[e2e +{}ms] verify cleanup", t0.elapsed().as_millis());
     assert!(

@@ -18,6 +18,18 @@ pub enum ScreenState {
     SessionEnded,
     /// Freebucks gate interstitial: "Not enough Freebucks — ...".
     FreebucksGate { message: String },
+    /// Hours gate interstitial (freebuff 0.2.x bills a session in HOURS):
+    /// "Not enough hours for <Model>: an hour on it takes N hours." with an
+    /// `Enter: retry  Esc: back to draft` affordance. A hard precondition the
+    /// agent must NOT satisfy itself — pressing Enter would start a session the
+    /// user cannot afford (AGENTS.md: never skip or auto-dismiss an
+    /// interstitial). `model`/`hours` are parsed out when the shape allows; the
+    /// raw `message` is always carried so the error is never vague.
+    HoursGate {
+        model: Option<String>,
+        hours: Option<u32>,
+        message: String,
+    },
     /// "Freebuff is already running" dialog with Take over / Exit buttons.
     AlreadyRunning,
     /// Interactive login gate: "Press ENTER to login ...". A hard precondition
@@ -40,9 +52,24 @@ pub const SPLASH_ACCEPT_KEY: &str = "\r";
 
 /// Classify the current screen state from a list of text rows (ANSI already stripped).
 pub fn classify(rows: &[String]) -> ScreenState {
-    // Precedence: FreebucksGate > AlreadyRunning > Login > SessionEnded > KickedOut > Busy > ModelList > ModelSplash > Idle > Booting > Unknown
+    // Precedence: HoursGate > FreebucksGate > AlreadyRunning > Login > SessionEnded > KickedOut > Busy > ModelList > ModelSplash > Idle > Booting > Unknown
 
-    // Check for FreebucksGate first (inside the model box). A v0.2.x picker can
+    // Check for the freebuff 0.2.x HOURS gate first: 0.2.29 bills a session in
+    // hours and refuses a turn with `Not enough hours for <Model>: an hour on it
+    // takes N hours.` Keyed on the phrase alone so a renamed model or a
+    // different figure still classifies; the model and figure are parsed out
+    // where possible and the raw line is always carried.
+    for row in rows {
+        if let Some((model, hours, message)) = parse_hours_gate(row) {
+            return ScreenState::HoursGate {
+                model,
+                hours,
+                message,
+            };
+        }
+    }
+
+    // Check for FreebucksGate next (inside the model box). A v0.2.x picker can
     // also show a per-model insufficient-balance warning, so require the gate's
     // fuller message shape (`... against 0 left ...` / `Enter opens plans`)
     // rather than the bare phrase, or the picker would be misread as the gate.
@@ -150,6 +177,7 @@ pub fn classify(rows: &[String]) -> ScreenState {
             || r.contains("thinking...")
             || r.contains("working...")
             || r.contains("Not enough Freebucks")
+            || r.contains("Not enough hours")
             || r.contains("Freebuff is already running")
             || r.contains("Another freebuff instance")
             || r.contains("See all ")
@@ -194,6 +222,47 @@ fn parse_busy_elapsed(row: &str) -> Option<u32> {
         }
     }
     None
+}
+
+/// Parse the freebuff 0.2.x HOURS gate from a single row. Detected by the
+/// `Not enough hours for` phrase (the shape 0.2.29 emits: `Not enough hours for
+/// <Model>: an hour on it takes N hours.`). The model name — the text between
+/// the phrase and the first `:` — and the hours figure (from `takes N hour(s)`)
+/// are returned when they parse, else `None`, so the caller still surfaces the
+/// raw line rather than a vague error. Returns `None` when the row carries no
+/// gate at all. Deliberately tolerant: neither the model nor the figure is
+/// hardcoded.
+fn parse_hours_gate(row: &str) -> Option<(Option<String>, Option<u32>, String)> {
+    const MARKER: &str = "Not enough hours for";
+    let idx = row.find(MARKER)?;
+    let rest = row[idx + MARKER.len()..].trim_start();
+    // The model name runs to the first `:` that separates it from the shortfall
+    // explanation; a bare phrase with no `:` yields no name.
+    let model = match rest.split_once(':') {
+        Some((name, _)) => {
+            let name = name.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        }
+        None => None,
+    };
+    Some((model, parse_takes_hours(rest), row.trim().to_string()))
+}
+
+/// `N` from a `takes N hour(s)` fragment anywhere in `text`. The `hour`/`hours`
+/// unit is required right after the digits so a stray number is not read as the
+/// figure.
+fn parse_takes_hours(text: &str) -> Option<u32> {
+    let idx = text.find("takes ")?;
+    let after = &text[idx + "takes ".len()..];
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    if after[digits.len()..].trim_start().starts_with("hour") {
+        digits.parse().ok()
+    } else {
+        None
+    }
 }
 
 /// One model entry on the splash, collapsed or in the expanded list.
@@ -1095,6 +1164,9 @@ mod tests {
             // promo banner in a rounded box shadowed the input box; the rest
             // are synthetic, derived from that frame's layout.
             "0227-real-banner-and-input-120x40" => fixture!("0227-real-banner-and-input-120x40"),
+            // The 2026-10-16 live run's hours gate: freebuff v0.2.29 bills in
+            // hours and refused the turn. VERBATIM frame from that run.
+            "0229-real-hours-gate-120x40" => fixture!("0229-real-hours-gate-120x40"),
             "0227-synthetic-wrapped-input-120x40" => {
                 fixture!("0227-synthetic-wrapped-input-120x40")
             }
@@ -1655,6 +1727,84 @@ mod tests {
         if let ScreenState::FreebucksGate { message } = state {
             assert!(message.contains("Not enough Freebucks"));
             assert!(message.contains("5 Freebucks/hr against 0 left"));
+        }
+    }
+
+    // --- freebuff v0.2.29 HOURS gate --------------------------------------
+    //
+    // The 2026-10-16 live run showed an interstitial bufflink did not classify:
+    // freebuff 0.2.29 bills a session in HOURS and refuses a turn with
+    // `Not enough hours for <Model>: an hour on it takes N hours.`. Instead of
+    // a clear error the turn ended in an opaque null. The fixture is the
+    // VERBATIM frame from that run.
+
+    #[test]
+    fn v0229_real_hours_gate_fixture_classifies_as_hours_gate() {
+        let rows = load_fixture("0229-real-hours-gate-120x40");
+        match classify(&rows) {
+            ScreenState::HoursGate {
+                model,
+                hours,
+                message,
+            } => {
+                assert_eq!(model.as_deref(), Some("MiMo Fast"));
+                assert_eq!(hours, Some(2));
+                assert!(message.contains("Not enough hours for"));
+            }
+            other => panic!("expected HoursGate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v0229_hours_gate_parses_varying_model_and_figure() {
+        let gate = |line: &str| classify(&[line.to_string()]);
+        // Neither the model nor the figure is hardcoded.
+        match gate("Not enough hours for Optima Prime: an hour on it takes 9 hours.") {
+            ScreenState::HoursGate { model, hours, .. } => {
+                assert_eq!(model.as_deref(), Some("Optima Prime"));
+                assert_eq!(hours, Some(9));
+            }
+            other => panic!("expected HoursGate, got {other:?}"),
+        }
+        // A single-hour figure is tolerated.
+        match gate("│ Not enough hours for Tiny: an hour on it takes 1 hour. │") {
+            ScreenState::HoursGate { hours, .. } => assert_eq!(hours, Some(1)),
+            other => panic!("expected HoursGate, got {other:?}"),
+        }
+        // Parsing fails: STILL a gate, raw line carried, never a vague error.
+        match gate("Not enough hours for") {
+            ScreenState::HoursGate {
+                model,
+                hours,
+                message,
+            } => {
+                assert_eq!(model, None);
+                assert_eq!(hours, None);
+                assert!(message.contains("Not enough hours for"));
+            }
+            other => panic!("expected HoursGate, got {other:?}"),
+        }
+    }
+
+    /// The older Freebucks gate must still classify as ITS gate, never the new
+    /// hours gate (regression guard for the 0.2.29 addition).
+    #[test]
+    fn v0229_freebucks_gate_is_not_the_hours_gate() {
+        let rows = load_fixture("freebucks-gate-80x24");
+        assert!(matches!(classify(&rows), ScreenState::FreebucksGate { .. }));
+        assert!(!matches!(classify(&rows), ScreenState::HoursGate { .. }));
+    }
+
+    /// Fail-loud guard: a normal idle screen must never be misread as the gate.
+    #[test]
+    fn v0229_idle_screen_is_not_the_hours_gate() {
+        for name in ["idle-120x40", "idle-max-plan-120x40"] {
+            let rows = load_fixture(name);
+            assert_eq!(classify(&rows), ScreenState::Idle, "{name}");
+            assert!(
+                !matches!(classify(&rows), ScreenState::HoursGate { .. }),
+                "{name} must not be the hours gate"
+            );
         }
     }
 
