@@ -6,7 +6,9 @@
 pub enum ScreenState {
     /// Still showing the FREEBUFF banner animation, no other markers.
     Booting,
-    /// Model picker splash: "Start coding for free", "See all 4 models", "Freebucks/hr".
+    /// Model picker splash (collapsed): the templated `See all <N> models`
+    /// toggle (any count), the older `Start coding for free` copy, or the
+    /// `Choose a model to start a new session` title, alongside `Freebucks/hr`.
     ModelSplash,
     /// Expanded model picker: 2+ model boxes, or "Show fewer" visible.
     ModelList,
@@ -40,9 +42,14 @@ pub const SPLASH_ACCEPT_KEY: &str = "\r";
 pub fn classify(rows: &[String]) -> ScreenState {
     // Precedence: FreebucksGate > AlreadyRunning > Login > SessionEnded > KickedOut > Busy > ModelList > ModelSplash > Idle > Booting > Unknown
 
-    // Check for FreebucksGate first (inside the model box)
+    // Check for FreebucksGate first (inside the model box). A v0.2.x picker can
+    // also show a per-model insufficient-balance warning, so require the gate's
+    // fuller message shape (`... against 0 left ...` / `Enter opens plans`)
+    // rather than the bare phrase, or the picker would be misread as the gate.
     for row in rows {
-        if row.contains("Not enough Freebucks") {
+        if row.contains("Not enough Freebucks")
+            && (row.contains("against") || row.contains("Enter opens plans"))
+        {
             return ScreenState::FreebucksGate {
                 message: row.trim().to_string(),
             };
@@ -93,18 +100,28 @@ pub fn classify(rows: &[String]) -> ScreenState {
         }
     }
 
-    // Check for ModelList (expanded splash) before ModelSplash: 2+ model
-    // boxes, or "Show fewer" visible. The collapsed splash has exactly one.
+    // Check for ModelList (expanded picker) before ModelSplash: "Show fewer",
+    // or 2+ model boxes. v0.2.x renders each model in its own single-border box
+    // under UPPERCASE section headers, so count parsed catalog entries too; the
+    // collapsed splash shows exactly one box plus the templated toggle. The
+    // v0.0.x `model_rows` walk is kept so an older freebuff still classifies.
     let has_show_fewer = rows.iter().any(|r| r.contains("Show fewer"));
-    if has_show_fewer || model_rows(rows).len() >= 2 {
+    let catalog_models = parse_catalog(rows).entries.len();
+    if has_show_fewer || catalog_models >= 2 || model_rows(rows).len() >= 2 {
         return ScreenState::ModelList;
     }
 
-    // Check for ModelSplash
+    // Check for ModelSplash. v0.2.27 dropped "Start coding for free" and the
+    // fixed "See all 4 models" copy: the toggle is templated with the model
+    // count, so match any `See all <N> models`. Keep the older anchors and add
+    // the new picker title as a fallback so a copy tweak cannot break it.
     let has_start_coding = rows.iter().any(|r| r.contains("Start coding for free"));
-    let has_see_all_models = rows.iter().any(|r| r.contains("See all 4 models"));
+    let has_see_all_models = advertised_model_count(rows).is_some();
     let has_freebucks_hr = rows.iter().any(|r| r.contains("Freebucks/hr"));
-    if has_start_coding || has_see_all_models || has_freebucks_hr {
+    let has_choose_model = rows
+        .iter()
+        .any(|r| r.contains("Choose a model to start a new session"));
+    if has_start_coding || has_see_all_models || has_freebucks_hr || has_choose_model {
         return ScreenState::ModelSplash;
     }
 
@@ -135,7 +152,8 @@ pub fn classify(rows: &[String]) -> ScreenState {
             || r.contains("Not enough Freebucks")
             || r.contains("Freebuff is already running")
             || r.contains("Another freebuff instance")
-            || r.contains("See all 4 models")
+            || r.contains("See all ")
+            || r.contains("Choose a model to start a new session")
             || r.contains("Freebucks/hr")
             || r.contains("Session ended")
             || r.contains("Press Enter to continue")
@@ -248,6 +266,309 @@ fn box_inner(row: &str) -> Option<&str> {
         None => after_left,
     };
     Some(inner.trim().trim_end_matches(['█', '▀', '▄']).trim())
+}
+
+/// Section of the freebuff v0.2.x expanded model picker. The renderer emits
+/// UPPERCASE section labels as their own text rows ahead of that section's
+/// model boxes (`unlimited`, `optimized`, `powerful`, plus `LIMITED TRIAL` when
+/// a trial model is offered).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSection {
+    Unlimited,
+    Optimized,
+    Powerful,
+    LimitedTrial,
+    Unknown,
+}
+
+/// One model entry parsed from the freebuff v0.2.x picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelEntry {
+    /// Display name (freebuff never renders the model id on screen).
+    pub display_name: String,
+    /// Section the entry appeared under.
+    pub section: ModelSection,
+    /// Hourly price parsed from an `N Freebucks/hr` line, when shown.
+    pub price_per_hour: Option<u32>,
+    /// True when a `Recommended` status line is shown for this entry.
+    pub recommended: bool,
+    /// False when a locked/warning label (e.g. `Not enough Freebucks`) is shown.
+    pub available: bool,
+    /// True when the row carries the `›` focus marker.
+    pub focused: bool,
+}
+
+/// Parsed freebuff v0.2.x picker: the model entries visible in this render, in
+/// screen order, plus the advertised total from the toggle line.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModelCatalog {
+    pub entries: Vec<ModelEntry>,
+    /// `N` from a `See all <N> models` toggle row, when rendered. A caller
+    /// compares `entries.len()` with this to learn whether it has seen every
+    /// model or still needs to scroll.
+    pub advertised: Option<usize>,
+}
+
+/// Navigation ring of the freebuff v0.2.x picker. Every model row plus the
+/// toggle row participates in one wrapping ring
+/// (`(index + direction + len) % len`); the toggle row carries the internal id
+/// `__freebuff_toggle__`. A caller walks this instead of a fixed max-presses
+/// constant: after at most `ring_len` presses it has visited every stop, so it
+/// can never wrap forever without landing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NavRing {
+    /// Number of model rows visible in this render (fewer than the advertised
+    /// total when the list is scrolled).
+    pub visible_models: usize,
+    /// Advertised total from the toggle line, when rendered.
+    pub advertised_models: Option<usize>,
+    /// Index of the toggle row within the ring, when the toggle is rendered.
+    /// Models occupy `0..models`; the toggle sits last.
+    pub toggle_index: Option<usize>,
+    /// Total number of focusable stops: every model (the advertised total when
+    /// known, else the visible count) plus the toggle row.
+    pub ring_len: usize,
+}
+
+/// Parse the freebuff v0.2.x model picker from rendered rows. Section-header
+/// rows and the `See all <N> models` / `Show fewer` toggle row are never
+/// emitted as models. The bordered-box layout is handled structurally: each
+/// model owns a single-border box whose FIRST content row carries the name,
+/// and any later rows in the same box (centred price/status lines, wrapped
+/// taglines) attach to that entry. A compacted layout that puts the price on
+/// the name row works too, because status parsing runs over the name row as
+/// well. Soft-wrapping and trailing padding are tolerated.
+pub fn parse_catalog(rows: &[String]) -> ModelCatalog {
+    let mut catalog = ModelCatalog {
+        entries: Vec::new(),
+        advertised: advertised_model_count(rows),
+    };
+    let mut section = ModelSection::Unknown;
+    let mut current: Option<ModelEntry> = None;
+    // Whether the previous row was content inside a box, and whether that box
+    // turned out to be a model box (as opposed to an input box, paste chip or
+    // slash-menu box). A new `│` row after box content continues the box.
+    let mut in_box = false;
+    let mut box_is_model = false;
+
+    for row in rows {
+        // A `│`-bordered row is box content.
+        if let Some(inner) = box_inner(row) {
+            let inner = inner.trim();
+            if inner.is_empty() {
+                in_box = false;
+                continue;
+            }
+            if is_toggle_line(inner) {
+                in_box = false;
+                continue;
+            }
+            if let Some(sec) = section_from_header(inner) {
+                if let Some(e) = current.take() {
+                    catalog.entries.push(e);
+                }
+                section = sec;
+                in_box = false;
+                continue;
+            }
+            if !in_box {
+                // First content row of a box. It is a model only when the row
+                // has a tagline separator after the name; an input box,
+                // paste chip or slash-menu box has none and is skipped whole.
+                let (focused, body) = strip_focus(inner);
+                let name = model_name(body);
+                if name.is_empty() || name.len() == body.len() {
+                    in_box = true;
+                    box_is_model = false;
+                    continue;
+                }
+                if let Some(e) = current.take() {
+                    catalog.entries.push(e);
+                }
+                let mut entry = ModelEntry {
+                    display_name: name,
+                    section,
+                    price_per_hour: None,
+                    recommended: false,
+                    available: true,
+                    focused,
+                };
+                apply_status(&mut entry, body);
+                current = Some(entry);
+                in_box = true;
+                box_is_model = true;
+                continue;
+            }
+            // Continuation rows attach to the current model box only.
+            if box_is_model {
+                if let Some(e) = current.as_mut() {
+                    apply_status(e, inner);
+                }
+            }
+            continue;
+        }
+
+        // A borderless row: only section headers and the toggle are meaningful.
+        let text = strip_frame(row);
+        if text.is_empty() || is_toggle_line(&text) {
+            in_box = false;
+            continue;
+        }
+        if let Some(sec) = section_from_header(&text) {
+            if let Some(e) = current.take() {
+                catalog.entries.push(e);
+            }
+            section = sec;
+            in_box = false;
+            continue;
+        }
+        // Any other chrome (banner rows, prose between boxes) ends the box run.
+        in_box = false;
+    }
+
+    if let Some(e) = current.take() {
+        catalog.entries.push(e);
+    }
+    catalog
+}
+
+/// `N` from a `See all <N> models` toggle row, matching ANY count (freebuff
+/// v0.2.x templates the line as `↓  See all ${LT.length} models`). Returns None
+/// for the `Show fewer` expanded form (which carries no count) and when no
+/// toggle row is present.
+pub fn advertised_model_count(rows: &[String]) -> Option<usize> {
+    for row in rows {
+        let text = strip_frame(row);
+        let Some(idx) = text.find("See all ") else {
+            continue;
+        };
+        let rest = &text[idx + "See all ".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        if rest[digits.len()..].trim_start().starts_with("models") {
+            if let Ok(n) = digits.parse::<usize>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Navigation ring of the freebuff v0.2.x picker, derived from the rendered
+/// rows: the index of the toggle row and the total ring length. Returns None
+/// when neither a model row nor the toggle is rendered. Section headers are
+/// treated as labels, not focus stops (they render as plain text rows).
+pub fn nav_ring(rows: &[String]) -> Option<NavRing> {
+    let catalog = parse_catalog(rows);
+    let visible_models = catalog.entries.len();
+    let advertised_models = catalog.advertised;
+    let toggle_present = rows.iter().any(|r| is_toggle_line(&strip_frame(r)));
+    if visible_models == 0 && !toggle_present {
+        return None;
+    }
+    let models = advertised_models.unwrap_or(visible_models);
+    let ring_len = models + usize::from(toggle_present);
+    Some(NavRing {
+        visible_models,
+        advertised_models,
+        toggle_index: toggle_present.then_some(models),
+        ring_len,
+    })
+}
+
+/// Section from a header row, ignoring an optional ` · <hint>` suffix. Only an
+/// EXACT UPPERCASE label as the row's first segment matches, so a model row
+/// whose tagline merely mentions `Powerful` is not read as a header.
+fn section_from_header(text: &str) -> Option<ModelSection> {
+    let upper = text.trim().to_ascii_uppercase();
+    let head = upper.split(" · ").next().unwrap_or("").trim();
+    match head {
+        "UNLIMITED" => Some(ModelSection::Unlimited),
+        "OPTIMIZED" => Some(ModelSection::Optimized),
+        "POWERFUL" => Some(ModelSection::Powerful),
+        "LIMITED TRIAL" => Some(ModelSection::LimitedTrial),
+        _ => None,
+    }
+}
+
+/// Split a model box's inner text into (focused, body) around the `›` marker.
+fn strip_focus(inner: &str) -> (bool, &str) {
+    match inner.strip_prefix('›') {
+        Some(rest) => (true, rest.trim()),
+        None => (false, inner.trim()),
+    }
+}
+
+/// Strip border/scrollbar characters and padding from any row.
+fn strip_frame(row: &str) -> String {
+    row.trim()
+        .trim_matches(|c: char| matches!(c, '│' | '┃' | '█' | '▀' | '▄'))
+        .trim()
+        .to_string()
+}
+
+/// Display name from a model box body: the text before the first tagline
+/// separator — ` · `, a ` • <effort>` suffix, or a run of 2+ padding spaces.
+fn model_name(body: &str) -> String {
+    let mut end = body.len();
+    for sep in [" · ", " • ", "  "] {
+        if let Some(i) = body.find(sep) {
+            end = end.min(i);
+        }
+    }
+    body[..end].trim().to_string()
+}
+
+/// Whether a row is the picker toggle (collapsed `See all <N> models` or
+/// expanded `Show fewer`).
+fn is_toggle_line(text: &str) -> bool {
+    text.contains("See all ") || text.contains("Show fewer")
+}
+
+/// `N` from an `N Freebucks/hr` price fragment.
+fn parse_price_per_hour(text: &str) -> Option<u32> {
+    let idx = text.find("Freebucks/hr")?;
+    let before = text[..idx].trim_end();
+    let digits: String = before
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    digits.parse().ok()
+}
+
+/// Fold a status/price line (or a compacted name row) into `entry`.
+fn apply_status(entry: &mut ModelEntry, text: &str) {
+    if entry.price_per_hour.is_none() {
+        if let Some(p) = parse_price_per_hour(text) {
+            entry.price_per_hour = Some(p);
+        }
+    }
+    if text.contains("Recommended") {
+        entry.recommended = true;
+    }
+    if is_unavailable_label(text) {
+        entry.available = false;
+    }
+}
+
+/// Whether `text` carries a locked/warning label or an insufficient-balance
+/// state (the picker shows these instead of a plain price for unusable models).
+fn is_unavailable_label(text: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "Not enough Freebucks",
+        "Insufficient",
+        "Locked",
+        "Unlock",
+        "Trial ended",
+        "Unavailable",
+    ];
+    MARKERS.iter().any(|m| text.contains(m))
 }
 
 /// Normalise a model name or `BLINK_MODEL` fragment for comparison:
@@ -450,19 +771,24 @@ pub enum SelectStep {
 }
 
 /// Decide the next keystroke for `BLINK_MODEL` on the expanded model list.
-/// `presses` is how many Down presses have been sent so far (cap: 12).
+/// `presses` is how many Down presses have been sent so far; `ring_len` is the
+/// focus-ring length (models plus the toggle) reported by [`nav_ring`]. The
+/// walk gives up once it has pressed a full ring's worth without landing,
+/// instead of a fixed cap: the old `MAX_DOWN_PRESSES = 12` could never reach a
+/// model at index >= 12, so a 13-model list wrapped forever and never landed.
 pub fn plan_select_step(
     target: &str,
     rows: &[ModelRow],
     show_fewer: bool,
+    ring_len: u32,
     presses: u32,
 ) -> SelectStep {
-    const MAX_DOWN_PRESSES: u32 = 12;
+    let max_presses = ring_len.max(1);
     let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
     match match_model(target, &names) {
         ModelMatch::Ambiguous(names) => SelectStep::Ambiguous(names),
         ModelMatch::None { offered } => {
-            if presses >= MAX_DOWN_PRESSES || (show_fewer && !rows.iter().any(|r| r.focused)) {
+            if presses >= max_presses || (show_fewer && !rows.iter().any(|r| r.focused)) {
                 SelectStep::NotOffered { offered }
             } else {
                 SelectStep::Down
@@ -471,8 +797,7 @@ pub fn plan_select_step(
         ModelMatch::One(i) => {
             if rows[i].focused {
                 SelectStep::Accept
-            } else if presses >= MAX_DOWN_PRESSES || (show_fewer && !rows.iter().any(|r| r.focused))
-            {
+            } else if presses >= max_presses || (show_fewer && !rows.iter().any(|r| r.focused)) {
                 // Focus never landed on the match (e.g. the walk reached
                 // `Show fewer`, or the list kept scrolling): fail loudly
                 // rather than pressing Enter on the wrong row.
@@ -574,6 +899,27 @@ mod tests {
             "freebucks-gate-80x24" => fixture!("freebucks-gate-80x24"),
             "slash-menu" => fixture!("slash-menu"),
             "paste-chip-120x40" => fixture!("paste-chip-120x40"),
+            // freebuff v0.2.x picker — SYNTHETIC fixtures, hand-built from the
+            // 0.2.27 bundle's render code (see 0227-synthetic-NOTE.md), not
+            // captured from a live run.
+            "0227-synthetic-splash-collapsed-120x40" => {
+                fixture!("0227-synthetic-splash-collapsed-120x40")
+            }
+            "0227-synthetic-splash-expanded-120x40" => {
+                fixture!("0227-synthetic-splash-expanded-120x40")
+            }
+            "0227-synthetic-splash-trial-120x40" => {
+                fixture!("0227-synthetic-splash-trial-120x40")
+            }
+            "0227-synthetic-splash-scrolled-120x40" => {
+                fixture!("0227-synthetic-splash-scrolled-120x40")
+            }
+            "0227-synthetic-splash-focus-120x40" => {
+                fixture!("0227-synthetic-splash-focus-120x40")
+            }
+            "0227-synthetic-splash-narrow-80x24" => {
+                fixture!("0227-synthetic-splash-narrow-80x24")
+            }
             _ => panic!("unknown fixture: {}", name),
         };
         content.lines().map(|s| s.to_string()).collect()
@@ -775,43 +1121,46 @@ mod tests {
             })
             .collect::<Vec<_>>()
         };
+        // A four-model list plus the toggle: a five-stop ring.
+        const RING: u32 = 5;
         // Focus already on the match: accept.
         assert_eq!(
-            plan_select_step("mimo", &rows(Some(1)), false, 0),
+            plan_select_step("mimo", &rows(Some(1)), false, RING, 0),
             SelectStep::Accept
         );
         // Match below focus: move down.
         assert_eq!(
-            plan_select_step("deepseek", &rows(Some(0)), false, 0),
+            plan_select_step("deepseek", &rows(Some(0)), false, RING, 0),
             SelectStep::Down
         );
         // Show fewer visible but a model still focused: keep walking.
         assert_eq!(
-            plan_select_step("deepseek", &rows(Some(2)), true, 3),
+            plan_select_step("deepseek", &rows(Some(2)), true, RING, 3),
             SelectStep::Down
         );
         // No match, list still walkable: move down.
         assert!(matches!(
-            plan_select_step("claude", &rows(Some(0)), false, 0),
+            plan_select_step("claude", &rows(Some(0)), false, RING, 0),
             SelectStep::Down
         ));
         // Focus reached Show fewer with no match: fail, naming the lineup.
-        match plan_select_step("claude", &rows(None), true, 5) {
+        match plan_select_step("claude", &rows(None), true, RING, 5) {
             SelectStep::NotOffered { offered } => assert_eq!(offered.len(), 4),
             other => panic!("expected NotOffered, got {other:?}"),
         }
         // Focus reached Show fewer past a missed match: fail as well.
-        match plan_select_step("deepseek", &rows(None), true, 5) {
+        match plan_select_step("deepseek", &rows(None), true, RING, 5) {
             SelectStep::NotOffered { offered } => assert_eq!(offered.len(), 4),
             other => panic!("expected NotOffered, got {other:?}"),
         }
-        // 12 Down presses without landing: fail rather than Enter blindly.
-        match plan_select_step("deepseek", &rows(Some(0)), false, 12) {
+        // A full ring's worth of Down presses without landing: fail rather than
+        // Enter blindly.
+        match plan_select_step("deepseek", &rows(Some(0)), false, RING, RING) {
             SelectStep::NotOffered { offered } => assert_eq!(offered.len(), 4),
             other => panic!("expected NotOffered, got {other:?}"),
         }
         // Two rows match: fail, naming both.
-        match plan_select_step("flash", &rows(Some(0)), false, 0) {
+        match plan_select_step("flash", &rows(Some(0)), false, RING, 0) {
             SelectStep::Ambiguous(names) => assert_eq!(names.len(), 2),
             other => panic!("expected Ambiguous, got {other:?}"),
         }
@@ -1141,5 +1490,277 @@ mod tests {
                 "input: {input}"
             );
         }
+    }
+
+    // --- freebuff v0.2.x picker -------------------------------------------
+    //
+    // The `0227-synthetic-*` fixtures are HAND-CONSTRUCTED from freebuff
+    // 0.2.27's own render code (bordered single-box model rows, UPPERCASE
+    // section headers, the templated `See all <N> models` / `Show fewer`
+    // toggle, centre-padded price rows). They are SYNTHETIC, derived from the
+    // bundle, not captured from a live run — replace them with real captures
+    // when available. See tests/fixtures/screens/0227-synthetic-NOTE.md.
+
+    #[test]
+    fn v0227_collapsed_picker_classifies_as_model_splash() {
+        let rows = load_fixture("0227-synthetic-splash-collapsed-120x40");
+        assert_eq!(classify(&rows), ScreenState::ModelSplash);
+    }
+
+    #[test]
+    fn v0227_expanded_picker_variants_classify_as_model_list() {
+        for name in [
+            "0227-synthetic-splash-expanded-120x40",
+            "0227-synthetic-splash-trial-120x40",
+            "0227-synthetic-splash-scrolled-120x40",
+            "0227-synthetic-splash-focus-120x40",
+            "0227-synthetic-splash-narrow-80x24",
+        ] {
+            let rows = load_fixture(name);
+            assert_eq!(classify(&rows), ScreenState::ModelList, "{name}");
+        }
+    }
+
+    #[test]
+    fn v0227_counting_toggle_carries_splash_without_old_copy() {
+        // v0.2.27 dropped "Start coding for free" and "Select a model": the
+        // templated toggle must carry the splash for ANY count.
+        for n in [1_usize, 4, 12, 13, 100] {
+            let rows = vec![format!("↓  See all {n} models")];
+            assert_eq!(classify(&rows), ScreenState::ModelSplash, "n={n}");
+        }
+        // The new picker title is a fallback even with no toggle line.
+        let rows = vec!["Choose a model to start a new session".to_string()];
+        assert_eq!(classify(&rows), ScreenState::ModelSplash);
+    }
+
+    #[test]
+    fn advertised_model_count_parses_any_count() {
+        assert_eq!(
+            advertised_model_count(&["↓  See all 12 models".to_string()]),
+            Some(12)
+        );
+        assert_eq!(
+            advertised_model_count(&["↓  See all 4 models".to_string()]),
+            Some(4)
+        );
+        assert_eq!(
+            advertised_model_count(&["   banner".to_string(), "↓  See all 13 models".to_string(),]),
+            Some(13)
+        );
+        // The expanded form carries no count.
+        assert_eq!(advertised_model_count(&["↑  Show fewer".to_string()]), None);
+        assert_eq!(advertised_model_count(&["nothing here".to_string()]), None);
+    }
+
+    #[test]
+    fn v0227_collapsed_catalog_parses_single_model() {
+        let rows = load_fixture("0227-synthetic-splash-collapsed-120x40");
+        let catalog = parse_catalog(&rows);
+        assert_eq!(catalog.advertised, Some(12));
+        assert_eq!(catalog.entries.len(), 1);
+        let m = &catalog.entries[0];
+        assert_eq!(m.display_name, "GLM 5.3 Flash");
+        assert_eq!(m.section, ModelSection::Unknown);
+        assert_eq!(m.price_per_hour, Some(5));
+        assert!(m.recommended);
+        assert!(m.available);
+        assert!(m.focused);
+    }
+
+    #[test]
+    fn v0227_expanded_catalog_sections_names_and_status() {
+        let rows = load_fixture("0227-synthetic-splash-expanded-120x40");
+        let catalog = parse_catalog(&rows);
+        // The `Show fewer` toggle carries no advertised count.
+        assert_eq!(catalog.advertised, None);
+        let got: Vec<(&str, ModelSection, Option<u32>)> = catalog
+            .entries
+            .iter()
+            .map(|e| (e.display_name.as_str(), e.section, e.price_per_hour))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("GLM 5.3 Flash", ModelSection::Unlimited, Some(5)),
+                ("Muse Spark 1.3", ModelSection::Unlimited, Some(5)),
+                ("MiMo 2.6 Pro", ModelSection::Optimized, Some(10)),
+                ("GPT-6 Luna", ModelSection::Optimized, Some(10)),
+                ("GPT-6.1 Sol", ModelSection::Powerful, Some(15)),
+                ("Claude Fable 5.1", ModelSection::Powerful, Some(15)),
+            ]
+        );
+        // Recommended flag on the first entry only.
+        assert!(catalog.entries[0].recommended);
+        assert!(catalog.entries[1..].iter().all(|e| !e.recommended));
+        // The `Not enough Freebucks` warning marks GPT-6.1 Sol unavailable.
+        assert!(!catalog.entries[4].available);
+        assert!(catalog
+            .entries
+            .iter()
+            .enumerate()
+            .all(|(i, e)| e.available == (i != 4)));
+        // Focus is on the first entry.
+        assert!(catalog.entries[0].focused);
+        assert!(catalog.entries[1..].iter().all(|e| !e.focused));
+    }
+
+    #[test]
+    fn v0227_catalog_never_emits_headers_or_toggle() {
+        let rows = load_fixture("0227-synthetic-splash-expanded-120x40");
+        let catalog = parse_catalog(&rows);
+        for e in &catalog.entries {
+            let upper = e.display_name.to_ascii_uppercase();
+            assert_ne!(upper, "UNLIMITED");
+            assert_ne!(upper, "OPTIMIZED");
+            assert_ne!(upper, "POWERFUL");
+            assert!(!e.display_name.contains("See all"));
+            assert!(!e.display_name.contains("Show fewer"));
+        }
+    }
+
+    #[test]
+    fn v0227_trial_section_and_locked_model() {
+        let rows = load_fixture("0227-synthetic-splash-trial-120x40");
+        let catalog = parse_catalog(&rows);
+        let sections: Vec<ModelSection> = catalog.entries.iter().map(|e| e.section).collect();
+        assert_eq!(
+            sections,
+            vec![
+                ModelSection::Unlimited,
+                ModelSection::Unlimited,
+                ModelSection::LimitedTrial,
+                ModelSection::LimitedTrial,
+            ]
+        );
+        // The locked model is unavailable, and its `Unlock` label is not read
+        // as a price.
+        let locked = &catalog.entries[3];
+        assert_eq!(locked.display_name, "Ox Alpha");
+        assert!(!locked.available);
+        assert_eq!(locked.price_per_hour, None);
+        // The trial model itself is usable.
+        assert!(catalog.entries[2].available);
+        assert_eq!(catalog.entries[2].price_per_hour, Some(1));
+    }
+
+    #[test]
+    fn v0227_scrolled_catalog_visible_lt_advertised() {
+        let rows = load_fixture("0227-synthetic-splash-scrolled-120x40");
+        let catalog = parse_catalog(&rows);
+        assert_eq!(catalog.entries.len(), 4);
+        assert_eq!(catalog.advertised, Some(13));
+        assert!(catalog.entries.len() < catalog.advertised.unwrap());
+        let ring = nav_ring(&rows).expect("ring");
+        assert_eq!(ring.visible_models, 4);
+        assert_eq!(ring.advertised_models, Some(13));
+        assert_eq!(ring.toggle_index, Some(13));
+        assert_eq!(ring.ring_len, 14);
+    }
+
+    #[test]
+    fn v0227_focus_tracks_second_entry() {
+        let rows = load_fixture("0227-synthetic-splash-focus-120x40");
+        let catalog = parse_catalog(&rows);
+        assert_eq!(catalog.entries.len(), 3);
+        assert_eq!(catalog.entries[1].display_name, "Muse Spark 1.3");
+        assert!(catalog.entries[1].focused);
+        assert!(!catalog.entries[0].focused);
+        assert!(!catalog.entries[2].focused);
+    }
+
+    #[test]
+    fn v0227_narrow_compacted_catalog() {
+        let rows = load_fixture("0227-synthetic-splash-narrow-80x24");
+        let catalog = parse_catalog(&rows);
+        let got: Vec<(&str, ModelSection, Option<u32>)> = catalog
+            .entries
+            .iter()
+            .map(|e| (e.display_name.as_str(), e.section, e.price_per_hour))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("GLM 5.3 Flash", ModelSection::Unlimited, Some(5)),
+                ("MiMo 2.6 Pro", ModelSection::Optimized, Some(10)),
+                // Cut-off box with no right border still parses.
+                ("DeepSeek V4 Pro", ModelSection::Optimized, Some(15)),
+            ]
+        );
+        assert!(catalog.entries[0].focused);
+    }
+
+    #[test]
+    fn nav_ring_reports_toggle_and_ring_length() {
+        // Collapsed: one visible model, 12 advertised, toggle sits last.
+        let rows = load_fixture("0227-synthetic-splash-collapsed-120x40");
+        let ring = nav_ring(&rows).expect("ring");
+        assert_eq!(ring.visible_models, 1);
+        assert_eq!(ring.advertised_models, Some(12));
+        assert_eq!(ring.toggle_index, Some(12));
+        assert_eq!(ring.ring_len, 13);
+        // No count and no toggle row: the ring is just the visible models.
+        let rows = vec![
+            "┌──────────────────────────┐".to_string(),
+            "│ MiMo 2.6 Pro · Balanced │".to_string(),
+            "└──────────────────────────┘".to_string(),
+        ];
+        let ring = nav_ring(&rows).expect("ring");
+        assert_eq!(ring.visible_models, 1);
+        assert_eq!(ring.advertised_models, None);
+        assert_eq!(ring.toggle_index, None);
+        assert_eq!(ring.ring_len, 1);
+    }
+
+    #[test]
+    fn nav_ring_none_without_models_or_toggle() {
+        assert_eq!(nav_ring(&[]), None);
+        assert_eq!(nav_ring(&["Freebuff will run commands".to_string()]), None);
+    }
+
+    #[test]
+    fn plan_select_step_walks_past_the_old_fixed_cap() {
+        // 13 models plus the toggle: a 14-stop ring. The old
+        // MAX_DOWN_PRESSES = 12 wrapped forever without landing; the
+        // ring-derived bound covers the whole ring.
+        let rows: Vec<ModelRow> = (0..13)
+            .map(|i| ModelRow {
+                name: format!("Model {i:02}"),
+                focused: i == 0,
+                cost_line: None,
+            })
+            .collect();
+        assert_eq!(
+            plan_select_step("Model 12", &rows, true, 14, 12),
+            SelectStep::Down,
+            "12 presses must not cap the walk short of the 14-stop ring"
+        );
+        assert_eq!(
+            plan_select_step("Model 12", &rows, true, 14, 13),
+            SelectStep::Down
+        );
+        match plan_select_step("Model 12", &rows, true, 14, 14) {
+            SelectStep::NotOffered { offered } => assert_eq!(offered.len(), 13),
+            other => panic!("expected NotOffered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v0227_keeps_old_v0_detectors() {
+        // The v0.0.x anchors still classify an older freebuff.
+        let collapsed = vec![
+            "Start coding for free".to_string(),
+            "↓  See all 4 models".to_string(),
+            "5 Freebucks/hr".to_string(),
+        ];
+        assert_eq!(classify(&collapsed), ScreenState::ModelSplash);
+        assert_eq!(
+            classify(&load_fixture("splash-120x40")),
+            ScreenState::ModelSplash
+        );
+        assert_eq!(
+            classify(&load_fixture("splash-list-120x40")),
+            ScreenState::ModelList
+        );
     }
 }
