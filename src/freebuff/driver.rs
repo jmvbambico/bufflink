@@ -22,7 +22,7 @@ use crate::freebuff::chats::{
 use crate::freebuff::log::{outcome, parse_log_line, saw_auth_failure, LogEvent, TurnOutcome};
 use crate::freebuff::screen::{
     active_model, check_active_model, classify, input_box_is_empty, input_box_text, match_model,
-    model_rows, pasted_chip_chars, plan_select_step, ModelMatch, ScreenState, SelectStep,
+    model_rows, nav_ring, pasted_chip_chars, plan_select_step, ModelMatch, ScreenState, SelectStep,
     SPLASH_ACCEPT_KEY,
 };
 use crate::freebuff::transcript::{diff, parse_messages, Block, Cursor, Delta, Message};
@@ -814,7 +814,19 @@ impl FreebuffBackend {
                         let snap_text = snap.text();
                         let rows = model_rows(&snap.rows);
                         let show_fewer = snap.rows.iter().any(|r| r.contains("Show fewer"));
-                        match plan_select_step(target, &rows, show_fewer, model_presses) {
+                        // Bound the walk by the real focus ring (models + toggle)
+                        // instead of a fixed max-presses constant; fall back to
+                        // the visible rows when no toggle line is rendered.
+                        let ring_len = nav_ring(&snap.rows)
+                            .map(|r| r.ring_len)
+                            .unwrap_or_else(|| rows.len() + usize::from(show_fewer));
+                        match plan_select_step(
+                            target,
+                            &rows,
+                            show_fewer,
+                            ring_len as u32,
+                            model_presses,
+                        ) {
                             SelectStep::Accept => {
                                 let idx = rows.iter().position(|r| r.focused).expect(
                                     "plan_select_step returns Accept only when a row is focused",
