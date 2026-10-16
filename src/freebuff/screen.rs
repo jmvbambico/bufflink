@@ -920,41 +920,100 @@ pub fn plan_select_step(
     }
 }
 
-/// Extract the text inside the bordered input box.
-/// The box is bordered by ╭…╮ (top) and ╰…╯ (bottom).
-/// Returns the text content trimmed, without the ▍ cursor glyph.
-/// Returns None if no input box is found.
+/// Extract the text inside the freebuff input box.
+/// The input box is the `╭…╮ … ╰…╯` box nearest the BOTTOM of the screen,
+/// located structurally by its border glyphs rather than by row index. This
+/// matters because freebuff v0.2.29 renders a sponsored promo banner in a
+/// rounded box of the SAME shape above the input box: a scan that returned the
+/// FIRST box returned the banner and never saw the typed prompt, so
+/// submit-confirmation timed out with the text plainly on screen. Every closed
+/// box is collected and the last one wins.
+///
+/// Returns the box content trimmed, without the `▍` cursor glyph, with its
+/// wrapped rows joined by `\n`. Returns None when no rounded box is present,
+/// and Some("") for a present-but-empty box (callers treat that as showing no
+/// prompt).
 pub fn input_box_text(rows: &[String]) -> Option<String> {
-    let mut in_box = false;
-    let mut box_lines = Vec::new();
+    let mut boxes: Vec<Vec<String>> = Vec::new();
+    let mut current: Option<Vec<String>> = None;
 
     for row in rows {
         if row.contains('╭') && row.contains('╮') {
-            in_box = true;
+            current = Some(Vec::new());
             continue;
         }
-        if row.contains('╰') && row.contains('╯') && in_box {
-            break;
+        if row.contains('╰') && row.contains('╯') {
+            if let Some(lines) = current.take() {
+                boxes.push(lines);
+            }
+            continue;
         }
-        if in_box {
-            // Strip border characters (│) and surrounding whitespace
+        if let Some(lines) = current.as_mut() {
+            // Strip border characters (│) and surrounding whitespace.
             let stripped = row.trim_start_matches('│').trim_end_matches('│').trim();
-            box_lines.push(stripped.to_string());
+            lines.push(stripped.to_string());
         }
     }
+    // An unterminated box (bottom border scrolled off) still yields its rows.
+    if let Some(lines) = current.take() {
+        boxes.push(lines);
+    }
 
+    let box_lines = boxes.into_iter().next_back()?;
     if box_lines.is_empty() {
         return None;
     }
 
     // Join lines, remove the cursor glyph ▍, trim
     let text = box_lines.join("\n").replace('▍', "").trim().to_string();
+    Some(text)
+}
 
-    if text.is_empty() {
-        Some(String::new())
-    } else {
-        Some(text)
+/// Collapse every run of whitespace to a single space, then trim. The newlines
+/// that join a box's wrapped rows, and the padding inside a row, both become
+/// ordinary single spaces, so an unwrapped needle can be compared against a
+/// wrapped box.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether the input box currently displays `needle` (a prefix of the prompt),
+/// tolerating soft-wrapping. The box's rows are joined and their whitespace
+/// collapsed before the comparison, so a prompt the TUI wrapped across two rows
+/// still matches its unwrapped prefix; a whitespace-insensitive fallback
+/// catches a wrap that splits a token in two. Only the input box — the
+/// bottom-most rounded box — is examined, so a promo banner above it cannot
+/// shadow it.
+///
+/// An empty `needle`, or an empty box, matches nothing: a dropped prompt must
+/// never look submitted.
+pub fn input_box_shows(rows: &[String], needle: &str) -> bool {
+    let needle = collapse_ws(needle);
+    if needle.is_empty() {
+        return false;
     }
+    let Some(text) = input_box_text(rows) else {
+        return false;
+    };
+    let text = collapse_ws(&text);
+    if text.is_empty() {
+        return false;
+    }
+    if text.contains(&needle) {
+        return true;
+    }
+    // A wrap that splits mid-token leaves no space to collapse; compare with
+    // ALL whitespace removed so `...number`/`per...` still joins.
+    let squish = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    squish(&text).contains(&squish(&needle))
+}
+
+/// Whether the screen confirms a submitted prompt: the typed text's prefix is
+/// visible in the input box (tolerating wrapped rows and a banner above it) or
+/// a pasted-text chip is shown. This is the exact predicate the driver's submit
+/// wait uses, so a fixture pins the behaviour the driver depends on.
+pub fn prompt_visible(rows: &[String], preview: &str) -> bool {
+    input_box_shows(rows, preview) || pasted_chip_chars(rows).is_some()
 }
 
 /// Parse the pasted-text chip count from rows.
@@ -1030,6 +1089,23 @@ mod tests {
             }
             "0227-synthetic-splash-narrow-80x24" => {
                 fixture!("0227-synthetic-splash-narrow-80x24")
+            }
+            // Submit-confirmation fixtures. The real one is a VERBATIM frame
+            // captured from the 2026-10-16 live run (freebuff v0.2.29) where a
+            // promo banner in a rounded box shadowed the input box; the rest
+            // are synthetic, derived from that frame's layout.
+            "0227-real-banner-and-input-120x40" => fixture!("0227-real-banner-and-input-120x40"),
+            "0227-synthetic-wrapped-input-120x40" => {
+                fixture!("0227-synthetic-wrapped-input-120x40")
+            }
+            "0227-synthetic-wrapped-banner-120x40" => {
+                fixture!("0227-synthetic-wrapped-banner-120x40")
+            }
+            "0227-synthetic-unrelated-input-120x40" => {
+                fixture!("0227-synthetic-unrelated-input-120x40")
+            }
+            "0227-synthetic-empty-input-120x40" => {
+                fixture!("0227-synthetic-empty-input-120x40")
             }
             _ => panic!("unknown fixture: {}", name),
         };
@@ -1932,5 +2008,110 @@ mod tests {
             classify(&load_fixture("splash-list-120x40")),
             ScreenState::ModelList
         );
+    }
+
+    // --- Submit confirmation (0229) ---------------------------------------
+    //
+    // The 2026-10-16 live run failed to confirm a submitted prompt although the
+    // text was plainly in the input box: freebuff v0.2.29 draws a promo banner
+    // in a ROUNDED box (`╭…╮`/`╰…╯`) ABOVE the input box, and `input_box_text`
+    // returned the first rounded box — the banner. The real frame is kept
+    // verbatim as `0227-real-banner-and-input-120x40`; the rest are synthetic,
+    // derived from that frame's layout. The driver's prefix is the first 20
+    // chars, exactly as `submit_prompt` computes it.
+
+    const PROMPT_PREFIX: &str = "Count from 1 to 400,";
+
+    #[test]
+    fn v0229_real_banner_frame_confirms_the_prompt_in_the_input_box() {
+        let rows = load_fixture("0227-real-banner-and-input-120x40");
+        assert_eq!(rows.len(), 40);
+        // The banner is present and must NOT be dismissed or suppressed.
+        assert!(rows.iter().any(|r| r.contains("New model")));
+        assert!(rows.iter().any(|r| r.contains("See plans  freebuff.com")));
+        assert_eq!(classify(&rows), ScreenState::Idle);
+        // The input box is the bottom-most rounded box, so its text — not the
+        // banner's — is what the detector reads. This is the exact regression:
+        // first-box-wins returned the banner.
+        let box_text = input_box_text(&rows).expect("input box");
+        assert!(
+            box_text.contains("Count from 1 to 400"),
+            "must read the input box, got: {box_text:?}"
+        );
+        assert!(
+            !box_text.contains("See plans"),
+            "must not read the promo banner: {box_text:?}"
+        );
+        assert!(input_box_shows(&rows, PROMPT_PREFIX));
+        assert!(prompt_visible(&rows, PROMPT_PREFIX));
+    }
+
+    #[test]
+    fn v0229_soft_wrapped_prompt_is_confirmed() {
+        let rows = load_fixture("0227-synthetic-wrapped-input-120x40");
+        assert!(rows.iter().any(|r| r.contains("one number per")));
+        assert!(rows.iter().any(|r| r.contains("line, with a short")));
+        // The driver's prefix lands on the first wrapped row.
+        assert!(prompt_visible(&rows, PROMPT_PREFIX));
+        // A needle spanning the wrap only matches once the rows are joined.
+        assert!(input_box_shows(&rows, "one number per line"));
+        assert!(input_box_text(&rows)
+            .unwrap()
+            .contains("Count from 1 to 400"));
+    }
+
+    #[test]
+    fn v0229_wrapped_prompt_with_banner_is_confirmed() {
+        let rows = load_fixture("0227-synthetic-wrapped-banner-120x40");
+        assert!(rows.iter().any(|r| r.contains("See plans  freebuff.com")));
+        assert!(prompt_visible(&rows, PROMPT_PREFIX));
+        assert!(input_box_shows(&rows, "one number per line"));
+        // The banner sits above the box and is neither dismissed nor read.
+        assert!(!input_box_text(&rows).unwrap().contains("See plans"));
+    }
+
+    /// Regression guard: the pasted-text chip form still confirms a submit.
+    #[test]
+    fn v0229_pasted_chip_still_confirms_a_submit() {
+        let rows = load_fixture("paste-chip-120x40");
+        assert_eq!(pasted_chip_chars(&rows), Some(5001));
+        // The box itself shows the placeholder; confirmation comes from the chip.
+        assert!(!input_box_shows(&rows, PROMPT_PREFIX));
+        assert!(prompt_visible(&rows, PROMPT_PREFIX));
+    }
+
+    /// Fail-loud: an empty input box must never look submitted.
+    #[test]
+    fn v0229_empty_input_box_is_not_confirmed() {
+        let rows = load_fixture("0227-synthetic-empty-input-120x40");
+        assert_eq!(input_box_text(&rows).as_deref(), Some(""));
+        assert!(input_box_is_empty(&rows));
+        assert!(!input_box_shows(&rows, PROMPT_PREFIX));
+        assert!(!prompt_visible(&rows, PROMPT_PREFIX));
+        // An empty needle matches nothing.
+        assert!(!input_box_shows(&rows, ""));
+    }
+
+    /// Fail-loud: unrelated text in the box does not satisfy the prefix.
+    #[test]
+    fn v0229_unrelated_input_box_is_not_confirmed() {
+        let rows = load_fixture("0227-synthetic-unrelated-input-120x40");
+        assert!(input_box_text(&rows).unwrap().contains("python"));
+        assert!(!input_box_shows(&rows, PROMPT_PREFIX));
+        assert!(!prompt_visible(&rows, PROMPT_PREFIX));
+    }
+
+    /// The last rounded box wins, but its content is still returned when the
+    /// box has no closing border (the bottom scrolled off).
+    #[test]
+    fn input_box_text_prefers_the_bottom_box_and_tolerates_no_close() {
+        let rows = vec![
+            "╭────╮".to_string(),
+            "│ up │".to_string(),
+            "╰────╯".to_string(),
+            "╭────╮".to_string(),
+            "│ low│".to_string(),
+        ];
+        assert_eq!(input_box_text(&rows).as_deref(), Some("low"));
     }
 }

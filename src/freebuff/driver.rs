@@ -21,9 +21,9 @@ use crate::freebuff::chats::{
 };
 use crate::freebuff::log::{outcome, parse_log_line, saw_auth_failure, LogEvent, TurnOutcome};
 use crate::freebuff::screen::{
-    active_model, check_active_model, classify, input_box_is_empty, input_box_text, match_model,
-    model_rows, nav_ring, pasted_chip_chars, plan_select_step, resolve_model_id, ModelMatch,
-    ScreenState, SelectStep, SPLASH_ACCEPT_KEY,
+    active_model, check_active_model, classify, input_box_is_empty, input_box_shows,
+    input_box_text, match_model, model_rows, nav_ring, pasted_chip_chars, plan_select_step,
+    prompt_visible, resolve_model_id, ModelMatch, ScreenState, SelectStep, SPLASH_ACCEPT_KEY,
 };
 use crate::freebuff::settings::{settings_path, SettingsPin};
 use crate::freebuff::transcript::{diff, parse_messages, Block, Cursor, Delta, Message};
@@ -1007,17 +1007,14 @@ impl FreebuffBackend {
         info!("prompt: pasting text ({} chars)", text.len());
         pty.paste(text).await?;
 
-        // Wait for input box to show the text (first 20 chars) or a pasted chip
+        // Wait for the input box to show the text (first 20 chars) or a pasted
+        // chip. The prompt is matched as a PREFIX across soft-wrapped rows and
+        // the box is located structurally, so a long prompt the TUI wrapped or
+        // a promo banner above the box does not defeat confirmation.
         let preview: String = text.chars().take(20).collect();
         match pty
             .wait_for(
-                |s| {
-                    let in_box = input_box_text(&s.rows)
-                        .map(|t| t.contains(&preview))
-                        .unwrap_or(false);
-                    let chip = pasted_chip_chars(&s.rows).is_some();
-                    in_box || chip
-                },
+                |s| prompt_visible(&s.rows, &preview),
                 Duration::from_secs(5),
             )
             .await
@@ -1052,9 +1049,7 @@ impl FreebuffBackend {
             let state = classify(&s.rows);
             is_terminal_gate(&state)
                 || matches!(state, ScreenState::Busy { .. })
-                || (!input_box_text(&s.rows)
-                    .map(|t| t.contains(&preview))
-                    .unwrap_or(false)
+                || (!input_box_shows(&s.rows, &preview)
                     && pasted_chip_chars(&s.rows).is_none()
                     && input_box_is_empty(&s.rows))
         };
