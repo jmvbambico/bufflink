@@ -298,6 +298,78 @@ pub fn match_model(target: &str, names: &[String]) -> ModelMatch {
     }
 }
 
+/// Canonical 0.2.x model ids and the display name freebuff renders for each in
+/// the idle status row. freebuff 0.2.x persists the active model as an id
+/// (`freebuffModel` in `settings.json`) but still shows a display name, and the
+/// two are not derivable from one another: `deepseek/deepseek-v4-flash` shows
+/// as `DeepSeek V4.1 Flash`, and `mimo/mimo-v2.5` as `MiMo 2.6 Flash`. Since
+/// `BLINK_MODEL` now carries ids, matching a requested id against the running
+/// row must go through this table. Extracted from the freebuff 0.2.27 bundle;
+/// update when the lineup rotates (see docs/research).
+const MODEL_ID_DISPLAY: &[(&str, &str)] = &[
+    ("z-ai/glm-5.3-flash", "GLM 5.3 Flash"),
+    ("z-ai/glm-5.2", "GLM 5.2"),
+    ("mimo/mimo-v2.5", "MiMo 2.6 Flash"),
+    ("mimo/mimo-v2.6-pro", "MiMo 2.6 Pro"),
+    ("openai/gpt-6-luna", "GPT-6 Luna"),
+    ("openai/gpt-6.1-sol", "GPT-6.1 Sol"),
+    ("openai/gpt-5.6-luna", "GPT-5.6 Luna"),
+    ("deepseek/deepseek-v4-flash", "DeepSeek V4.1 Flash"),
+    (
+        "deepseek/deepseek-v4-flash-fast",
+        "DeepSeek V4.1 Flash Fast",
+    ),
+    ("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro"),
+    ("meta/muse-spark-1.3-contributor", "Muse Spark 1.3"),
+    ("meta/muse-spark-1.2-contributor", "Muse Spark 1.2"),
+    ("upstage/solar-pro4", "Solar Pro 4"),
+    ("upstage/solar-mini4", "Solar Mini 4"),
+    ("google/gemini-3.8-flash", "Gemini 3.8 Flash"),
+    ("minimax/minimax-m3", "MiniMax M3"),
+    ("crof/kimi-k3-eco", "Kimi K3"),
+    ("anthropic/claude-fable-5.1", "Claude Fable 5.1"),
+    ("stealth/ox-alpha", "Ox Alpha"),
+    ("stealth/space-bunny-alpha", "Space Bunny Alpha"),
+];
+
+/// The display name freebuff renders for a known 0.2.x model id. Matches on
+/// the whole id or its last `/` segment, under [`normalize_model`] (case- and
+/// separator-insensitive). Returns None for an id freebuff did not ship in the
+/// 0.2.27 lineup — callers treat that as an unrecognized id.
+pub fn model_display_name(id: &str) -> Option<&'static str> {
+    let want = normalize_model(id);
+    let want_seg = normalize_model(id.rsplit('/').next().unwrap_or(id));
+    MODEL_ID_DISPLAY.iter().find_map(|(cid, name)| {
+        let cid_norm = normalize_model(cid);
+        let cid_seg = normalize_model(cid.rsplit('/').next().unwrap_or(cid));
+        if cid_norm == want || (!want_seg.is_empty() && cid_seg == want_seg) {
+            Some(*name)
+        } else {
+            None
+        }
+    })
+}
+
+/// Resolve a `BLINK_MODEL` value — a provider-prefixed id, a bare id, or a
+/// display name — to the canonical catalog id to write into `settings.json`.
+/// Returns None when the value names no model in the 0.2.27 lineup.
+pub fn resolve_model_id(target: &str) -> Option<&'static str> {
+    let want = normalize_model(target);
+    let want_seg = normalize_model(target.rsplit('/').next().unwrap_or(target));
+    MODEL_ID_DISPLAY.iter().find_map(|(id, name)| {
+        let id_norm = normalize_model(id);
+        let id_seg = normalize_model(id.rsplit('/').next().unwrap_or(id));
+        if id_norm == want
+            || (!want_seg.is_empty() && id_seg == want_seg)
+            || normalize_model(name) == want
+        {
+            Some(*id)
+        } else {
+            None
+        }
+    })
+}
+
 /// Active model and (optional) time left from the Idle screen's status row.
 /// Two shapes are accepted: current plans mark the row with the `/model`
 /// command hint and may report no remaining time (e.g. `GLM 5.3 Flash • max ·
@@ -416,22 +488,51 @@ fn time_left_at_start(s: &str) -> Option<&str> {
     }
 }
 
-/// Decide whether an already-running hour satisfies `BLINK_MODEL`, using the
-/// same [`match_model`] rule as the splash: against a single active name the
-/// outcome is match or already-running error (never ambiguous).
+/// Decide whether an already-running hour satisfies `BLINK_MODEL`. `target` may
+/// be an id, a bare id fragment or a display name (see [`models_match`]); the
+/// outcome is match or already-running error (never ambiguous). The error
+/// distinguishes a recognized id that is simply not the running model from a
+/// value freebuff would not recognize at all.
 pub fn check_active_model(
     target: &str,
     active: &str,
     time_left: Option<&str>,
 ) -> Result<(), String> {
-    match match_model(target, &[active.to_string()]) {
-        ModelMatch::One(_) => Ok(()),
-        _ => {
-            let time = time_left.map(|t| format!(" ({t})")).unwrap_or_default();
-            Err(format!(
-                "freebuff: an hour on '{active}' is already running{time}; requested '{target}' — wait for it to end or unset BLINK_MODEL"
-            ))
-        }
+    if models_match(target, active) {
+        return Ok(());
+    }
+    let time = time_left.map(|t| format!(" ({t})")).unwrap_or_default();
+    if resolve_model_id(target).is_some() {
+        Err(format!(
+            "freebuff: an hour on '{active}' is already running{time}; requested '{target}' is not that model — the BLINK_MODEL pin may be stale; wait for the hour to end or unset BLINK_MODEL"
+        ))
+    } else {
+        Err(format!(
+            "freebuff: an hour on '{active}' is already running{time}; requested '{target}' is not a freebuff 0.2.x model id — check BLINK_MODEL against freebuff's /model picker"
+        ))
+    }
+}
+
+/// Do a requested `BLINK_MODEL` value and the model name shown on the idle
+/// status row denote the same model? Accepts a direct name/normalized-substring
+/// match, and otherwise resolves the request to its canonical id via
+/// [`MODEL_ID_DISPLAY`] and compares the id and its display name against the
+/// running row. This is what lets an id such as `z-ai/glm-5.3-flash` be
+/// confirmed against a row that reads `GLM 5.3 Flash`.
+fn models_match(target: &str, active: &str) -> bool {
+    let running = [active.to_string()];
+    if let ModelMatch::One(_) = match_model(target, &running) {
+        return true;
+    }
+    let Some(id) = resolve_model_id(target) else {
+        return false;
+    };
+    if let ModelMatch::One(_) = match_model(id, &running) {
+        return true;
+    }
+    match model_display_name(id) {
+        Some(name) => matches!(match_model(name, &running), ModelMatch::One(_)),
+        None => false,
     }
 }
 
@@ -983,7 +1084,7 @@ mod tests {
 
     #[test]
     fn check_active_model_table() {
-        // Match reuses the match_model rule (normalised substring).
+        // Ok: a bare id fragment or display name matches a running name.
         assert_eq!(
             check_active_model("mimo-2.5", "MiMo 2.5", Some("58m left")),
             Ok(())
@@ -993,22 +1094,81 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            check_active_model("deepseek-v4-pro", "MiMo 2.5", Some("58m left")),
-            Err("freebuff: an hour on 'MiMo 2.5' is already running (58m left); requested 'deepseek-v4-pro' — wait for it to end or unset BLINK_MODEL".to_string())
-        );
-        assert_eq!(
-            check_active_model("mimo", "GLM 5.3 Flash", Some("1h left")),
-            Err("freebuff: an hour on 'GLM 5.3 Flash' is already running (1h left); requested 'mimo' — wait for it to end or unset BLINK_MODEL".to_string())
-        );
-        // Model enforcement must still fire when the plan reports no time.
-        assert_eq!(
-            check_active_model("deepseek-v4-pro", "GLM 5.3 Flash", None),
-            Err("freebuff: an hour on 'GLM 5.3 Flash' is already running; requested 'deepseek-v4-pro' — wait for it to end or unset BLINK_MODEL".to_string())
-        );
-        assert_eq!(
             check_active_model("glm-5.3-flash", "GLM 5.3 Flash", None),
             Ok(())
         );
+        // Ok: a 0.2.x provider id matches its display name via the table, even
+        // when the id and the name share no substring.
+        assert_eq!(
+            check_active_model("z-ai/glm-5.3-flash", "GLM 5.3 Flash", Some("1h left")),
+            Ok(())
+        );
+        assert_eq!(
+            check_active_model("deepseek/deepseek-v4-flash", "DeepSeek V4.1 Flash", None),
+            Ok(())
+        );
+        assert_eq!(
+            check_active_model("mimo/mimo-v2.5", "MiMo 2.6 Flash", Some("42m left")),
+            Ok(())
+        );
+        // Ok: a display name resolves through the table too.
+        assert_eq!(
+            check_active_model("GLM 5.3 Flash", "GLM 5.3 Flash", None),
+            Ok(())
+        );
+
+        // Err, recognized id that is not the running model: names the staleness
+        // explicitly.
+        let err = check_active_model("deepseek-v4-pro", "MiMo 2.5", Some("58m left"))
+            .expect_err("different model must error");
+        assert!(err.contains("an hour on 'MiMo 2.5' is already running (58m left)"));
+        assert!(err.contains("requested 'deepseek-v4-pro' is not that model"));
+        assert!(err.contains("BLINK_MODEL pin may be stale"));
+        assert!(err.contains("unset BLINK_MODEL"));
+
+        // Err, unrecognized id (the reported 'mimo-2.6'): a distinct message.
+        let err = check_active_model("mimo-2.6", "GLM 5.3 Flash", Some("1h left"))
+            .expect_err("unrecognized model must error");
+        assert!(err.contains("an hour on 'GLM 5.3 Flash' is already running (1h left)"));
+        assert!(err.contains("requested 'mimo-2.6' is not a freebuff 0.2.x model id"));
+        assert!(err.contains("/model picker"));
+
+        // Enforcement still fires when the plan reports no time left.
+        let err = check_active_model("deepseek-v4-pro", "GLM 5.3 Flash", None)
+            .expect_err("different model must error");
+        assert!(err.contains("an hour on 'GLM 5.3 Flash' is already running;"));
+        assert!(err.contains("not that model"));
+    }
+
+    #[test]
+    fn model_id_display_resolves_ids_and_names() {
+        assert_eq!(
+            model_display_name("z-ai/glm-5.3-flash"),
+            Some("GLM 5.3 Flash")
+        );
+        assert_eq!(model_display_name("glm-5.3-flash"), Some("GLM 5.3 Flash"));
+        assert_eq!(model_display_name("mimo/mimo-v2.5"), Some("MiMo 2.6 Flash"));
+        assert_eq!(
+            model_display_name("deepseek/deepseek-v4-flash"),
+            Some("DeepSeek V4.1 Flash")
+        );
+        assert_eq!(model_display_name("mimo-2.6"), None);
+        assert_eq!(model_display_name(""), None);
+
+        assert_eq!(
+            resolve_model_id("z-ai/glm-5.3-flash"),
+            Some("z-ai/glm-5.3-flash")
+        );
+        assert_eq!(
+            resolve_model_id("GLM 5.3 Flash"),
+            Some("z-ai/glm-5.3-flash")
+        );
+        assert_eq!(resolve_model_id("mimo/mimo-v2.5"), Some("mimo/mimo-v2.5"));
+        assert_eq!(
+            resolve_model_id("deepseek/deepseek-v4-flash-fast"),
+            Some("deepseek/deepseek-v4-flash-fast")
+        );
+        assert_eq!(resolve_model_id("mimo-2.6"), None);
     }
 
     #[test]
