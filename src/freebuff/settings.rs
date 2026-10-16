@@ -11,7 +11,8 @@
 //! Rules of the road (see AGENTS.md): never touch state we did not create. We
 //! read-modify-write a `serde_json::Value` object so keys bufflink does not own
 //! survive untouched, copy the original file to
-//! `settings.json.blink-backup` once before the first write, and never create a
+//! `settings.json.blink-backup` before the first write of each run (refreshed,
+//! so it always reflects the value actually being replaced), and never create a
 //! fresh settings file that would discard user state — a missing or unparseable
 //! file is a loud error, not something to paper over.
 
@@ -115,6 +116,13 @@ impl SettingsPin {
         &self.path
     }
 
+    /// Path of the last-resort backup holding the user's pre-pin values. Named
+    /// in every error so a failed restore tells the user exactly which file
+    /// holds their original model.
+    pub fn backup_path(&self) -> &Path {
+        &self.backup_path
+    }
+
     /// Whether a pin is currently applied.
     pub fn is_applied(&self) -> bool {
         self.applied
@@ -122,9 +130,10 @@ impl SettingsPin {
 
     /// Write `freebuffModel = model_id` (and `freebuffModelKey` when given, else
     /// remove any stale key so it cannot override the requested model on a
-    /// catalog refresh). Backs up the original file once, then read-modify-writes
-    /// preserving every other key. Fails loudly if the file is missing or
-    /// unparseable — never creates a fresh one.
+    /// catalog refresh). Refreshes the backup to the value being replaced on the
+    /// first pin of a run, then read-modify-writes preserving every other key.
+    /// Fails loudly if the file is missing or unparseable — never creates a
+    /// fresh one.
     pub fn pin(&mut self, model_id: &str, model_key: Option<&str>) -> Result<()> {
         validate_model_id(model_id).with_context(|| format!("invalid BLINK_MODEL '{model_id}'"))?;
         if let Some(key) = model_key {
@@ -152,14 +161,20 @@ impl SettingsPin {
         };
 
         if !self.applied {
-            if !self.backup_path.exists() {
-                atomic_write(&self.backup_path, &raw).with_context(|| {
-                    format!(
-                        "failed to back up freebuff settings to {}",
-                        self.backup_path.display()
-                    )
-                })?;
-            }
+            // Refresh the backup to the value actually being replaced right now.
+            // Writing it only when ABSENT left a STALE backup: a previous run's
+            // copy (model A) survived, the user later selected model B, a restore
+            // failed and the process died before any retry — B lived only in
+            // memory while the durable copy still said A. Re-writing it on every
+            // capture keeps the on-disk artefact correct even if we never get to
+            // restore. (Within a run, only the first pin captures: `applied`
+            // guards it so a later pin does not record our own pinned value.)
+            atomic_write(&self.backup_path, &raw).with_context(|| {
+                format!(
+                    "failed to back up freebuff settings to {}",
+                    self.backup_path.display()
+                )
+            })?;
             self.original_model = obj.get(SETTINGS_MODEL).cloned();
             self.original_key = obj.get(SETTINGS_MODEL_KEY).cloned();
         }
@@ -249,8 +264,9 @@ impl SettingsPin {
             .context("failed to serialize restored freebuff settings")?;
         atomic_write(&self.path, &out).with_context(|| {
             format!(
-                "failed to restore freebuff settings to {}",
-                self.path.display()
+                "failed to restore freebuff settings to {}: the user's original model was NOT restored (backup at {})",
+                self.path.display(),
+                self.backup_path.display()
             )
         })?;
         self.applied = false;
@@ -416,6 +432,33 @@ mod tests {
         fs::write(&backup, serde_json::to_vec_pretty(&aside).unwrap()).unwrap();
         pin.pin("deepseek/deepseek-v4-pro", None).unwrap();
         assert_eq!(read_json(&backup), aside);
+    }
+
+    /// The backup is REFRESHED on the first pin of each run so it always
+    /// reflects the value actually being replaced. A stale backup left by an
+    /// earlier run would otherwise hold an older model while the user's current
+    /// choice lived only in memory — so a restore failure plus an immediate
+    /// process exit would lose it.
+    #[test]
+    fn backup_is_refreshed_to_the_value_being_replaced() {
+        let (_dir, path) = temp_settings(Some(json!({
+            "freebuffModel": "mimo/mimo-v2.5",
+            "mode": "DEFAULT"
+        })));
+        let backup = backup_path(&path);
+
+        // A previous run left a STALE backup describing an older model.
+        fs::write(
+            &backup,
+            serde_json::to_vec_pretty(&json!({ "freebuffModel": "old/model" })).unwrap(),
+        )
+        .unwrap();
+
+        // A fresh run replaces the user's CURRENT model...
+        let mut pin = SettingsPin::new(path.clone());
+        pin.pin("z-ai/glm-5.3-flash", None).unwrap();
+        // ...and the durable backup now describes exactly what this run replaced.
+        assert_eq!(read_json(&backup)["freebuffModel"], "mimo/mimo-v2.5");
     }
 
     #[test]

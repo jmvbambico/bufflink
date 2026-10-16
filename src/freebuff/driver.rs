@@ -346,7 +346,10 @@ impl FreebuffBackend {
     /// A failed restore KEEPS the pin — it holds the user's original model, so
     /// dropping it here would silently hijack the user's choice forever. It is
     /// retained for a later shutdown path to retry; only success (or no pin)
-    /// clears it. The pinned settings backup is the last-resort manual restore.
+    /// clears it. If no further shutdown runs before the process exits, the
+    /// on-disk `settings.json.blink-backup` — kept current at pin time — is the
+    /// artefact that holds the user's original model, and the warning names that
+    /// exact file.
     async fn restore_settings_pin(&self) {
         let mut guard = self.settings_pin.lock().await;
         let outcome = guard.as_mut().map(|pin| pin.restore());
@@ -354,9 +357,15 @@ impl FreebuffBackend {
             // Nothing was pinned, or the originals are back: the pin is done.
             None | Some(Ok(())) => *guard = None,
             Some(Err(e)) => {
+                let backup = guard
+                    .as_ref()
+                    .map(|pin| pin.backup_path().display().to_string())
+                    .unwrap_or_default();
                 warn!(
                     error = %format!("{e:#}"),
-                    "failed to restore freebuff settings; keeping the pin to retry on shutdown"
+                    backup = %backup,
+                    "failed to restore freebuff settings; keeping the pin to retry on shutdown \
+                     — the user's original model is preserved in the backup file"
                 );
             }
         }

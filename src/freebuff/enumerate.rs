@@ -14,7 +14,7 @@
 //! name is dropped from the plain output (and flagged on stderr / in `--json`).
 
 use crate::freebuff::screen::{
-    classify, model_rows, nav_ring, parse_catalog, toggle_row_has_focus_marker, ScreenState,
+    classify, model_rows, nav_ring, toggle_row_has_focus_marker, ScreenState,
 };
 use crate::pty::{Key, Pty};
 use anyhow::{anyhow, Result};
@@ -27,6 +27,10 @@ const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SETTLE: Duration = Duration::from_millis(300);
 /// Max Down presses before giving up (prevents an infinite scroll walk).
 const MAX_DOWN_PRESSES: u32 = 100;
+/// How many unreadable frames to tolerate before refusing to press Enter. A
+/// half-painted frame can classify as the splash before its model row is drawn;
+/// re-reading a few times is safe because no Enter is sent while unverified.
+const MAX_UNREADABLE_FRAMES: u32 = 5;
 
 /// Source of a catalog entry's id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,62 +163,236 @@ pub fn price_per_hour_from_cost_line(line: &str) -> Option<u64> {
     }
 }
 
-/// `true` only when the parsed screen proves focus is on the See-all /
-/// Show-fewer toggle row.
+/// Positive focus evidence for the model rows on one screen.
 ///
-/// Pressing Enter on a model row starts a session and SPENDS Freebucks, so this
-/// is a hard refusal point: Enter is refused unless this returns `true`. It
-/// FAILS CLOSED — the previous form inferred safety from the ABSENCE of a
-/// focused model (`all()` over a model-row list is vacuously true when the list
-/// is EMPTY), so a partially rendered / mid-clear / scrolled frame, or any
-/// future row-shape change, could let Enter reach a focused model row.
-///
-/// Enter is allowed only when all of these hold:
-/// (a) the toggle row is rendered AND is positively the focused stop — the
-///     toggle line itself carries the `›` marker, or (the real 0.2.x renderer
-///     marks a focused toggle by colour, which the PTY layer strips) the parse
-///     proves it structurally below;
-/// (b) no model row is focused, established from a NON-EMPTY parse;
-/// (c) the screen parses coherently at all ([`nav_ring`] recognises the picker).
-pub fn focus_is_on_toggle(rows: &[String]) -> bool {
-    // (c) The screen must be recognisable as the 0.2.x picker: a model row or
-    //     the toggle must be present. A blank/garbled/partial frame is None.
-    let Some(ring) = nav_ring(rows) else {
-        return false;
-    };
-    // (a) The toggle row must actually be rendered.
-    if ring.toggle_index.is_none() {
-        return false;
-    }
-
-    // (a) Explicit evidence: the toggle line itself carries the focus marker.
-    let toggle_marked = rows.iter().any(|r| toggle_row_has_focus_marker(r));
-    // (b) Independent "no model focused" reads, so a single parser missing a
-    //     focus marker cannot alone fail open.
-    let no_row_focused = model_rows(rows).iter().all(|m| !m.focused);
-    let catalog = parse_catalog(rows);
-    if catalog.entries.is_empty() {
-        // No model row parsed at all. `all()` here would be vacuously true, so
-        // this is exactly the empty-parse case that must NOT pass: only an
-        // explicit toggle marker (and no focused row either parser can see)
-        // proves focus.
-        return toggle_marked && no_row_focused;
-    }
-    // (b) With a NON-EMPTY parse, `!focused` is meaningful: the picker is a
-    //     single-focus ring, so no focused model row means the toggle holds it.
-    let no_entry_focused = catalog.entries.iter().all(|e| !e.focused);
-    no_entry_focused && no_row_focused
+/// Enter on a model row starts a session and SPENDS Freebucks, so focus is
+/// never inferred from ABSENCE: an empty parse is [`ModelFocus::NoRows`], never
+/// "nothing is focused".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelFocus {
+    /// Exactly one model row positively carries the focus marker, at this index
+    /// within the parsed model rows.
+    Single(usize),
+    /// Model rows parsed, but none carries the focus marker.
+    NoneMarked,
+    /// No model row parsed at all — must never be read as "nothing focused".
+    NoRows,
+    /// Two or more model rows carry the marker: not a single-focus ring.
+    Multiple,
 }
 
-/// Send `Enter` only when the guard confirms focus is on the toggle row.
-async fn enter_toggle(pty: &Pty, rows: &[String]) -> Result<()> {
-    if !focus_is_on_toggle(rows) {
-        return Err(anyhow!(
-            "refusing to send Enter: focus is not on the See-all/Show-fewer toggle row \
-             (Enter on a model row starts a session and spends Freebucks)"
-        ));
+/// Read positive focus evidence from a screen. [`model_rows`] and the
+/// screen-catalog parser read the SAME rows and miss the SAME glyph, so they
+/// are not independent evidence; a row counts as focused only when the marker
+/// is positively present. A row drawn with a changed glyph (e.g. `❯`) parses as
+/// an unfocused model row, which is exactly the frame that must not be mistaken
+/// for "the toggle is focused".
+fn model_focus(rows: &[String]) -> ModelFocus {
+    let models = model_rows(rows);
+    if models.is_empty() {
+        return ModelFocus::NoRows;
     }
-    pty.key(Key::Enter).await
+    let mut hit = None;
+    let mut marked = 0usize;
+    for (i, m) in models.iter().enumerate() {
+        if m.focused {
+            marked += 1;
+            hit = Some(i);
+        }
+    }
+    match marked {
+        0 => ModelFocus::NoneMarked,
+        1 => ModelFocus::Single(hit.expect("marked == 1")),
+        _ => ModelFocus::Multiple,
+    }
+}
+
+/// State of the validated walk that reaches the picker's See-all/Show-fewer
+/// toggle row.
+///
+/// Focus is tracked POSITIVELY: the walk starts only from a row whose focus
+/// marker is detected, and every Down press is validated against the row the
+/// rendered ring says focus must move to. It never concludes "the toggle is
+/// focused" from the absence of a marker on any model row.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToggleWalk {
+    /// Focused model-row index the walk verified before its first press.
+    start: Option<usize>,
+    /// Presses the verified start proved separate the focused row from the
+    /// toggle row.
+    planned: Option<u32>,
+    /// Presses taken so far.
+    presses: u32,
+}
+
+impl ToggleWalk {
+    /// A walk that has not yet established its starting position.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forget the verified start (used when a repaint leaves the picker).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Record that a Down press was just sent.
+    pub fn record_down(&mut self) {
+        self.presses = self.presses.saturating_add(1);
+    }
+
+    /// The number of Down presses taken so far.
+    pub fn presses(&self) -> u32 {
+        self.presses
+    }
+}
+
+/// The next action of the validated toggle walk. A value, so every abort path
+/// is assertable without a live PTY.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToggleStep {
+    /// Press Down and re-read the screen.
+    Down,
+    /// Focus is positively on the toggle: Enter is safe.
+    Enter,
+    /// Focus could not be verified: send NO Enter. Carries the reason.
+    Abort(String),
+}
+
+/// Decide the next step of the walk that reaches the picker's toggle row.
+///
+/// The only paths to [`ToggleStep::Enter`] are:
+/// * the toggle line itself positively carries the focus marker and no model
+///   row is marked (a marked toggle cannot co-exist with a focused model in a
+///   single-focus ring); or
+/// * a walk that started from a single positively-marked model row, whose
+///   length was fixed by the rendered ring, and whose every press was validated
+///   to land on the row the ring predicted, ending on the toggle.
+///
+/// Anything that cannot be verified FAILS CLOSED with [`ToggleStep::Abort`],
+/// because Enter on a model row starts a billed session.
+///
+/// NB: on the collapsed splash only the recommended model row and the toggle are
+/// focus stops (the rest of the lineup hides behind `See all N models`), so the
+/// ring this screen proves is the RENDERED rows plus the toggle. The advertised
+/// count describes the expanded list; it is only cross-checked here for
+/// consistency, never used to count presses.
+pub fn toggle_walk_next(rows: &[String], walk: &mut ToggleWalk) -> ToggleStep {
+    let Some(ring) = nav_ring(rows) else {
+        return ToggleStep::Abort("the screen is not the freebuff model picker".to_string());
+    };
+    if ring.toggle_index.is_none() {
+        return ToggleStep::Abort("the See-all/Show-fewer toggle row is not rendered".to_string());
+    }
+
+    // Positive evidence straight from the toggle line. The real 0.2.x renderer
+    // marks a focused toggle by colour only (which the PTY layer strips), but
+    // when a marker IS emitted it is unambiguous.
+    if rows.iter().any(|r| toggle_row_has_focus_marker(r)) {
+        return match model_focus(rows) {
+            ModelFocus::NoneMarked | ModelFocus::NoRows => ToggleStep::Enter,
+            ModelFocus::Single(i) => ToggleStep::Abort(format!(
+                "the toggle line carries a focus marker but model row {i} is also focused"
+            )),
+            ModelFocus::Multiple => ToggleStep::Abort(
+                "the toggle line carries a focus marker but several model rows are focused"
+                    .to_string(),
+            ),
+        };
+    }
+
+    // Establish the verified starting position once.
+    if walk.start.is_none() {
+        let start = match model_focus(rows) {
+            ModelFocus::Single(i) => i,
+            ModelFocus::NoneMarked => {
+                return ToggleStep::Abort(
+                    "no model row positively carries the focus marker: focus cannot be \
+                     tracked from a verified start"
+                        .to_string(),
+                )
+            }
+            ModelFocus::NoRows => return ToggleStep::Abort("no model row is rendered".to_string()),
+            ModelFocus::Multiple => {
+                return ToggleStep::Abort(
+                    "several model rows carry the focus marker: not a single-focus ring"
+                        .to_string(),
+                )
+            }
+        };
+        // Count the rendered rows with the SAME parser that established focus
+        // (`model_rows`), and cross-check the advertised count against it. The
+        // two row parsers read one screen and can disagree, and a toggle that
+        // advertises fewer models than are rendered is self-contradictory: both
+        // are unverifiable, so fail closed rather than guess a walk length.
+        let rendered = model_rows(rows).len();
+        if start >= rendered {
+            return ToggleStep::Abort(format!(
+                "the focused model row {start} is outside the {rendered} rendered row(s)"
+            ));
+        }
+        if let Some(advertised) = ring.advertised_models {
+            if advertised < rendered {
+                return ToggleStep::Abort(format!(
+                    "the toggle advertises {advertised} model(s) but {rendered} are rendered"
+                ));
+            }
+        }
+        // The toggle sits immediately after the last RENDERED model row, so the
+        // walk length is that many model stops plus the toggle hop.
+        walk.start = Some(start);
+        walk.planned = Some((rendered - start) as u32);
+        walk.presses = 0;
+        return ToggleStep::Down;
+    }
+
+    let start = walk.start.expect("start set together with planned");
+    let planned = walk.planned.expect("planned set together with start");
+
+    if walk.presses >= planned {
+        // The ring's worth of presses have been taken: the next stop must be
+        // the toggle, so no model row may be positively focused.
+        return match model_focus(rows) {
+            ModelFocus::NoneMarked => ToggleStep::Enter,
+            ModelFocus::Single(i) => ToggleStep::Abort(format!(
+                "expected the toggle after {planned} Down press(es) but model row {i} is still focused"
+            )),
+            ModelFocus::NoRows => ToggleStep::Abort(
+                "the screen stopped parsing before the toggle was reached".to_string(),
+            ),
+            ModelFocus::Multiple => ToggleStep::Abort(
+                "several model rows are focused before the toggle was reached".to_string(),
+            ),
+        };
+    }
+
+    // Mid-walk: focus must have advanced one row, to `start + presses`.
+    let expected = start + walk.presses as usize;
+    match model_focus(rows) {
+        ModelFocus::Single(i) if i == expected => ToggleStep::Down,
+        ModelFocus::Single(i) => ToggleStep::Abort(format!(
+            "focus jumped to model row {i} but the walk expected row {expected}"
+        )),
+        ModelFocus::NoneMarked => ToggleStep::Abort(
+            "focus left the model rows before the walk reached the toggle".to_string(),
+        ),
+        ModelFocus::NoRows | ModelFocus::Multiple => {
+            ToggleStep::Abort("the screen stopped parsing mid-walk".to_string())
+        }
+    }
+}
+
+/// Whether the expanded-list walk has scrolled past the last model (the toggle
+/// row holds focus). This is a TERMINATION signal only — it never authorises
+/// Enter. It requires a NON-EMPTY model parse so an empty or partial frame is
+/// never read as "nothing is focused" (the vacuous-`all()` fix).
+fn walk_past_last_model(rows: &[String]) -> bool {
+    match nav_ring(rows) {
+        Some(ring) if ring.toggle_index.is_some() => {
+            matches!(model_focus(rows), ModelFocus::NoneMarked)
+        }
+        _ => false,
+    }
 }
 
 /// Wait for the screen to change after a keypress, then let the repaint finish.
@@ -271,12 +449,15 @@ pub async fn enumerate_catalog(pty: &Pty) -> Result<Vec<CatalogEntry>> {
         }
     }
 
-    // 2. Expand the picker if it is collapsed. Enter is only sent on the
-    //    toggle row, and only after the guard confirms focus is there. The
+    // 2. Expand the picker if it is collapsed. Enter is sent ONLY when the
+    //    validated walk (see `toggle_walk_next`) proves focus has arrived at the
+    //    toggle row; any unverifiable frame aborts without pressing Enter. The
     //    collapsed splash advertises the lineup size (`↓ See all N models`);
     //    record it so the walk below knows when every model has been read.
     let mut total: Option<usize> = None;
     let mut presses = 0u32;
+    let mut unreadable_frames = 0u32;
+    let mut walk = ToggleWalk::new();
     loop {
         let rows = pty.screen().rows.clone();
         let st = classify(&rows);
@@ -285,26 +466,44 @@ pub async fn enumerate_catalog(pty: &Pty) -> Result<Vec<CatalogEntry>> {
         }
         match st {
             ScreenState::ModelList => break, // already expanded
-            ScreenState::ModelSplash => {
-                if focus_is_on_toggle(&rows) {
-                    enter_toggle(pty, &rows).await?;
+            ScreenState::ModelSplash => match toggle_walk_next(&rows, &mut walk) {
+                ToggleStep::Enter => {
+                    pty.key(Key::Enter).await?;
                     tokio::time::sleep(SETTLE).await;
-                } else if presses >= MAX_DOWN_PRESSES {
-                    return Err(anyhow!(
-                        "freebuff: could not reach the model-picker toggle row"
-                    ));
-                } else {
+                }
+                ToggleStep::Down => {
+                    if presses >= MAX_DOWN_PRESSES {
+                        return Err(anyhow!(
+                            "freebuff: could not reach the model-picker toggle row"
+                        ));
+                    }
                     let before = pty.screen().text();
                     pty.key(Key::Down).await?;
+                    walk.record_down();
                     presses += 1;
                     settle_after(pty, &before, deadline).await?;
                 }
-            }
+                ToggleStep::Abort(reason) => {
+                    // A frame caught mid-repaint can classify as the splash
+                    // before its model row is drawn. Re-read a few times before
+                    // giving up; no Enter is ever sent while focus is unverified.
+                    if model_rows(&rows).is_empty() && unreadable_frames < MAX_UNREADABLE_FRAMES {
+                        unreadable_frames += 1;
+                        tokio::time::sleep(SETTLE).await;
+                    } else {
+                        return Err(anyhow!(
+                            "freebuff: refusing to send Enter on the model picker — {reason} \
+                             (Enter on a model row starts a session and spends Freebucks)"
+                        ));
+                    }
+                }
+            },
             ScreenState::Booting => {
                 // The TUI clears the screen (`ESC[2J`) before each repaint, so a
                 // read taken in that window sees an empty grid and classifies as
                 // Booting. It is a transient render state, not a different TUI
                 // shape: let the paint settle and re-read.
+                walk.reset();
                 tokio::time::sleep(SETTLE).await;
             }
             st => {
@@ -362,9 +561,10 @@ pub async fn enumerate_catalog(pty: &Pty) -> Result<Vec<CatalogEntry>> {
         // In the expanded view the advertised total (`↓ See all N`) is no
         // longer shown; `↑ Show fewer` carries no number. When focus reaches
         // that toggle row we've scrolled past the last model, so the walk is
-        // done. (`focus_is_on_toggle` requires no model focused, so it won't
-        // fire right after expanding: focus=0 on the first model.)
-        if focus_is_on_toggle(&rows) {
+        // done. This is a TERMINATION signal only — it never authorises Enter —
+        // and it requires a non-empty model parse so an empty frame is not read
+        // as "nothing is focused".
+        if walk_past_last_model(&rows) {
             break;
         }
 
@@ -462,6 +662,9 @@ mod tests {
             "splash-120x40" => fixture!("splash-120x40"),
             "splash-list-focus4-120x40" => fixture!("splash-list-focus4-120x40"),
             "splash-list-showfewer-120x40" => fixture!("splash-list-showfewer-120x40"),
+            "0227-synthetic-splash-collapsed-120x40" => {
+                fixture!("0227-synthetic-splash-collapsed-120x40")
+            }
             _ => panic!("unknown fixture: {name}"),
         };
         content.lines().map(|s| s.to_string()).collect()
@@ -559,115 +762,274 @@ mod tests {
         assert_eq!(price_per_hour_from_cost_line(""), None);
     }
 
-    #[test]
-    fn focus_is_on_toggle_refuses_model_focus() {
-        // Collapsed splash: focus is on the model row (`›`), not the toggle.
-        assert!(!focus_is_on_toggle(&load_fixture("splash-120x40")));
-        // Expanded list with a model focused.
-        assert!(!focus_is_on_toggle(&load_fixture(
-            "splash-list-focus4-120x40"
-        )));
+    /// Assert the walk never returns Enter and never walks for a frame from
+    /// which focus cannot be positively established.
+    fn assert_no_enter(rows: &[String], walk: &mut ToggleWalk) {
+        for _ in 0..4 {
+            match toggle_walk_next(rows, walk) {
+                ToggleStep::Enter => panic!("must never Enter on {rows:?}"),
+                ToggleStep::Down => panic!("must never walk on {rows:?}"),
+                ToggleStep::Abort(_) => {}
+            }
+        }
     }
 
-    #[test]
-    fn focus_is_on_toggle_allows_toggle_focus() {
-        // `Show fewer` visible and no model row focused: focus is on the toggle.
-        assert!(focus_is_on_toggle(&load_fixture(
-            "splash-list-showfewer-120x40"
-        )));
-    }
-
-    #[test]
-    fn focus_is_on_toggle_rejects_no_toggle() {
-        let rows = vec![
-            "│   Unknown Model · something │".to_string(),
-            "│   5 Freebucks/hr              │".to_string(),
+    /// `n` rendered model boxes with the marker on `focused`, plus the toggle.
+    fn three_models_focused(focused: usize) -> Vec<String> {
+        let names = [
+            "GLM 5.3 Flash · Deep reasoning",
+            "MiMo 2.6 Pro · Balanced",
+            "GPT-6 Luna · Balanced",
         ];
-        assert!(!focus_is_on_toggle(&rows));
+        let mut rows = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            let marker = if i == focused { "›" } else { " " };
+            rows.push(format!("│ {marker} {name} │"));
+        }
+        rows.push("↓  See all 3 models".to_string());
+        rows
     }
 
+    /// A model row focused (`›`) never authorises Enter: the walk starts by
+    /// pressing Down, never by concluding the toggle holds focus.
     #[test]
-    fn focus_is_on_toggle_requires_no_model_focus() {
-        // Toggle visible but a model is focused: must refuse.
+    fn toggle_walk_does_not_enter_while_a_model_is_focused() {
+        for f in 0..3 {
+            let mut walk = ToggleWalk::new();
+            assert_eq!(
+                toggle_walk_next(&three_models_focused(f), &mut walk),
+                ToggleStep::Down
+            );
+        }
+        // The collapsed splash (recommended row focused) likewise walks.
+        let mut walk = ToggleWalk::new();
+        assert_eq!(
+            toggle_walk_next(&load_fixture("splash-120x40"), &mut walk),
+            ToggleStep::Down
+        );
+    }
+
+    /// Focus is NEVER inferred from absence: without a positively-marked model
+    /// row, the walk aborts and no Enter is sent.
+    #[test]
+    fn toggle_walk_aborts_when_initial_focus_is_not_positively_identified() {
+        // Model box parses but carries no marker.
+        assert_no_enter(
+            &[
+                "│   GLM 5.3 Flash · Deep reasoning · Images │".to_string(),
+                "│                              5 Freebucks/hr │".to_string(),
+                "↓  See all 12 models".to_string(),
+            ],
+            &mut ToggleWalk::new(),
+        );
+        // Two rows carry the marker: not a single-focus ring.
+        assert_no_enter(
+            &[
+                "│ › GLM 5.3 Flash · Deep reasoning │".to_string(),
+                "│ › MiMo 2.6 Pro · Balanced │".to_string(),
+                "↓  See all 2 models".to_string(),
+            ],
+            &mut ToggleWalk::new(),
+        );
+        // Empty parses: model_rows recognises nothing, so "nothing is focused"
+        // must never be concluded.
+        assert_no_enter(&["↓  See all 3 models".to_string()], &mut ToggleWalk::new());
+        assert_no_enter(&["↑  Show fewer".to_string()], &mut ToggleWalk::new());
+        assert_no_enter(&[], &mut ToggleWalk::new());
+        assert_no_enter(&["".to_string(), "   ".to_string()], &mut ToggleWalk::new());
+        // A model-shaped row the parser cannot read (no ` · ` separator) leaves
+        // the parse empty -> abort.
+        assert_no_enter(
+            &[
+                "│ › GLM 5.3 Flash".to_string(),
+                "↓  See all 3 models".to_string(),
+            ],
+            &mut ToggleWalk::new(),
+        );
+        // A model box with no toggle row is not the picker -> abort.
+        assert_no_enter(
+            &[
+                "│   Unknown Model · something │".to_string(),
+                "│   5 Freebucks/hr              │".to_string(),
+            ],
+            &mut ToggleWalk::new(),
+        );
+    }
+
+    /// The reviewer's exact scenario: a FOCUSED model row rendered with a
+    /// DIFFERENT glyph (`❯` instead of `›`) parses as an (unfocused) model row.
+    /// Both the old absence-based guard and the two row parsers saw no focus and
+    /// pressed Enter — onto a focused model row, starting a billed session. The
+    /// walk must ABORT: never walk, never conclude the toggle is focused.
+    #[test]
+    fn toggle_walk_aborts_on_a_focused_row_with_a_changed_glyph() {
         let rows = vec![
-            "│ › Known Model · something │".to_string(),
-            "│   5 Freebucks/hr              │".to_string(),
-            "↓  See all 3 models".to_string(),
+            "│ ❯ GLM 5.3 Flash · Deep reasoning · Reasoning: max · Images │".to_string(),
+            "│                             5 Freebucks/hr · Recommended │".to_string(),
+            "↓  See all 12 models".to_string(),
         ];
-        assert!(!focus_is_on_toggle(&rows));
+        let mut walk = ToggleWalk::new();
+        match toggle_walk_next(&rows, &mut walk) {
+            ToggleStep::Abort(_) => {}
+            other => panic!("expected Abort, got {other:?}"),
+        }
+        assert_eq!(walk.presses(), 0, "the walk never took a press");
+        // Re-reading the same frame must keep refusing, never Enter.
+        assert_no_enter(&rows, &mut walk);
     }
 
-    /// The money-safety regression: an EMPTY parse used to read as "nothing is
-    /// focused" (`all()` is vacuously true), so this guard FAILED OPEN. Every
-    /// unparseable / partial / blank frame must refuse Enter.
+    /// A Down press that does not move focus must abort, not be read as arrival
+    /// at the toggle.
     #[test]
-    fn focus_is_on_toggle_fails_closed_on_unparseable_screens() {
-        // Empty and blank/whitespace-only frames.
-        assert!(!focus_is_on_toggle(&[]));
-        assert!(!focus_is_on_toggle(&["".to_string(), "   ".to_string()]));
-        // Garbled / mid-clear frame: chrome but no recognisable picker shape.
+    fn toggle_walk_aborts_when_a_press_does_not_move_focus() {
+        let start = load_fixture("0227-synthetic-splash-collapsed-120x40");
+        let mut walk = ToggleWalk::new();
+        assert_eq!(toggle_walk_next(&start, &mut walk), ToggleStep::Down);
+        walk.record_down();
+        // The screen is unchanged: focus did not move off the model row.
+        assert!(matches!(
+            toggle_walk_next(&start, &mut walk),
+            ToggleStep::Abort(_)
+        ));
+    }
+
+    /// Focus landing on a row other than the one the ring predicted.
+    #[test]
+    fn toggle_walk_aborts_when_focus_jumps_to_an_unexpected_row() {
+        let mut walk = ToggleWalk::new();
+        assert_eq!(
+            toggle_walk_next(&three_models_focused(0), &mut walk),
+            ToggleStep::Down
+        );
+        walk.record_down();
+        // After one press focus must be on row 1, not row 2.
+        assert!(matches!(
+            toggle_walk_next(&three_models_focused(2), &mut walk),
+            ToggleStep::Abort(_)
+        ));
+        // Focus leaving the models entirely before the planned end also aborts.
+        let mut walk = ToggleWalk::new();
+        let _ = toggle_walk_next(&three_models_focused(0), &mut walk);
+        walk.record_down();
+        assert!(matches!(
+            toggle_walk_next(
+                &[
+                    "│   GLM 5.3 Flash · Deep reasoning │".to_string(),
+                    "│   MiMo 2.6 Pro · Balanced │".to_string(),
+                    "│   GPT-6 Luna · Balanced │".to_string(),
+                    "↓  See all 3 models".to_string(),
+                ],
+                &mut walk
+            ),
+            ToggleStep::Abort(_)
+        ));
+    }
+
+    /// The frame stops parsing mid-walk.
+    #[test]
+    fn toggle_walk_aborts_when_the_screen_stops_parsing_mid_walk() {
+        let mut walk = ToggleWalk::new();
+        assert_eq!(
+            toggle_walk_next(&three_models_focused(0), &mut walk),
+            ToggleStep::Down
+        );
+        walk.record_down();
         let garbled = vec![
             String::new(),
             "some half-rendered garbage".to_string(),
             "⎘ Copy invite link  Open Earn ↵".to_string(),
         ];
-        assert!(!focus_is_on_toggle(&garbled));
-        // A model box with no toggle row: not a toggle frame.
-        let no_toggle = vec![
-            "│   Unknown Model · something │".to_string(),
-            "│   5 Freebucks/hr              │".to_string(),
-        ];
-        assert!(!focus_is_on_toggle(&no_toggle));
+        assert!(matches!(
+            toggle_walk_next(&garbled, &mut walk),
+            ToggleStep::Abort(_)
+        ));
     }
 
-    /// A frame where only the toggle parses (e.g. the model box is cut off mid
-    /// render) has NO focus marker anywhere: with no model rows parsed, the
-    /// "no model focused" read is vacuous, so it must refuse.
+    /// The toggle's advertised count cannot disagree with the rendered ring.
     #[test]
-    fn focus_is_on_toggle_fails_closed_when_no_model_row_parses() {
-        assert!(!focus_is_on_toggle(&["↓  See all 3 models".to_string()]));
-        assert!(!focus_is_on_toggle(&["↑  Show fewer".to_string()]));
-        // Even a model-shaped row that the parser cannot read (no ` · ` tagline
-        // separator) leaves the parse empty -> refuse.
-        let cut_off = vec![
-            "│ › GLM 5.3 Flash".to_string(),
-            "↓  See all 3 models".to_string(),
+    fn toggle_walk_aborts_when_the_advertised_count_disagrees_with_the_ring() {
+        let rows = vec![
+            "│ › GLM 5.3 Flash · Deep reasoning │".to_string(),
+            "│   MiMo 2.6 Pro · Balanced │".to_string(),
+            "↓  See all 1 models".to_string(),
         ];
-        assert!(!focus_is_on_toggle(&cut_off));
+        let mut walk = ToggleWalk::new();
+        match toggle_walk_next(&rows, &mut walk) {
+            ToggleStep::Abort(msg) => assert!(msg.contains("advertises"), "unexpected: {msg}"),
+            other => panic!("expected Abort, got {other:?}"),
+        }
+    }
+
+    /// The happy path: a verified start plus validated Down presses arrive at
+    /// the toggle, and only THEN is Enter returned.
+    #[test]
+    fn toggle_walk_enters_only_after_the_validated_walk_reaches_the_toggle() {
+        let start = load_fixture("0227-synthetic-splash-collapsed-120x40");
+        let mut walk = ToggleWalk::new();
+        assert_eq!(toggle_walk_next(&start, &mut walk), ToggleStep::Down);
+        walk.record_down();
+        // After the one validated Down press, the model row is unfocused and
+        // the toggle is the next stop.
+        let after = vec![
+            "│   GLM 5.3 Flash · Deep reasoning · Reasoning: max · Images │".to_string(),
+            "│                             5 Freebucks/hr · Recommended │".to_string(),
+            "↓  See all 12 models".to_string(),
+        ];
+        assert_eq!(toggle_walk_next(&after, &mut walk), ToggleStep::Enter);
+        assert_eq!(walk.presses(), 1, "exactly one validated Down press");
+    }
+
+    /// The expansion walk terminates on the toggle only with a non-empty model
+    /// parse: an empty frame is never read as "nothing is focused".
+    #[test]
+    fn walk_past_last_model_requires_a_non_empty_parse() {
+        assert!(!walk_past_last_model(&["↓  See all 3 models".to_string()]));
+        assert!(!walk_past_last_model(&["↑  Show fewer".to_string()]));
+        assert!(!walk_past_last_model(&[]));
+        // A focused model plus the toggle: not past the last model.
+        assert!(!walk_past_last_model(&[
+            "│ › MiMo 2.6 Pro · Balanced │".to_string(),
+            "↓  See all 3 models".to_string(),
+        ]));
+        // Unfocused model rows plus the toggle: the walk has scrolled past.
+        assert!(walk_past_last_model(&load_fixture(
+            "splash-list-showfewer-120x40"
+        )));
     }
 
     /// Positive evidence: the toggle line itself carries the `›` focus marker.
     /// (The real 0.2.x renderer marks a focused toggle only by colour, which the
     /// PTY layer strips, so this is a forward-compatible path, not the only one.)
     #[test]
-    fn focus_is_on_toggle_accepts_an_explicitly_focused_toggle() {
-        assert!(focus_is_on_toggle(&["›  ↓  See all 3 models".to_string()]));
-        // Corroborated by an unfocused model box.
-        assert!(focus_is_on_toggle(&[
-            "│   MiMo 2.6 Pro · Balanced │".to_string(),
-            "›  ↑  Show fewer".to_string(),
-        ]));
-        // A model row focused AND a marked toggle cannot co-occur; the focused
-        // model wins and the guard refuses.
-        assert!(!focus_is_on_toggle(&[
-            "│ › MiMo 2.6 Pro · Balanced │".to_string(),
-            "›  ↓  See all 3 models".to_string(),
-        ]));
-    }
-
-    /// Documented deviation: the real 0.2.x picker draws the toggle with the
-    /// focus colour/bold (stripped by the PTY layer) instead of `›`, so a frame
-    /// with a parsed-but-unfocused model box plus the toggle IS the
-    /// toggle-focused frame and must be accepted — otherwise the picker could
-    /// never be expanded. Verified against the 0.2.x bundle renderer.
-    #[test]
-    fn focus_is_on_toggle_accepts_the_colour_only_toggle_frame() {
-        let rows = vec![
-            "│   GLM 5.3 Flash · Deep reasoning · Images │".to_string(),
-            "│              5 Freebucks/hr               │".to_string(),
-            "↓  See all 12 models".to_string(),
-        ];
-        assert!(focus_is_on_toggle(&rows));
+    fn toggle_walk_enters_on_an_explicitly_focused_toggle() {
+        assert_eq!(
+            toggle_walk_next(
+                &["›  ↓  See all 3 models".to_string()],
+                &mut ToggleWalk::new()
+            ),
+            ToggleStep::Enter
+        );
+        assert_eq!(
+            toggle_walk_next(
+                &[
+                    "│   MiMo 2.6 Pro · Balanced │".to_string(),
+                    "›  ↑  Show fewer".to_string(),
+                ],
+                &mut ToggleWalk::new()
+            ),
+            ToggleStep::Enter
+        );
+        // A model row focused AND a marked toggle cannot co-occur: refuse.
+        assert!(matches!(
+            toggle_walk_next(
+                &[
+                    "│ › MiMo 2.6 Pro · Balanced │".to_string(),
+                    "›  ↓  See all 3 models".to_string(),
+                ],
+                &mut ToggleWalk::new()
+            ),
+            ToggleStep::Abort(_)
+        ));
     }
 
     #[test]
