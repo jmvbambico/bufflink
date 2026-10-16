@@ -78,6 +78,25 @@ Start coding for free
 EOF
 }
 
+# Print the freebuff 0.2.x HOURS gate (bills a session in hours; a turn is
+# refused). Mirrors the real interstitial captured on 2026-10-16 (v0.2.29).
+print_hours_gate() {
+    cat <<'EOF'
+████████████████████████████████████████
+█                                                      █
+█   F  R  E  E  B  U  F  F                            █
+█                                                      █
+████████████████████████████████████████
+
+┌──────────────────────────────────────────────────────┐
+│ Not enough hours for MiMo Fast: an hour on it takes 2 hours.
+│ Choose another model with /model or visit https://freebuff.com/plans. │
+│ Enter: retry  Esc: back to draft                     │
+└──────────────────────────────────────────────────────┘
+ MiMo Fast · /model to change
+EOF
+}
+
 # Print already running dialog
 print_already_running() {
     cat <<'EOF'
@@ -266,6 +285,12 @@ case "${FAKE_FREEBUFF_MODE:-}" in
         # Block forever
         while true; do sleep 1; done
         ;;
+    hours-gate)
+        print_hours_gate
+        # Block forever: the real interstitial waits for Enter/Esc, which
+        # bufflink must NOT send (AGENTS.md: never auto-dismiss an interstitial).
+        while true; do sleep 1; done
+        ;;
     running)
         print_already_running
         # Block forever
@@ -370,6 +395,145 @@ case "${FAKE_FREEBUFF_MODE:-}" in
         }
         while true; do
             idle_prompt || break
+        done
+        ;;
+    list)
+        # 0.2.x-shaped model picker, interactive: blink drives it with Up/Down
+        # and Enter. Enter on a model row is an Enter-guard violation, so the
+        # fake exits 1 to prove blink never sends Enter on a model row.
+        # POSIX sh has no arrays and the shebang is #!/bin/sh (dash on Ubuntu):
+        # keep the ten model display names, in order, as a newline-delimited
+        # list and look each model's cost up by name.
+        MODEL_NAMES='GLM 5.3 Flash
+MiMo 2.6 Pro
+MiMo 2.6 Flash
+GPT-6 Luna
+GPT-6.1 Sol
+DeepSeek V4.1 Flash
+Solar Pro 4
+Solar Mini 4
+Muse Spark 1.3
+Gemini 3.8 Flash'
+        N=$(printf '%s\n' "$MODEL_NAMES" | wc -l | tr -d ' ')
+        model_cost() {
+            case "$1" in
+                'GLM 5.3 Flash') printf '5' ;;
+                'MiMo 2.6 Pro') printf '10' ;;
+                'MiMo 2.6 Flash') printf '3' ;;
+                'GPT-6 Luna') printf '8' ;;
+                'GPT-6.1 Sol') printf '12' ;;
+                'DeepSeek V4.1 Flash') printf '15' ;;
+                'Solar Pro 4') printf '10' ;;
+                'Solar Mini 4') printf '4' ;;
+                'Muse Spark 1.3') printf '6' ;;
+                'Gemini 3.8 Flash') printf '7' ;;
+            esac
+        }
+        ESC=$(printf '\033')
+        CR=$(printf '\r')
+        expanded=0
+        focus=0            # 0..N-1 model index; N = the toggle row (expanded only)
+        focus_toggle=0     # collapsed: 1 means focus on the See-all toggle
+        scroll=0
+        V=$(( (${LINES:-40} - 8) / 2 ))
+        [ "$V" -lt 1 ] && V=1
+        [ "$V" -gt "$N" ] && V=$N
+
+        stty raw -echo 2>/dev/null || true
+
+        draw() {
+            printf '\033[2J\033[H'
+            printf '████████████████████████████████████████\r\n'
+            printf '█                                                      █\r\n'
+            printf '█   F  R  E  E  B  U  F  F                            █\r\n'
+            printf '█                                                      █\r\n'
+            printf '████████████████████████████████████████\r\n'
+            printf '\r\nStart coding for free\r\n\r\n'
+            if [ "$expanded" -eq 0 ]; then
+                first_name=$(printf '%s\n' "$MODEL_NAMES" | head -n 1)
+                if [ "$focus_toggle" -eq 1 ]; then
+                    printf '│   %s · Deep reasoning · Reasoning: max · Images · NEW │\r\n' "$first_name"
+                else
+                    printf '│ › %s · Deep reasoning · Reasoning: max · Images · NEW │\r\n' "$first_name"
+                fi
+                printf '│                               %d Freebucks/hr                                │\r\n' "$(model_cost "$first_name")"
+                printf '↓  See all %d models\r\n' "$N"
+            else
+                end=$(( scroll + V ))
+                [ "$end" -gt "$N" ] && end=$N
+                i=0
+                printf '%s\n' "$MODEL_NAMES" | while IFS= read -r name; do
+                    if [ "$i" -ge "$scroll" ] && [ "$i" -lt "$end" ]; then
+                        if [ "$i" -eq "$focus" ]; then
+                            printf '│ › %s · Deep reasoning · Reasoning: max · Images · NEW │\r\n' "$name"
+                        else
+                            printf '│   %s · Deep reasoning · Reasoning: max · Images · NEW │\r\n' "$name"
+                        fi
+                        printf '│                               %d Freebucks/hr                                │\r\n' "$(model_cost "$name")"
+                    fi
+                    i=$(( i + 1 ))
+                done
+                printf '↑  Show fewer\r\n'
+            fi
+        }
+
+        draw
+        while true; do
+            # Read one byte reliably: `read -n 1` cannot capture '\r' (Enter),
+            # so use `dd bs=1 count=1` which passes every byte through.
+            c=$(dd bs=1 count=1 2>/dev/null) || break
+            [ -n "$c" ] || break # EOF: the PTY was closed.
+            case "$c" in
+                "$ESC")
+                    c2=$(dd bs=1 count=1 2>/dev/null) || continue
+                    [ "$c2" = "[" ] || continue
+                    c3=$(dd bs=1 count=1 2>/dev/null) || continue
+                    case "$c3" in
+                        B)
+                            if [ "$expanded" -eq 0 ]; then
+                                focus_toggle=1
+                            elif [ "$focus" -lt "$N" ]; then
+                                focus=$(( focus + 1 ))
+                                if [ "$focus" -ge $(( scroll + V )) ]; then
+                                    scroll=$(( focus - V + 1 ))
+                                fi
+                            fi
+                            ;;
+                        A)
+                            if [ "$expanded" -eq 0 ]; then
+                                focus_toggle=0
+                            elif [ "$focus" -gt 0 ]; then
+                                focus=$(( focus - 1 ))
+                                if [ "$focus" -lt "$scroll" ]; then
+                                    scroll=$focus
+                                fi
+                            fi
+                            ;;
+                    esac
+                    ;;
+                "$CR")
+                    if [ "$expanded" -eq 0 ]; then
+                        if [ "$focus_toggle" -eq 1 ]; then
+                            expanded=1
+                            focus=0
+                            scroll=0
+                        else
+                            printf 'freebuff: Enter on a model row starts a session and spends Freebucks\n' >&2
+                            exit 1
+                        fi
+                    elif [ "$focus" -eq "$N" ]; then
+                        expanded=0
+                        focus_toggle=0
+                    else
+                        printf 'freebuff: Enter on a model row starts a session and spends Freebucks\n' >&2
+                        exit 1
+                    fi
+                    ;;
+                q|Q)
+                    exit 0
+                    ;;
+            esac
+            draw
         done
         ;;
 esac

@@ -1,0 +1,29 @@
+ ███████████                        ██                 ▄████  ▄██
+ ███▀▀▀▀▀▀▀▀                        ██                 ██    ██▀
+ ███ █████  ██████ ▄█████   ▄████▄  ██████▄  ██   ██ ████████████
+ ███ ███▀▀  ██▀   ███▄▄▄██ ██▄▄▄███ ██   ▀██ ██   ██   ██    ██
+ ███ ███    ███   ███▀▀▀▀▀ ██▀▀▀▀▀  ██▄  ▄██ ██▄  ██   ██    ██
+ ███ ██▀    ██▀    ▀█████   ▀████▀  ██████▀   ▀████▀   ██    ██
+
+ ┌──────────────────────────────────────────────────────────────────┐
+ │ Session active                                                   │
+ │ 1/5 hours remaining                                              │
+ │ MiMo Fast · /model to change                                     │
+ └──────────────────────────────────────────────────────────────────┘
+
+   [06:31 PM]
+   Reply with exactly the single word PONG and nothing else. ⎘
+
+   • Thinking
+     The user wants me to reply with exactly the single word PONG.
+
+   PONG
+
+
+┌──────────────────────────────────────────────────────┐
+│ Not enough hours for MiMo Fast: an hour on it takes 2 hours.
+│ Choose another model with /model or visit https://freebuff.com/plans. │
+│ Enter: retry  Esc: back to draft                     │
+└──────────────────────────────────────────────────────┘
+ MiMo Fast · /tmp/blink-e2e-1792149992031 · /model to change
+ ← for history · ? for help

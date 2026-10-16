@@ -21,10 +21,11 @@ use crate::freebuff::chats::{
 };
 use crate::freebuff::log::{outcome, parse_log_line, saw_auth_failure, LogEvent, TurnOutcome};
 use crate::freebuff::screen::{
-    active_model, check_active_model, classify, input_box_is_empty, input_box_text, match_model,
-    model_rows, pasted_chip_chars, plan_select_step, ModelMatch, ScreenState, SelectStep,
-    SPLASH_ACCEPT_KEY,
+    active_model, check_active_model, classify, input_box_is_empty, input_box_shows,
+    input_box_text, match_model, model_rows, nav_ring, pasted_chip_chars, plan_select_step,
+    prompt_visible, resolve_model_id, ModelMatch, ScreenState, SelectStep, SPLASH_ACCEPT_KEY,
 };
+use crate::freebuff::settings::{settings_path, SettingsPin};
 use crate::freebuff::transcript::{diff, parse_messages, Block, Cursor, Delta, Message};
 use crate::freebuff::{CANCEL_KEY, EXIT_COMMAND};
 use crate::pty::{Key, Pty, PtyConfig, ScreenSnapshot};
@@ -61,11 +62,13 @@ pub struct DriverConfig {
     pub settle_timeout: Duration,
     /// Time to wait after Enter for freebuff to go busy or consume the paste (default: 30s, env: BLINK_SUBMIT_TIMEOUT_S).
     pub submit_timeout: Duration,
-    /// Model to select on the splash (default: None -> freebuff's default,
-    /// env: BLINK_MODEL). A name or id fragment matched case-insensitively
-    /// against the splash's display names (the lineup rotates, so ids are
-    /// never hardcoded); unset means Enter on the collapsed splash. A name
-    /// that matches nothing (or several rows) fails loudly.
+    /// Model to use (default: None -> freebuff's default, env: BLINK_MODEL).
+    /// freebuff 0.2.x has no boot picker; bufflink pins this value into
+    /// `freebuffModel` in the manicode `settings.json` before launch and
+    /// restores the user's original on shutdown. A provider-prefixed id
+    /// (`z-ai/glm-5.3-flash`), a bare id or a display name is accepted and
+    /// resolved to a canonical id when known; an unknown value is written
+    /// as-is and reported clearly if it does not match the running model.
     pub model: Option<String>,
     /// Path to dump the raw startup screen to on a startup timeout (default:
     /// None, env: BLINK_DUMP_SCREEN). Unset means the feature is inert — no
@@ -149,10 +152,29 @@ fn remainder_after_nudge(submit_timeout: Duration) -> Duration {
 fn is_terminal_gate(state: &ScreenState) -> bool {
     matches!(
         state,
-        ScreenState::FreebucksGate { .. }
+        ScreenState::HoursGate { .. }
+            | ScreenState::FreebucksGate { .. }
             | ScreenState::AlreadyRunning
             | ScreenState::Login
             | ScreenState::KickedOut
+    )
+}
+
+/// Human error for the freebuff 0.2.x hours gate. Names the model and the
+/// shortfall when both parsed, and otherwise carries the raw gate line, so the
+/// error is never empty or vague. Always explains that bufflink surfaces the
+/// gate rather than pressing Enter (AGENTS.md: never auto-dismiss an
+/// interstitial; Enter could start a session the user cannot afford).
+fn hours_gate_error(model: Option<&str>, hours: Option<u32>, message: &str) -> anyhow::Error {
+    let head = match (model, hours) {
+        (Some(m), Some(h)) => {
+            format!("freebuff: not enough hours for '{m}' — an hour on it takes {h} hours")
+        }
+        (Some(m), None) => format!("freebuff: not enough hours for '{m}'"),
+        _ => format!("freebuff: not enough hours — {message}"),
+    };
+    anyhow!(
+        "{head}; freebuff refused the turn. Choose a cheaper model with /model or visit https://freebuff.com/plans"
     )
 }
 
@@ -162,6 +184,11 @@ fn is_terminal_gate(state: &ScreenState) -> bool {
 /// resolves the owner pid from `manicode_dir` (read-only).
 fn terminal_gate_error(state: &ScreenState, manicode_dir: &Path) -> Option<anyhow::Error> {
     match state {
+        ScreenState::HoursGate {
+            model,
+            hours,
+            message,
+        } => Some(hours_gate_error(model.as_deref(), *hours, message)),
         ScreenState::FreebucksGate { message } => {
             Some(anyhow!("freebuff: not enough Freebucks — {}", message))
         }
@@ -181,6 +208,26 @@ fn terminal_gate_error(state: &ScreenState, manicode_dir: &Path) -> Option<anyho
             "freebuff: another instance took over this account"
         )),
         _ => None,
+    }
+}
+
+/// A failed settings restore, carrying the backup path captured while the pin
+/// was still held. Keeping the path in the value (rather than re-reading it off
+/// the pin later) means an operator message always names a real file even when a
+/// concurrent restore cleared the pin in between.
+struct PinRestoreFailure {
+    error: anyhow::Error,
+    backup: Option<PathBuf>,
+}
+
+/// Display the backup path for an operator message, NEVER an empty string: an
+/// error that says "the original settings remain in the backup at " is worse
+/// than useless. A path unknown because the pin was already restored is named as
+/// such rather than silently blanked.
+fn backup_display(backup: Option<&Path>) -> String {
+    match backup {
+        Some(path) => path.display().to_string(),
+        None => "<unknown: the pin had already been restored>".to_string(),
     }
 }
 
@@ -296,6 +343,10 @@ struct Session {
 pub struct FreebuffBackend {
     cfg: DriverConfig,
     session: Mutex<Option<Session>>,
+    /// Active model pin on freebuff's `settings.json`, if any. Held so the
+    /// user's original `freebuffModel`/`freebuffModelKey` can be restored on
+    /// shutdown (or on a failed launch).
+    settings_pin: Mutex<Option<SettingsPin>>,
 }
 
 impl FreebuffBackend {
@@ -304,6 +355,7 @@ impl FreebuffBackend {
         Self {
             cfg,
             session: Mutex::new(None),
+            settings_pin: Mutex::new(None),
         }
     }
 
@@ -313,6 +365,90 @@ impl FreebuffBackend {
             .manicode_dir
             .clone()
             .unwrap_or_else(crate::freebuff::chats::manicode_dir)
+    }
+
+    /// Pin `BLINK_MODEL` into freebuff's `settings.json` before launch.
+    ///
+    /// freebuff 0.2.x has no boot model picker; it reads the active model from
+    /// `freebuffModel` at startup. The requested value is resolved to a
+    /// canonical catalog id when known (a display name or bare fragment still
+    /// works), but an unknown-yet-plausible id is written as-is so the running
+    /// model can be checked against it later and reported clearly. Fails loudly
+    /// if the settings file is missing/unparseable or the id is malformed.
+    async fn apply_model_pin(&self, target: &str) -> Result<()> {
+        let id = resolve_model_id(target).unwrap_or(target).to_string();
+        let mut guard = self.settings_pin.lock().await;
+        let pin =
+            guard.get_or_insert_with(|| SettingsPin::new(settings_path(&self.manicode_dir())));
+        pin.pin(&id, None)
+            .with_context(|| format!("freebuff: cannot pin BLINK_MODEL='{target}'"))
+    }
+
+    /// Restore the user's original settings if a pin is applied. A no-op when
+    /// nothing was pinned. Success clears the pin; failure KEEPS it — it holds
+    /// the user's original model, so dropping it here would silently hijack the
+    /// user's choice forever. Returns the restore error so a caller can fold it
+    /// into the error that is already on its way out, alongside the backup path
+    /// captured WHILE the pin was still held: a concurrent successful restore
+    /// clears the pin, so re-reading the path after the lock is released can come
+    /// back empty — an error that names no file is worse than useless.
+    async fn try_restore_pin(&self) -> std::result::Result<(), PinRestoreFailure> {
+        let mut guard = self.settings_pin.lock().await;
+        match guard.as_mut() {
+            None => Ok(()),
+            Some(pin) => {
+                // Capture the backup path BEFORE the pin (and its path) can be
+                // dropped, so the message always names a real file.
+                let backup = Some(pin.backup_path().to_path_buf());
+                match pin.restore() {
+                    Ok(()) => {
+                        *guard = None;
+                        Ok(())
+                    }
+                    Err(error) => Err(PinRestoreFailure { error, backup }),
+                }
+            }
+        }
+    }
+
+    /// Restore the user's original settings after a pin, for exit paths that have
+    /// no error to fold into (shutdown). Errors are logged, not propagated:
+    /// shutdown must proceed.
+    ///
+    /// The on-disk `settings.json.blink-backup` — kept current at pin time — is
+    /// the artefact that holds the user's original model if no further exit path
+    /// runs before the process dies, and the warning names that exact file.
+    async fn restore_settings_pin(&self) {
+        if let Err(failure) = self.try_restore_pin().await {
+            let backup = backup_display(failure.backup.as_deref());
+            warn!(
+                error = %format!("{:#}", failure.error),
+                backup = %backup,
+                "failed to restore freebuff settings; keeping the pin to retry on shutdown \
+                 — the user's original model is preserved in the backup file"
+            );
+        }
+    }
+
+    /// Fold a restore attempt into the error that is already on its way out, so
+    /// that no exit path between the pin and the process exiting can leave the
+    /// user's settings modified. The original error stays PRIMARY — the cause of
+    /// the turn failing must never be masked by a restore failure — and the
+    /// restore failure is appended, naming the backup the user can recover from.
+    /// On success the pin is cleared and the backup removed; on failure both are
+    /// kept for a later retry.
+    async fn fold_restore_error(&self, err: anyhow::Error) -> anyhow::Error {
+        match self.try_restore_pin().await {
+            Ok(()) => err,
+            Err(failure) => {
+                let backup = backup_display(failure.backup.as_deref());
+                let restore_err = failure.error;
+                anyhow!(
+                    "{err:#}; additionally, the user's freebuff settings were NOT restored: \
+                     {restore_err:#}. The original settings remain in the backup at {backup}"
+                )
+            }
+        }
     }
 
     /// Build PtyConfig from DriverConfig and cwd.
@@ -814,7 +950,19 @@ impl FreebuffBackend {
                         let snap_text = snap.text();
                         let rows = model_rows(&snap.rows);
                         let show_fewer = snap.rows.iter().any(|r| r.contains("Show fewer"));
-                        match plan_select_step(target, &rows, show_fewer, model_presses) {
+                        // Bound the walk by the real focus ring (models + toggle)
+                        // instead of a fixed max-presses constant; fall back to
+                        // the visible rows when no toggle line is rendered.
+                        let ring_len = nav_ring(&snap.rows)
+                            .map(|r| r.ring_len)
+                            .unwrap_or_else(|| rows.len() + usize::from(show_fewer));
+                        match plan_select_step(
+                            target,
+                            &rows,
+                            show_fewer,
+                            ring_len as u32,
+                            model_presses,
+                        ) {
                             SelectStep::Accept => {
                                 let idx = rows.iter().position(|r| r.focused).expect(
                                     "plan_select_step returns Accept only when a row is focused",
@@ -874,6 +1022,12 @@ impl FreebuffBackend {
                 // prompt path cannot drift from these messages. Login is a hard
                 // precondition the agent never satisfies (AGENTS.md: it never
                 // logs in or drives the auth flow).
+                ScreenState::HoursGate { .. } => {
+                    info!("startup: hours gate detected");
+                    let _ = pty.kill().await;
+                    return Err(terminal_gate_error(&state, &self.manicode_dir())
+                        .expect("HoursGate is terminal (see is_terminal_gate)"));
+                }
                 ScreenState::FreebucksGate { .. } => {
                     info!("startup: freebucks gate detected");
                     let _ = pty.kill().await;
@@ -939,17 +1093,14 @@ impl FreebuffBackend {
         info!("prompt: pasting text ({} chars)", text.len());
         pty.paste(text).await?;
 
-        // Wait for input box to show the text (first 20 chars) or a pasted chip
+        // Wait for the input box to show the text (first 20 chars) or a pasted
+        // chip. The prompt is matched as a PREFIX across soft-wrapped rows and
+        // the box is located structurally, so a long prompt the TUI wrapped or
+        // a promo banner above the box does not defeat confirmation.
         let preview: String = text.chars().take(20).collect();
         match pty
             .wait_for(
-                |s| {
-                    let in_box = input_box_text(&s.rows)
-                        .map(|t| t.contains(&preview))
-                        .unwrap_or(false);
-                    let chip = pasted_chip_chars(&s.rows).is_some();
-                    in_box || chip
-                },
+                |s| prompt_visible(&s.rows, &preview),
                 Duration::from_secs(5),
             )
             .await
@@ -984,9 +1135,7 @@ impl FreebuffBackend {
             let state = classify(&s.rows);
             is_terminal_gate(&state)
                 || matches!(state, ScreenState::Busy { .. })
-                || (!input_box_text(&s.rows)
-                    .map(|t| t.contains(&preview))
-                    .unwrap_or(false)
+                || (!input_box_shows(&s.rows, &preview)
                     && pasted_chip_chars(&s.rows).is_none()
                     && input_box_is_empty(&s.rows))
         };
@@ -1039,71 +1188,284 @@ impl FreebuffBackend {
         }
         Ok(())
     }
+
+    /// The body of `new_session`, minus the error funnel: every `Err` it returns
+    /// is routed back through [`Self::fold_restore_error`], so no early return
+    /// between the settings pin and a live session can skip the restore.
+    async fn new_session_inner(&self, cwd: PathBuf) -> Result<String> {
+        // Check if session already exists
+        if let Some(session) = self.session.lock().await.as_ref() {
+            info!(
+                "new_session: returning existing session {}",
+                session.session_id
+            );
+            return Ok(session.session_id.clone());
+        }
+
+        let manicode_dir_opt = self.cfg.manicode_dir.as_deref();
+        let chats_dir_path = chats_dir(&cwd, manicode_dir_opt);
+        info!(cwd = %cwd.display(), chats_dir = %chats_dir_path.display(), "new_session: starting");
+
+        // Snapshot chats dir before launch
+        let initial_snapshot = snapshot(&chats_dir_path)?;
+
+        // Pin BLINK_MODEL into settings.json before freebuff starts: 0.2.x
+        // reads the active model from there, so a resumed hour only counts
+        // as a match if the pin is already in place.
+        if let Some(target) = self.cfg.model.clone() {
+            self.apply_model_pin(&target).await?;
+        }
+
+        // Spawn freebuff in PTY. A spawn failure returns through the funnel,
+        // which restores the pin applied above.
+        let pty_config = self.build_pty_config(&cwd);
+        let pty = Arc::new(Pty::spawn(pty_config).await?);
+        let child_pid = pty.pid().unwrap_or(0);
+
+        // Run startup sequence. Every fatal gate and timeout here — including
+        // the hours/freebucks/login terminal gates — returns through the funnel.
+        if let Err(e) = self
+            .run_startup(&pty, &cwd, &chats_dir_path, &initial_snapshot)
+            .await
+        {
+            let _ = pty.kill().await;
+            return Err(e);
+        }
+
+        // Create session ID
+        let session_id = format!(
+            "blink-{}-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system time before epoch")
+                .as_millis(),
+            child_pid
+        );
+        info!(session_id = %session_id, "new_session: session created");
+
+        let session = Session {
+            pty,
+            chats_dir: chats_dir_path,
+            initial_snapshot,
+            chat_dir: Arc::new(Mutex::new(None)),
+            transcript_cursor: Arc::new(Mutex::new(Cursor::new())),
+            log_offset: Arc::new(Mutex::new(0)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            session_id: session_id.clone(),
+            parse_failures: Arc::new(Mutex::new(0)),
+            emitted_message_chunk: Arc::new(AtomicBool::new(false)),
+        };
+
+        *self.session.lock().await = Some(session);
+        Ok(session_id)
+    }
+
+    /// The body of `prompt`, minus the error funnel: every `Err` it returns —
+    /// the terminal-gate fail-fast, a submit stall, a turn timeout, a kick-out,
+    /// a transcript parse failure — is routed back through
+    /// [`Self::fold_restore_error`], so the settings pin is restored on all of
+    /// them, not only on a clean shutdown.
+    async fn prompt_inner(
+        &self,
+        session_id: &str,
+        text: String,
+        updates: UpdateSink,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<StopReason> {
+        // Get session and verify ID
+        let session = {
+            let guard = self.session.lock().await;
+            guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("no active session"))?
+                .clone_session_ref()
+        };
+
+        if session.session_id != session_id {
+            return Err(anyhow!(
+                "session id mismatch: expected {}, got {}",
+                session.session_id,
+                session_id
+            ));
+        }
+
+        info!(session_id = %session_id, "prompt: starting");
+        session.emitted_message_chunk.store(false, Ordering::SeqCst);
+
+        let pty = session.pty.clone();
+
+        // Submit the prompt
+        self.submit_prompt(&pty, &text).await?;
+
+        // Locate chat dir if not already known
+        let chat_dir = {
+            let mut chat_dir_guard = session.chat_dir.lock().await;
+            if chat_dir_guard.is_none() {
+                info!("prompt: locating new chat directory");
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if let Some(dir) =
+                        newest_new_chat(&session.chats_dir, &session.initial_snapshot)?
+                    {
+                        info!(chat_dir = %dir.display(), "prompt: found chat dir");
+                        *chat_dir_guard = Some(dir.clone());
+                        break dir;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(anyhow!("timeout waiting for chat directory to appear"));
+                    }
+                    tokio::time::sleep(self.cfg.poll_interval).await;
+                }
+            } else {
+                chat_dir_guard.as_ref().unwrap().clone()
+            }
+        };
+
+        // Turn loop
+        let turn_deadline = Instant::now() + self.cfg.turn_timeout;
+        let mut cancelled_sent = false;
+        let mut turn_events = Vec::new();
+
+        loop {
+            if Instant::now() >= turn_deadline {
+                return Err(anyhow!("turn timeout after {:?}", self.cfg.turn_timeout));
+            }
+
+            // Check for cancel
+            if *cancel.borrow() && !cancelled_sent {
+                info!("prompt: cancel requested, sending Esc");
+                pty.write(CANCEL_KEY.as_bytes())
+                    .await
+                    .context("freebuff: failed to send Esc for session/cancel")?;
+                session.cancelled.store(true, Ordering::SeqCst);
+                cancelled_sent = true;
+            }
+
+            // Check for errors (kicked out, child exited)
+            self.check_errors(&pty).await?;
+
+            // Read log events for this turn
+            {
+                let mut offset_guard = session.log_offset.lock().await;
+                let new_events = self.read_log_events(&chat_dir, &mut offset_guard).await?;
+                turn_events.extend(new_events);
+            }
+
+            // Check turn outcome from log events
+            if let Some(turn_outcome) = outcome(&turn_events) {
+                // Wait for transcript to settle before final flush
+                let settle_start = Instant::now();
+                while settle_start.elapsed() < self.cfg.settle_timeout {
+                    let transcript_path = chat_dir.join(CHAT_MESSAGES);
+                    if let Ok(content) = fs::read_to_string(&transcript_path).await {
+                        if let Ok(messages) = parse_messages(&content) {
+                            if let Some(Message::Ai {
+                                blocks,
+                                is_complete,
+                                ..
+                            }) = messages.last()
+                            {
+                                let has_content = blocks.iter().any(|b| {
+                                    matches!(b, Block::Text { text_type, .. } if text_type != "reasoning")
+                                        || matches!(b, Block::Tool { .. })
+                                });
+                                match turn_outcome {
+                                    TurnOutcome::Completed if *is_complete && has_content => break,
+                                    TurnOutcome::Interrupted if !blocks.is_empty() => break,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(self.cfg.poll_interval).await;
+                }
+                let settle_elapsed = settle_start.elapsed();
+                info!(
+                    elapsed_ms = settle_elapsed.as_millis(),
+                    "transcript settled"
+                );
+
+                // Flush one last transcript diff (final flush)
+                {
+                    let mut cursor_guard = session.transcript_cursor.lock().await;
+                    self.process_transcript_deltas(
+                        &chat_dir,
+                        &mut cursor_guard,
+                        &updates,
+                        &session.parse_failures,
+                        &session.emitted_message_chunk,
+                        true, // is_final_flush
+                    )
+                    .await?;
+                }
+
+                match turn_outcome {
+                    TurnOutcome::Completed => {
+                        info!("prompt: turn completed");
+                        // Check if any AgentMessageChunk was emitted during this turn
+                        if !session.emitted_message_chunk.load(Ordering::SeqCst) {
+                            return Err(anyhow!(
+                                "freebuff finished the turn but no reply text was found in the transcript"
+                            ));
+                        }
+                        // Reset for next turn
+                        session.emitted_message_chunk.store(false, Ordering::SeqCst);
+                        return Ok(if cancelled_sent {
+                            StopReason::Cancelled
+                        } else {
+                            StopReason::EndTurn
+                        });
+                    }
+                    TurnOutcome::Interrupted => {
+                        info!("prompt: turn interrupted");
+                        // Reset for next turn
+                        session.emitted_message_chunk.store(false, Ordering::SeqCst);
+                        return Ok(StopReason::Cancelled);
+                    }
+                    TurnOutcome::Error { message } => {
+                        return Err(anyhow!("freebuff turn failed: {}", message));
+                    }
+                }
+            }
+
+            // Process transcript deltas (regular poll)
+            {
+                let mut cursor_guard = session.transcript_cursor.lock().await;
+                self.process_transcript_deltas(
+                    &chat_dir,
+                    &mut cursor_guard,
+                    &updates,
+                    &session.parse_failures,
+                    &session.emitted_message_chunk,
+                    false, // not final flush
+                )
+                .await?;
+            }
+
+            tokio::time::sleep(self.cfg.poll_interval).await;
+        }
+    }
 }
 
 impl Backend for FreebuffBackend {
+    /// Restore the settings pin on every exit path: `new_session_inner` returns
+    /// through this funnel, so a failed launch — a spawn error, a startup
+    /// timeout, or a terminal gate such as the hours gate — can never leave the
+    /// pin applied.
     fn new_session(&self, cwd: PathBuf) -> impl Future<Output = Result<String>> + Send {
         let this = self;
         async move {
-            // Check if session already exists
-            if let Some(session) = this.session.lock().await.as_ref() {
-                info!(
-                    "new_session: returning existing session {}",
-                    session.session_id
-                );
-                return Ok(session.session_id.clone());
+            match this.new_session_inner(cwd).await {
+                Ok(session_id) => Ok(session_id),
+                Err(e) => Err(this.fold_restore_error(e).await),
             }
-
-            let manicode_dir_opt = this.cfg.manicode_dir.as_deref();
-            let chats_dir_path = chats_dir(&cwd, manicode_dir_opt);
-            info!(cwd = %cwd.display(), chats_dir = %chats_dir_path.display(), "new_session: starting");
-
-            // Snapshot chats dir before launch
-            let initial_snapshot = snapshot(&chats_dir_path)?;
-
-            // Spawn freebuff in PTY
-            let pty_config = this.build_pty_config(&cwd);
-            let pty = Arc::new(Pty::spawn(pty_config).await?);
-            let child_pid = pty.pid().unwrap_or(0);
-
-            // Run startup sequence
-            if let Err(e) = this
-                .run_startup(&pty, &cwd, &chats_dir_path, &initial_snapshot)
-                .await
-            {
-                let _ = pty.kill().await;
-                return Err(e);
-            }
-
-            // Create session ID
-            let session_id = format!(
-                "blink-{}-{}",
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .expect("system time before epoch")
-                    .as_millis(),
-                child_pid
-            );
-            info!(session_id = %session_id, "new_session: session created");
-
-            let session = Session {
-                pty,
-                chats_dir: chats_dir_path,
-                initial_snapshot,
-                chat_dir: Arc::new(Mutex::new(None)),
-                transcript_cursor: Arc::new(Mutex::new(Cursor::new())),
-                log_offset: Arc::new(Mutex::new(0)),
-                cancelled: Arc::new(AtomicBool::new(false)),
-                session_id: session_id.clone(),
-                parse_failures: Arc::new(Mutex::new(0)),
-                emitted_message_chunk: Arc::new(AtomicBool::new(false)),
-            };
-
-            *this.session.lock().await = Some(session);
-            Ok(session_id)
         }
     }
 
+    /// Restore the settings pin on every exit path: `prompt_inner` returns
+    /// through this funnel, so the terminal-gate fail-fast that ends a turn —
+    /// and every other early return in the turn loop — restores the user's
+    /// settings before the error leaves the backend.
     fn prompt(
         &self,
         session_id: &str,
@@ -1113,179 +1475,9 @@ impl Backend for FreebuffBackend {
     ) -> impl Future<Output = Result<StopReason>> + Send {
         let this = self;
         async move {
-            // Get session and verify ID
-            let session = {
-                let guard = this.session.lock().await;
-                guard
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("no active session"))?
-                    .clone_session_ref()
-            };
-
-            if session.session_id != session_id {
-                return Err(anyhow!(
-                    "session id mismatch: expected {}, got {}",
-                    session.session_id,
-                    session_id
-                ));
-            }
-
-            info!(session_id = %session_id, "prompt: starting");
-            session.emitted_message_chunk.store(false, Ordering::SeqCst);
-
-            let pty = session.pty.clone();
-
-            // Submit the prompt
-            this.submit_prompt(&pty, &text).await?;
-
-            // Locate chat dir if not already known
-            let chat_dir = {
-                let mut chat_dir_guard = session.chat_dir.lock().await;
-                if chat_dir_guard.is_none() {
-                    info!("prompt: locating new chat directory");
-                    let deadline = Instant::now() + Duration::from_secs(30);
-                    loop {
-                        if let Some(dir) =
-                            newest_new_chat(&session.chats_dir, &session.initial_snapshot)?
-                        {
-                            info!(chat_dir = %dir.display(), "prompt: found chat dir");
-                            *chat_dir_guard = Some(dir.clone());
-                            break dir;
-                        }
-                        if Instant::now() >= deadline {
-                            return Err(anyhow!("timeout waiting for chat directory to appear"));
-                        }
-                        tokio::time::sleep(this.cfg.poll_interval).await;
-                    }
-                } else {
-                    chat_dir_guard.as_ref().unwrap().clone()
-                }
-            };
-
-            // Turn loop
-            let turn_deadline = Instant::now() + this.cfg.turn_timeout;
-            let mut cancelled_sent = false;
-            let mut turn_events = Vec::new();
-
-            loop {
-                if Instant::now() >= turn_deadline {
-                    return Err(anyhow!("turn timeout after {:?}", this.cfg.turn_timeout));
-                }
-
-                // Check for cancel
-                if *cancel.borrow() && !cancelled_sent {
-                    info!("prompt: cancel requested, sending Esc");
-                    pty.write(CANCEL_KEY.as_bytes())
-                        .await
-                        .context("freebuff: failed to send Esc for session/cancel")?;
-                    session.cancelled.store(true, Ordering::SeqCst);
-                    cancelled_sent = true;
-                }
-
-                // Check for errors (kicked out, child exited)
-                this.check_errors(&pty).await?;
-
-                // Read log events for this turn
-                {
-                    let mut offset_guard = session.log_offset.lock().await;
-                    let new_events = this.read_log_events(&chat_dir, &mut offset_guard).await?;
-                    turn_events.extend(new_events);
-                }
-
-                // Check turn outcome from log events
-                if let Some(turn_outcome) = outcome(&turn_events) {
-                    // Wait for transcript to settle before final flush
-                    let settle_start = Instant::now();
-                    while settle_start.elapsed() < this.cfg.settle_timeout {
-                        let transcript_path = chat_dir.join(CHAT_MESSAGES);
-                        if let Ok(content) = fs::read_to_string(&transcript_path).await {
-                            if let Ok(messages) = parse_messages(&content) {
-                                if let Some(Message::Ai {
-                                    blocks,
-                                    is_complete,
-                                    ..
-                                }) = messages.last()
-                                {
-                                    let has_content = blocks.iter().any(|b| {
-                                        matches!(b, Block::Text { text_type, .. } if text_type != "reasoning")
-                                            || matches!(b, Block::Tool { .. })
-                                    });
-                                    match turn_outcome {
-                                        TurnOutcome::Completed if *is_complete && has_content => {
-                                            break
-                                        }
-                                        TurnOutcome::Interrupted if !blocks.is_empty() => break,
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        tokio::time::sleep(this.cfg.poll_interval).await;
-                    }
-                    let settle_elapsed = settle_start.elapsed();
-                    info!(
-                        elapsed_ms = settle_elapsed.as_millis(),
-                        "transcript settled"
-                    );
-
-                    // Flush one last transcript diff (final flush)
-                    {
-                        let mut cursor_guard = session.transcript_cursor.lock().await;
-                        this.process_transcript_deltas(
-                            &chat_dir,
-                            &mut cursor_guard,
-                            &updates,
-                            &session.parse_failures,
-                            &session.emitted_message_chunk,
-                            true, // is_final_flush
-                        )
-                        .await?;
-                    }
-
-                    match turn_outcome {
-                        TurnOutcome::Completed => {
-                            info!("prompt: turn completed");
-                            // Check if any AgentMessageChunk was emitted during this turn
-                            if !session.emitted_message_chunk.load(Ordering::SeqCst) {
-                                return Err(anyhow!(
-                                    "freebuff finished the turn but no reply text was found in the transcript"
-                                ));
-                            }
-                            // Reset for next turn
-                            session.emitted_message_chunk.store(false, Ordering::SeqCst);
-                            return Ok(if cancelled_sent {
-                                StopReason::Cancelled
-                            } else {
-                                StopReason::EndTurn
-                            });
-                        }
-                        TurnOutcome::Interrupted => {
-                            info!("prompt: turn interrupted");
-                            // Reset for next turn
-                            session.emitted_message_chunk.store(false, Ordering::SeqCst);
-                            return Ok(StopReason::Cancelled);
-                        }
-                        TurnOutcome::Error { message } => {
-                            return Err(anyhow!("freebuff turn failed: {}", message));
-                        }
-                    }
-                }
-
-                // Process transcript deltas (regular poll)
-                {
-                    let mut cursor_guard = session.transcript_cursor.lock().await;
-                    this.process_transcript_deltas(
-                        &chat_dir,
-                        &mut cursor_guard,
-                        &updates,
-                        &session.parse_failures,
-                        &session.emitted_message_chunk,
-                        false, // not final flush
-                    )
-                    .await?;
-                }
-
-                tokio::time::sleep(this.cfg.poll_interval).await;
+            match this.prompt_inner(session_id, text, updates, cancel).await {
+                Ok(stop_reason) => Ok(stop_reason),
+                Err(e) => Err(this.fold_restore_error(e).await),
             }
         }
     }
@@ -1300,6 +1492,7 @@ impl Backend for FreebuffBackend {
 
             let Some(session) = session else {
                 info!("shutdown: no session to shut down");
+                this.restore_settings_pin().await;
                 return;
             };
 
@@ -1340,7 +1533,41 @@ impl Backend for FreebuffBackend {
             }
             let _ = pty.kill().await;
 
+            // Put the user's settings back now that freebuff has exited.
+            this.restore_settings_pin().await;
+
             info!("shutdown: complete");
+        }
+    }
+}
+
+/// Last-resort settings restore when the backend itself is dropped.
+///
+/// The `prompt`/`new_session` funnels run `fold_restore_error` on any `Result`,
+/// but a CANCELLED or ABORTED future never returns a `Result` — cancellation
+/// drops the future and the funnel never executes. `session/cancel` does not drop
+/// the future (it only flips the cancel `watch`, and the turn loop returns
+/// through the funnel), and the ACP abort path on stdin EOF calls
+/// `shutdown()` immediately afterwards, which restores — so the funnel covers
+/// those. This drop guard covers the residue: a backend dropped WITHOUT
+/// `shutdown()` ever running. `SettingsPin::restore` is synchronous (std `fs`)
+/// and idempotent, and `try_lock` keeps a drop on a contended mutex from blocking
+/// or panicking. If it cannot restore, the on-disk `settings.json.blink-backup`
+/// remains the documented recovery path.
+impl Drop for FreebuffBackend {
+    fn drop(&mut self) {
+        let Ok(mut guard) = self.settings_pin.try_lock() else {
+            return;
+        };
+        if let Some(pin) = guard.as_mut() {
+            if let Err(e) = pin.restore() {
+                warn!(
+                    error = %format!("{e:#}"),
+                    backup = %backup_display(Some(pin.backup_path())),
+                    "last-resort settings restore on drop failed; keeping the pin's backup as \
+                     the recovery path"
+                );
+            }
         }
     }
 }
@@ -1405,6 +1632,7 @@ fn tool_kind(tool_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::freebuff::settings::backup_path;
     use std::env;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -1522,6 +1750,404 @@ mod tests {
         assert_eq!(id1, id2);
 
         // Cleanup
+        backend.shutdown().await;
+    }
+
+    /// Seed `manicode_dir/settings.json` with a realistic freebuff settings file.
+    fn write_settings(manicode_dir: &Path, value: serde_json::Value) {
+        let path = settings_path(manicode_dir);
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    fn read_settings(manicode_dir: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(settings_path(manicode_dir)).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn settings_pin_is_written_on_start_and_restored_on_shutdown() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(
+            &temp_dir,
+            serde_json::json!({
+                "mode": "DEFAULT",
+                "adsEnabled": true,
+                "freebuffModel": "mimo/mimo-v2.5",
+                "freebuffModelKey": "m-00032eaeec"
+            }),
+        );
+
+        // 'z-ai/glm-5.3-flash' is the model the fake's splash offers, so the
+        // launch reaches Idle; the pin still has to change the settings file.
+        let mut cfg = test_config(&temp_dir, None);
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        let backend = FreebuffBackend::new(cfg);
+
+        // The pin is applied before launch: while the session is up the
+        // settings file carries the requested model and no stale pick key.
+        let _session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+        let pinned = read_settings(&temp_dir);
+        assert_eq!(pinned["freebuffModel"], "z-ai/glm-5.3-flash");
+        assert!(pinned.get("freebuffModelKey").is_none());
+        assert_eq!(pinned["mode"], "DEFAULT");
+        assert_eq!(pinned["adsEnabled"], true);
+
+        // Shutdown puts the user's originals back.
+        backend.shutdown().await;
+        let restored = read_settings(&temp_dir);
+        assert_eq!(restored["freebuffModel"], "mimo/mimo-v2.5");
+        assert_eq!(restored["freebuffModelKey"], "m-00032eaeec");
+        assert_eq!(restored["mode"], "DEFAULT");
+    }
+
+    /// The regression this work fixes: a turn that aborts down the terminal-gate
+    /// / fail-fast path must restore the user's settings byte-for-byte, exactly
+    /// like a clean shutdown. Before the fix the pin was restored ONLY on
+    /// shutdown, so a fail-fast turn left the user's live settings.json modified
+    /// (freebuffModelKey dropped) while they run freebuff interactively.
+    #[tokio::test]
+    async fn settings_pin_is_restored_byte_for_byte_on_prompt_terminal_gate() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(
+            &temp_dir,
+            serde_json::json!({
+                "mode": "DEFAULT",
+                "adsEnabled": true,
+                "freebuffModel": "mimo/mimo-v2.5",
+                "freebuffModelKey": "m-00032eaeec"
+            }),
+        );
+        let original_bytes = std::fs::read(settings_path(&temp_dir)).unwrap();
+        let backup = backup_path(&settings_path(&temp_dir));
+
+        // 'z-ai/glm-5.3-flash' is the model the fake's splash offers, so startup
+        // reaches Idle; 'prompt-gate' shows the Freebucks gate once the prompt is
+        // submitted — the path the real e2e run aborted down.
+        let mut cfg = test_config(&temp_dir, Some("prompt-gate"));
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+        assert_eq!(
+            read_settings(&temp_dir)["freebuffModel"],
+            "z-ai/glm-5.3-flash"
+        );
+        assert!(backup.exists(), "the pin must have captured a backup");
+
+        let (result, _updates) = run_prompt_collect(&backend, &session_id, "hello").await;
+        let err = result
+            .expect_err("prompt must fail fast on the gate")
+            .to_string();
+        assert!(err.contains("not enough Freebucks"), "gate error: {err}");
+
+        assert_eq!(
+            std::fs::read(settings_path(&temp_dir)).unwrap(),
+            original_bytes,
+            "the terminal-gate abort must restore settings byte-for-byte"
+        );
+        assert!(
+            backend.settings_pin.lock().await.is_none(),
+            "a successful restore must clear the pin"
+        );
+        assert!(
+            !backup.exists(),
+            "a successful restore must remove the backup"
+        );
+
+        backend.shutdown().await;
+    }
+
+    /// The generic submit-timeout path is another early return between the pin
+    /// and the process exiting; it must restore too.
+    #[tokio::test]
+    async fn settings_pin_is_restored_on_prompt_submit_stall() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(
+            &temp_dir,
+            serde_json::json!({
+                "freebuffModel": "mimo/mimo-v2.5",
+                "freebuffModelKey": "m-00032eaeec",
+                "mode": "DEFAULT"
+            }),
+        );
+        let original_bytes = std::fs::read(settings_path(&temp_dir)).unwrap();
+        let backup = backup_path(&settings_path(&temp_dir));
+
+        let mut cfg = test_config(&temp_dir, Some("prompt-stall"));
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        cfg.submit_timeout = Duration::from_secs(3);
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+        let (result, _updates) = run_prompt_collect(&backend, &session_id, "hello-stall").await;
+        let err = result
+            .expect_err("prompt must time out on a non-gate stall")
+            .to_string();
+        assert!(err.contains("neither went busy"), "stall error: {err}");
+
+        assert_eq!(
+            std::fs::read(settings_path(&temp_dir)).unwrap(),
+            original_bytes,
+            "the submit-timeout abort must restore settings byte-for-byte"
+        );
+        assert!(backend.settings_pin.lock().await.is_none());
+        assert!(!backup.exists());
+
+        backend.shutdown().await;
+    }
+
+    /// A transcript parse failure on the final flush is a third early-return
+    /// path; the pin must be restored there as well.
+    #[tokio::test]
+    async fn settings_pin_is_restored_on_prompt_parse_error() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(
+            &temp_dir,
+            serde_json::json!({
+                "freebuffModel": "mimo/mimo-v2.5",
+                "freebuffModelKey": "m-00032eaeec",
+                "mode": "DEFAULT"
+            }),
+        );
+        let original_bytes = std::fs::read(settings_path(&temp_dir)).unwrap();
+        let backup = backup_path(&settings_path(&temp_dir));
+
+        let mut cfg = test_config(&temp_dir, Some("unparsable"));
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+        let (result, _updates) = run_prompt_collect(&backend, &session_id, "test").await;
+        let err = result
+            .expect_err("prompt must fail on the unparsable transcript")
+            .to_string();
+        assert!(
+            err.contains("freebuff transcript could not be parsed"),
+            "parse error: {err}"
+        );
+
+        assert_eq!(
+            std::fs::read(settings_path(&temp_dir)).unwrap(),
+            original_bytes,
+            "the parse-error abort must restore settings byte-for-byte"
+        );
+        assert!(backend.settings_pin.lock().await.is_none());
+        assert!(!backup.exists());
+
+        backend.shutdown().await;
+    }
+
+    /// The STARTUP terminal gate is another exit path between the pin and a live
+    /// session; the funnel must restore there too.
+    #[tokio::test]
+    async fn settings_pin_is_restored_when_startup_aborts_on_terminal_gate() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(
+            &temp_dir,
+            serde_json::json!({
+                "freebuffModel": "mimo/mimo-v2.5",
+                "freebuffModelKey": "m-00032eaeec",
+                "mode": "DEFAULT"
+            }),
+        );
+        let original_bytes = std::fs::read(settings_path(&temp_dir)).unwrap();
+        let backup = backup_path(&settings_path(&temp_dir));
+
+        let mut cfg = test_config(&temp_dir, Some("gate"));
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        let backend = FreebuffBackend::new(cfg);
+
+        let err = backend
+            .new_session(temp_dir.clone())
+            .await
+            .expect_err("new_session must fail on the startup gate")
+            .to_string();
+        assert!(err.contains("not enough Freebucks"), "gate error: {err}");
+
+        assert_eq!(
+            std::fs::read(settings_path(&temp_dir)).unwrap(),
+            original_bytes,
+            "the startup-gate abort must restore settings byte-for-byte"
+        );
+        assert!(backend.settings_pin.lock().await.is_none());
+        assert!(!backup.exists());
+
+        backend.shutdown().await;
+    }
+
+    /// A restore that fails on a fail-fast path must NOT mask the cause of the
+    /// turn failing: the gate error stays primary, the restore failure is
+    /// surfaced alongside it, and the backup is LEFT IN PLACE as the user's only
+    /// recovery path.
+    #[tokio::test]
+    async fn failed_restore_on_abort_keeps_the_backup_and_surfaces_both_errors() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(
+            &temp_dir,
+            serde_json::json!({
+                "freebuffModel": "mimo/mimo-v2.5",
+                "freebuffModelKey": "m-00032eaeec",
+                "mode": "DEFAULT"
+            }),
+        );
+
+        let mut cfg = test_config(&temp_dir, Some("prompt-gate"));
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        let backend = FreebuffBackend::new(cfg);
+
+        let session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+        let backup = backup_path(&settings_path(&temp_dir));
+        assert!(backup.exists());
+
+        // Valid JSON, but not an object: the restore cannot succeed.
+        std::fs::write(settings_path(&temp_dir), b"[1,2,3]").unwrap();
+
+        let (result, _updates) = run_prompt_collect(&backend, &session_id, "hello").await;
+        let err = result
+            .expect_err("prompt must fail on the gate")
+            .to_string();
+        assert!(
+            err.contains("not enough Freebucks"),
+            "the primary cause must survive: {err}"
+        );
+        assert!(
+            err.contains("were NOT restored"),
+            "the restore failure must be surfaced: {err}"
+        );
+        assert!(
+            err.contains("blink-backup"),
+            "the recovery file must be named: {err}"
+        );
+        assert!(
+            backup.exists(),
+            "a failed restore must leave the backup in place"
+        );
+        assert!(
+            backend.settings_pin.lock().await.is_some(),
+            "a failed restore must keep the pin for a later retry"
+        );
+
+        backend.shutdown().await;
+    }
+
+    /// A restore that fails (settings.json became a non-object) must NOT drop
+    /// the pin: the user's original model is retained and a later shutdown
+    /// retries it, so their choice is never silently hijacked.
+    #[tokio::test]
+    async fn failed_restore_keeps_the_pin_for_a_later_shutdown() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(
+            &temp_dir,
+            serde_json::json!({
+                "freebuffModel": "mimo/mimo-v2.5",
+                "freebuffModelKey": "m-00032eaeec",
+                "mode": "DEFAULT"
+            }),
+        );
+        let mut cfg = test_config(&temp_dir, None);
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        let backend = FreebuffBackend::new(cfg);
+
+        backend.new_session(temp_dir.clone()).await.unwrap();
+
+        // Valid JSON, but not an object: restore fails.
+        std::fs::write(settings_path(&temp_dir), b"[1,2,3]").unwrap();
+        backend.shutdown().await;
+        assert!(
+            backend.settings_pin.lock().await.is_some(),
+            "a failed restore must keep the pin so the original can be recovered"
+        );
+
+        // Recover the file; the next shutdown retries and restores the original.
+        std::fs::write(
+            settings_path(&temp_dir),
+            serde_json::to_vec_pretty(&serde_json::json!({ "mode": "DEFAULT" })).unwrap(),
+        )
+        .unwrap();
+        backend.shutdown().await;
+        let restored = read_settings(&temp_dir);
+        assert_eq!(restored["freebuffModel"], "mimo/mimo-v2.5");
+        assert_eq!(restored["freebuffModelKey"], "m-00032eaeec");
+        assert!(backend.settings_pin.lock().await.is_none());
+    }
+
+    /// A backend dropped WITHOUT `shutdown()` (the future-less last resort) must
+    /// still put the user's settings back: a cancellation/abort path that never
+    /// ran the restore funnel must not leave the user's live settings modified.
+    #[tokio::test]
+    async fn settings_pin_is_restored_on_drop_without_shutdown() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(
+            &temp_dir,
+            serde_json::json!({
+                "freebuffModel": "mimo/mimo-v2.5",
+                "freebuffModelKey": "m-00032eaeec",
+                "mode": "DEFAULT"
+            }),
+        );
+        let original_bytes = std::fs::read(settings_path(&temp_dir)).unwrap();
+
+        let cfg = test_config(&temp_dir, None);
+        let backend = FreebuffBackend::new(cfg);
+        backend.apply_model_pin("z-ai/glm-5.3-flash").await.unwrap();
+        assert_eq!(
+            read_settings(&temp_dir)["freebuffModel"],
+            "z-ai/glm-5.3-flash"
+        );
+
+        // Drop without ever calling shutdown(): the guard must restore.
+        drop(backend);
+
+        assert_eq!(
+            std::fs::read(settings_path(&temp_dir)).unwrap(),
+            original_bytes,
+            "dropping the backend must restore the user's settings"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_pin_without_settings_file_fails_loudly() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        assert!(!settings_path(&temp_dir).exists());
+
+        let mut cfg = test_config(&temp_dir, None);
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        let backend = FreebuffBackend::new(cfg);
+
+        let err = backend.new_session(temp_dir.clone()).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("settings not found"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !settings_path(&temp_dir).exists(),
+            "a missing settings file must not be created"
+        );
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_model_id_is_rejected_before_launch() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+
+        let mut cfg = test_config(&temp_dir, None);
+        cfg.model = Some("GLM 5.3 Flash!!".to_string());
+        let backend = FreebuffBackend::new(cfg);
+
+        let err = backend.new_session(temp_dir.clone()).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid BLINK_MODEL"),
+            "unexpected error: {err:#}"
+        );
         backend.shutdown().await;
     }
 
@@ -1693,6 +2319,44 @@ mod tests {
         );
     }
 
+    /// The v0.2.29 drift seen live: freebuff bills in hours and refuses with
+    /// `Not enough hours for <Model>`. Startup must fail FAST with a clear
+    /// error naming the model and the shortfall, instead of an opaque null.
+    #[tokio::test]
+    async fn t19_startup_fails_fast_on_hours_gate() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("hours-gate"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let start = Instant::now();
+        let result = backend.new_session(temp_dir.clone()).await;
+        let elapsed = start.elapsed();
+
+        let err = result
+            .expect_err("startup must fail on the hours gate")
+            .to_string();
+        assert!(
+            err.contains("not enough hours"),
+            "must name the gate: {err}"
+        );
+        assert!(err.contains("MiMo Fast"), "must name the model: {err}");
+        assert!(
+            err.contains("takes 2 hours"),
+            "must name the shortfall: {err}"
+        );
+        assert!(
+            !err.contains("startup timeout"),
+            "must fail fast, not time out: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "fast-fail should be well under the {elapsed:?} it took"
+        );
+
+        backend.shutdown().await;
+    }
+
     #[tokio::test]
     async fn t6_fake_freebuff_mode_running_errors_with_already_running() {
         let tmp = test_temp_dir();
@@ -1840,6 +2504,11 @@ mod tests {
     fn terminal_gate_helper_matches_is_terminal_gate() {
         let dir = Path::new("/nonexistent-manicode-dir");
         let terminal = [
+            ScreenState::HoursGate {
+                model: Some("MiMo Fast".to_string()),
+                hours: Some(2),
+                message: "Not enough hours for MiMo Fast: an hour on it takes 2 hours.".to_string(),
+            },
             ScreenState::FreebucksGate {
                 message: "Not enough Freebucks — 5 Freebucks/hr against 0 left.".to_string(),
             },
@@ -1870,6 +2539,46 @@ mod tests {
                 "{state:?} must not map to an error"
             );
         }
+    }
+
+    /// The hours gate's operator error names the model and the shortfall when
+    /// both parsed, and otherwise carries the raw gate line — never empty or
+    /// vague — and never tells the caller bufflink will retry.
+    #[test]
+    fn hours_gate_error_names_model_and_shortfall_or_falls_back_to_raw_line() {
+        let dir = Path::new("/nonexistent-manicode-dir");
+
+        let parsed = ScreenState::HoursGate {
+            model: Some("MiMo Fast".to_string()),
+            hours: Some(2),
+            message: "│ Not enough hours for MiMo Fast: an hour on it takes 2 hours. │".to_string(),
+        };
+        assert!(is_terminal_gate(&parsed));
+        let err = terminal_gate_error(&parsed, dir)
+            .expect("HoursGate is terminal")
+            .to_string();
+        assert!(err.contains("not enough hours"), "{err}");
+        assert!(err.contains("MiMo Fast"), "must name the model: {err}");
+        assert!(
+            err.contains("takes 2 hours"),
+            "must name the shortfall: {err}"
+        );
+        assert!(err.contains("/model"), "must point at the remedy: {err}");
+        assert!(!err.contains("retry"), "must not imply a retry: {err}");
+
+        // Parsing failed: the raw gate line is carried so the error is never vague.
+        let unparsed = ScreenState::HoursGate {
+            model: None,
+            hours: None,
+            message: "Not enough hours for something".to_string(),
+        };
+        let err = terminal_gate_error(&unparsed, dir)
+            .expect("HoursGate is terminal")
+            .to_string();
+        assert!(
+            err.contains("Not enough hours for something"),
+            "must carry the raw gate line: {err}"
+        );
     }
 
     #[tokio::test]
@@ -2282,6 +2991,12 @@ mod tests {
     async fn t13_startup_wait_is_bounded_by_startup_timeout() {
         let tmp = test_temp_dir();
         let temp_dir = tmp.0.clone();
+        // BLINK_MODEL is incidental to this test; the settings file must exist
+        // so the model pin succeeds and the startup-timeout path is reached.
+        write_settings(
+            &temp_dir,
+            serde_json::json!({ "freebuffModel": "z-ai/glm-5.3-flash" }),
+        );
         let mut cfg = test_config(&temp_dir, Some("hang-splash"));
         cfg.model = Some("deepseek-v4-pro".to_string());
         let startup_timeout = Duration::from_secs(2);

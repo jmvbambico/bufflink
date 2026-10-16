@@ -1,0 +1,47 @@
+[
+  {
+    "id": "divider-1700000000000",
+    "variant": "ai",
+    "content": "",
+    "blocks": [
+      {
+        "type": "mode-divider",
+        "mode": "LITE"
+      }
+    ],
+    "timestamp": "08:12 AM"
+  },
+  {
+    "id": "user-1700000000000",
+    "variant": "user",
+    "content": "Reply with exactly the single word PONG and nothing else.",
+    "timestamp": "08:12 AM"
+  },
+  {
+    "id": "ai-1700000000100-normalfx",
+    "variant": "ai",
+    "content": "",
+    "blocks": [
+      {
+        "type": "text",
+        "content": "The user wants the single word PONG, nothing else.",
+        "textType": "reasoning",
+        "thinkingCollapseState": "preview",
+        "thinkingId": "think-normal-1",
+        "thinkingOpen": false
+      },
+      {
+        "type": "text",
+        "content": "PONG",
+        "textType": "text"
+      }
+    ],
+    "timestamp": "08:13 AM",
+    "completionTime": "3s",
+    "credits": 0,
+    "metadata": {
+      "allowInlineAds": true
+    },
+    "isComplete": true
+  }
+]

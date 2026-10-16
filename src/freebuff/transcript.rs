@@ -4,14 +4,25 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Default `textType` for a text block. freebuff omits it entirely for
+/// placeholder blocks (e.g. the `[response interrupted]` block it writes when a
+/// turn is aborted before any text arrived); treat those as regular text.
+fn default_text_type() -> String {
+    "text".to_string()
+}
+
 /// A message in the chat transcript.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "variant", rename_all = "lowercase")]
 pub enum Message {
     /// User message with text content.
-    User { content: String },
+    User {
+        #[serde(default)]
+        content: String,
+    },
     /// AI message with blocks.
     Ai {
+        #[serde(default)]
         blocks: Vec<Block>,
         #[serde(default, rename = "isComplete")]
         is_complete: bool,
@@ -32,8 +43,13 @@ pub enum Message {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Block {
     /// Text block (reasoning or regular text).
+    ///
+    /// `textType` is optional: freebuff 0.2.x writes text/reasoning blocks with
+    /// it, but the aborted-turn placeholder block carries only
+    /// `{"type":"text","content":"..."}`. `content` stays required so a block
+    /// that cannot carry the reply still fails loudly.
     Text {
-        #[serde(rename = "textType")]
+        #[serde(default = "default_text_type", rename = "textType")]
         text_type: String,
         content: String,
     },
@@ -43,6 +59,7 @@ pub enum Block {
         tool_call_id: String,
         #[serde(rename = "toolName")]
         tool_name: String,
+        #[serde(default)]
         input: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
@@ -563,5 +580,161 @@ mod tests {
                 delta
             );
         }
+    }
+
+    #[test]
+    fn parse_0227_interrupted_placeholder_without_text_type() {
+        // Real freebuff 0.2.29 transcript: the aborted-turn placeholder block is
+        // `{"type":"text","content":"[response interrupted]"}` with NO `textType`.
+        // This is the exact file that made the e2e suite fail with
+        // "missing field `textType`".
+        let json = include_str!("../../tests/fixtures/transcript/0227-pong-interrupted.json");
+        let messages = parse_messages(json).expect("interrupted 0.2.x transcript must parse");
+
+        assert_eq!(messages.len(), 3);
+
+        match &messages[2] {
+            Message::Ai {
+                blocks,
+                is_complete,
+                ..
+            } => {
+                assert!(*is_complete);
+                assert_eq!(blocks.len(), 1);
+                // Missing textType defaults to regular text, not reasoning.
+                assert!(matches!(
+                    &blocks[0],
+                    Block::Text { text_type, content }
+                        if text_type == "text" && content == "[response interrupted]"
+                ));
+            }
+            other => panic!("expected AI message, got {other:?}"),
+        }
+
+        // The placeholder must surface as a non-reasoning text delta, never be
+        // silently dropped (the driver needs it to know a reply existed).
+        let (_, deltas) = diff(&Cursor::new(), &messages);
+        assert_eq!(deltas.len(), 1);
+        assert!(matches!(
+            &deltas[0],
+            Delta::Text { reasoning: false, delta } if delta == "[response interrupted]"
+        ));
+    }
+
+    #[test]
+    fn parse_0227_normal_reply() {
+        // Real-derived 0.2.x reply: reasoning block carries the full thinking
+        // field set, the answer block carries `textType: "text"`.
+        let json = include_str!("../../tests/fixtures/transcript/0227-normal-reply.json");
+        let messages = parse_messages(json).expect("normal 0.2.x transcript must parse");
+
+        assert_eq!(messages.len(), 3);
+        match &messages[2] {
+            Message::Ai { blocks, .. } => {
+                assert_eq!(blocks.len(), 2);
+                assert!(matches!(
+                    &blocks[0],
+                    Block::Text { text_type, .. } if text_type == "reasoning"
+                ));
+                assert!(matches!(
+                    &blocks[1],
+                    Block::Text { text_type, content }
+                        if text_type == "text" && content == "PONG"
+                ));
+            }
+            other => panic!("expected AI message, got {other:?}"),
+        }
+
+        let (_, deltas) = diff(&Cursor::new(), &messages);
+        assert!(deltas
+            .iter()
+            .any(|d| matches!(d, Delta::Text { reasoning: false, delta } if delta == "PONG")));
+        assert!(deltas.iter().any(|d| matches!(
+            d,
+            Delta::Text {
+                reasoning: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn parse_0227_multi_part_message() {
+        // Real-derived 0.2.x multi-part reply: reasoning, tool call with output,
+        // more reasoning, then the final text block.
+        let json = include_str!("../../tests/fixtures/transcript/0227-multi-part.json");
+        let messages = parse_messages(json).expect("multi-part 0.2.x transcript must parse");
+
+        match &messages[2] {
+            Message::Ai { blocks, .. } => {
+                assert_eq!(blocks.len(), 4);
+                assert!(matches!(
+                    &blocks[1],
+                    Block::Tool { tool_call_id, tool_name, output, .. }
+                        if tool_call_id == "tool-call-1"
+                            && tool_name == "run_terminal_command"
+                            && output.as_deref() == Some("freebuff-ok\n")
+                ));
+                assert!(matches!(
+                    &blocks[3],
+                    Block::Text { text_type, content }
+                        if text_type == "text" && content == "freebuff-ok"
+                ));
+            }
+            other => panic!("expected AI message, got {other:?}"),
+        }
+
+        let (_, deltas) = diff(&Cursor::new(), &messages);
+        assert!(deltas
+            .iter()
+            .any(|d| matches!(d, Delta::ToolStarted { .. })));
+        assert!(deltas
+            .iter()
+            .any(|d| matches!(d, Delta::ToolFinished { .. })));
+        assert!(deltas.iter().any(
+            |d| matches!(d, Delta::Text { reasoning: false, delta } if delta == "freebuff-ok")
+        ));
+    }
+
+    #[test]
+    fn unknown_fields_variants_and_block_types_are_tolerated() {
+        // Tolerant of schema drift: extra unknown keys anywhere, an unknown
+        // message variant and an unknown block type must never fail the parse.
+        let json = r#"[
+            {
+                "variant": "ai",
+                "content": "",
+                "someFutureMessageField": {"nested": true},
+                "blocks": [
+                    {"type": "some-future-block", "whatever": 1},
+                    {"type": "mode-divider", "mode": "LITE", "extra": "x"}
+                ],
+                "isComplete": true
+            },
+            {"variant": "system-note", "content": "ignore me"},
+            {"variant": "user", "content": "hi", "textAttachments": [], "Unknown": 1}
+        ]"#;
+        let messages = parse_messages(json).expect("unknown fields must be tolerated");
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(&messages[1], Message::Other));
+        match &messages[0] {
+            Message::Ai { blocks, .. } => {
+                assert!(matches!(&blocks[0], Block::Other));
+                assert!(matches!(&blocks[1], Block::ModeDivider { mode } if mode == "LITE"));
+            }
+            other => panic!("expected AI message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_block_without_content_fails_loudly() {
+        // Decorative/unknown fields are tolerated, but a text block whose body
+        // cannot be located must still be a hard error, never an empty reply.
+        let json = r#"[{"variant":"ai","blocks":[{"type":"text","textType":"text"}]}]"#;
+        let err = parse_messages(json).expect_err("missing text content must fail");
+        assert!(
+            err.to_string().contains("content"),
+            "error should point at the missing field, got: {err:#}"
+        );
     }
 }
