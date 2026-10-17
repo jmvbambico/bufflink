@@ -37,7 +37,8 @@ pub enum ScreenState {
     /// reuse credentials, never auto-dismiss an interstitial).
     Login,
     /// Idle prompt ready for input: a live session status row (active model,
-    /// optionally with "· <n>h/m left") and input placeholder visible.
+    /// optionally with "· <n>h/m left") and an input box visible — showing the
+    /// placeholder OR typed content.
     Idle,
     /// Generating a reply: status bar shows "thinking... <N>s" or "working... <N>s".
     Busy { elapsed_s: Option<u32> },
@@ -167,16 +168,25 @@ pub fn classify(rows: &[String]) -> ScreenState {
 
     // Check for Idle: a live session status row (active model; the plan may
     // report remaining time or omit it, e.g. `GLM 5.3 Flash • max · ...`) AND
-    // an input affordance (placeholder or "✕ End session"). Keying on the
-    // status row — not a time figure, and not merely the placeholder — keeps
-    // this specific enough that screens matched earlier in the precedence
-    // chain (splash, login) are never misread as Idle.
+    // an input affordance. Keying on the status row — not a time figure, and
+    // not merely the placeholder — keeps this specific enough that screens
+    // matched earlier in the precedence chain (splash, login) are never
+    // misread as Idle.
+    //
+    // The affordance is the input PLACEHOLDER, the `✕ End session` marker, or a
+    // rendered input BOX. Typing into the box REPLACES the placeholder, so an
+    // ordinary idle screen whose box holds typed text (a prompt, `/model`) has
+    // no placeholder at all — keying only on the placeholder left it to fall
+    // through to `Booting`. The picker states are matched EARLIER in this chain,
+    // so a mixed repaint that paints any model rows still classifies as a
+    // picker and receives no key.
     let has_status_row = active_model(rows).is_some();
     let has_placeholder = rows
         .iter()
         .any(|r| r.contains("Enter a coding task or / for commands"));
     let has_end_session = rows.iter().any(|r| r.contains("✕ End session"));
-    if has_status_row && (has_placeholder || has_end_session) {
+    let has_input_box = input_box_text(rows).is_some();
+    if has_status_row && (has_placeholder || has_end_session || has_input_box) {
         return ScreenState::Idle;
     }
 

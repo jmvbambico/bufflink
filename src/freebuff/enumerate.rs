@@ -14,7 +14,7 @@
 //! name is dropped from the plain output (and flagged on stderr / in `--json`).
 
 use crate::freebuff::screen::{
-    active_model, classify, input_box_is_empty, input_box_is_exactly, model_rows, nav_ring,
+    classify, input_box_is_empty, input_box_is_exactly, model_rows, nav_ring,
     toggle_row_has_focus_marker, ModelRow, ModelSection, ScreenState,
 };
 use crate::pty::{Key, Pty};
@@ -497,15 +497,51 @@ fn gate_error(state: &ScreenState) -> Option<anyhow::Error> {
     }
 }
 
-/// A modal confirmation that would START or SPEND if Enter were pressed again,
-/// or `None`. Matched on the resume prompt's exact phrase
-/// (`Press Enter to continue in a new session`). The idle info line reads
-/// `Your first message starts the session.` — `the session`, not `a new
-/// session` — so a healthy idle screen is never mistaken for a confirmation,
-/// while the session-ended resume prompt is.
+/// Spend/commit keywords that mark a row as a start-or-spend confirmation when
+/// it is paired (in the SAME row) with an Enter affordance. Lowercase: matched
+/// against a lowercased row.
+const SPEND_KEYWORDS: &[&str] = &[
+    "confirm",
+    "spend",
+    "wallet",
+    "freebucks",
+    "hours",
+    "plans",
+    "retry",
+    "a new session",
+];
+
+/// Whether `row` is a start/spend CONFIRMATION — a row that pairs an Enter
+/// affordance with spend/session language, i.e. pressing Enter would START or
+/// SPEND a billed session.
+///
+/// Matched by SHAPE, not by one exact phrase: freebuff 0.2.x words these
+/// several ways (`... Enter to confirm.`, `Enter uses N from your wallet`,
+/// `Enter: retry  Esc: back to draft`, `Press Enter to continue in a new
+/// session`), so a confirmation worded differently must still be caught.
+///
+/// The match is ROW-LOCAL and requires BOTH parts, which is exactly what keeps
+/// the healthy idle screen out: its placeholder `Enter a coding task or / for
+/// commands` has an Enter but no spend keyword, while its info line `Your first
+/// message starts the session.` has session language but no Enter. Fail-closed:
+/// a false abort is correct, a false pass spends money.
+fn is_confirmation_row(row: &str) -> bool {
+    // The affordance is always rendered `Enter` (or `ENTER`, as on the login
+    // gate); matched case-SENSITIVELY so a lowercase `enter` inside a word
+    // (`after-enter`, `center`) is not read as one.
+    if !(row.contains("Enter") || row.contains("ENTER")) {
+        return false;
+    }
+    let lower = row.to_lowercase();
+    SPEND_KEYWORDS.iter().any(|k| lower.contains(k))
+}
+
+/// A modal confirmation that would START or SPEND if Enter were pressed, or
+/// `None`: the first row that pairs an Enter affordance with spend/commit
+/// language (see [`is_confirmation_row`]).
 fn confirmation_text(rows: &[String]) -> Option<String> {
     rows.iter()
-        .find(|r| r.contains("a new session"))
+        .find(|r| is_confirmation_row(r))
         .map(|r| r.trim().to_string())
 }
 
@@ -665,26 +701,6 @@ enum SubmitStep {
     Enter,
 }
 
-/// Whether a screen POSITIVELY shows freebuff's idle input box, so the single
-/// `/model` submit may be pressed.
-///
-/// freebuff 0.2.29's idle-with-typed-text screen keeps the FREEBUFF banner and
-/// drops the input placeholder, so [`classify`] cannot reach
-/// [`ScreenState::Idle`] and reports [`ScreenState::Booting`] instead (measured
-/// live 2026-10-17 against 0.2.29: with `blink` driving it, after typing
-/// `/model` the classification was `Booting`, the box held exactly `/model`, and
-/// the picker opened on the next Enter). The positive evidence that the screen is
-/// the idle input box — and not a half-painted frame — is a live session STATUS
-/// ROW ([`active_model`]); a `Booting` frame with no status row authorises
-/// nothing, so the guard still fails closed on an empty repaint.
-fn is_idle_input_screen(state: &ScreenState, rows: &[String]) -> bool {
-    match state {
-        ScreenState::Idle => true,
-        ScreenState::Booting => active_model(rows).is_some(),
-        _ => false,
-    }
-}
-
 /// Decide whether the ONE `/model` submit may be sent, from a FRESHLY read
 /// screen.
 ///
@@ -699,6 +715,11 @@ fn is_idle_input_screen(state: &ScreenState, rows: &[String]) -> bool {
 ///   `foo/model` would be "confirmed" and submitted as a MESSAGE, which starts a
 ///   billed session. The box must hold EXACTLY the command
 ///   ([`input_box_is_exactly`]).
+///
+/// The screen must classify STRICTLY as [`ScreenState::Idle`]: the classifier
+/// recognises the typed-in idle box itself (see `classify`), and the picker
+/// states are matched BEFORE Idle, so a mixed repaint that paints any picker
+/// rows classifies as a picker and presses nothing. Nothing is widened here.
 ///
 /// Exactly ONE Enter is ever sent. `pty.key` only WRITES the key — it does not
 /// wait for freebuff to consume it — so a repeat guarded on a screen snapshot
@@ -718,7 +739,7 @@ fn submit_step(state: &ScreenState, rows: &[String], cmd: &str) -> Result<Submit
             "freebuff: refusing to confirm a screen that would start a session: {line}"
         ));
     }
-    if !is_idle_input_screen(state, rows) {
+    if !matches!(state, ScreenState::Idle) {
         return Err(anyhow!(
             "freebuff: the screen is not the idle input box ({state:?}); Enter was NOT sent \
              — Enter on an unrecognised screen could start a billed session"
@@ -1825,6 +1846,83 @@ mod tests {
         );
     }
 
+    /// The confirmation detector matches by SHAPE — an Enter affordance AND a
+    /// spend/commit keyword in the SAME row — so a confirmation worded
+    /// differently from the resume prompt still fires (finding: one exact
+    /// phrase let a differently-worded start/spend confirmation through, and
+    /// Enter would have ACCEPTED it). The healthy idle lines must NOT fire.
+    #[test]
+    fn confirmation_detector_matches_by_shape_but_not_healthy_lines() {
+        for row in [
+            "Ends this session and starts a new one for 5 Freebucks. Enter to confirm.",
+            "Today's Freebucks are spent. Enter uses 5 from your wallet to start.",
+            "Claim earned Freebucks on admission, then spend 5 for this session. Enter to confirm.",
+            "Balance unavailable. Enter may spend wallet Freebucks to start this hour.",
+            "Enter: retry  Esc: back to draft",
+            "Press Enter to continue in a new session",
+            "Not enough Freebucks — 5 Freebucks/hr against 0 left. Enter opens plans.",
+        ] {
+            assert!(
+                is_confirmation_row(row),
+                "must be read as a confirmation: {row:?}"
+            );
+        }
+        // Fail-closed in BOTH directions: an Enter with NO spend keyword, or
+        // spend language with NO Enter, must never fire.
+        for row in [
+            "│  ▍Enter a coding task or / for commands  │",
+            "│ Your first message starts the session. │",
+            "↑↓ choose model · Tab reasoning · Enter select · Esc cancel",
+            "│ 25/25 Freebucks remaining │",
+            "│ 3/5 hours remaining │",
+            "📋 Pasted text (5,001 chars)",
+        ] {
+            assert!(!is_confirmation_row(row), "must NOT match: {row:?}");
+        }
+    }
+
+    /// Guard against a false positive that would break enumeration OUTRIGHT:
+    /// across EVERY screen fixture, only the frames that genuinely offer to
+    /// start/spend may read as a confirmation. The idle/picker/transcript
+    /// frames — including the real idle screens whose info box carries
+    /// `Freebucks`/`hours` copy on rows that have no Enter — must not.
+    #[test]
+    fn no_healthy_fixture_reads_as_a_confirmation() {
+        // Fixtures that ARE start/spend confirmations, or a gate whose Enter
+        // affordance commits (they classify as gates first, so this is only a
+        // fail-closed backstop).
+        const EXPECTED: &[&str] = &[
+            "session-ended-120x40.txt",
+            "freebucks-gate-80x24.txt",
+            "0229-real-hours-gate-120x40.txt",
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/screens");
+        let mut scanned = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("fixtures dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let content = std::fs::read_to_string(&path).expect("read fixture");
+            let rows: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+            let flagged = confirmation_text(&rows);
+            if EXPECTED.contains(&name.as_str()) {
+                assert!(flagged.is_some(), "{name} must read as a confirmation");
+            } else {
+                assert!(
+                    flagged.is_none(),
+                    "healthy fixture {name} must not be flagged: {flagged:?}"
+                );
+            }
+            scanned += 1;
+        }
+        assert!(
+            scanned >= 30,
+            "expected to scan every screen fixture, saw {scanned}"
+        );
+    }
+
     /// BLOCKING regression, driven by three CONSECUTIVE real frames of the live
     /// `/model` scroll: a wrapped description row must not become a model, and a
     /// section whose header has scrolled off must still be attributed. The tail
@@ -1963,22 +2061,23 @@ mod tests {
         }
     }
 
-    /// The real 0.2.29 idle-with-typed-text screen classifies as `Booting` (the
-    /// banner is up and the placeholder is gone), yet it IS the idle input box:
-    /// a live session status row plus a box holding exactly the command. It must
-    /// authorise the single Enter — otherwise `--list-models` can never submit
-    /// `/model` against the real CLI. A `Booting` frame with NO status row (a
-    /// half-painted repaint) must still fail closed.
+    /// The real 0.2.29 idle-with-typed-text screen IS the idle input box: a live
+    /// session status row plus a rendered box holding exactly the command.
+    /// Typing into the box REPLACED the placeholder, so it must classify as
+    /// `Idle` — the classifier recognises the typed-in box itself rather than
+    /// reporting `Booting`, which is why nothing needs to widen the
+    /// authorisation. It authorises the single Enter; a bare `Booting` frame
+    /// with no status row and no box still fails closed.
     #[test]
     fn submit_step_accepts_the_real_typed_idle_screen_but_not_a_bare_booting_frame() {
         let rows = real_typed_idle_rows("/model");
         assert_eq!(
             classify(&rows),
-            ScreenState::Booting,
-            "the real typed screen must classify as Booting for this guard to bite"
+            ScreenState::Idle,
+            "a typed idle box must classify as Idle, not Booting"
         );
         assert!(
-            active_model(&rows).is_some(),
+            crate::freebuff::screen::active_model(&rows).is_some(),
             "a live status row is present"
         );
         assert!(input_box_is_exactly(&rows, "/model"));
@@ -1987,12 +2086,45 @@ mod tests {
             Ok(SubmitStep::Enter)
         ));
 
-        // A Booting frame with no status row authorises nothing.
+        // A Booting frame (no status row, no box) authorises nothing.
         let bare = vec![" ██████".to_string()];
         assert_eq!(classify(&bare), ScreenState::Booting);
         assert!(
             submit_step(&classify(&bare), &bare, "/model").is_err(),
             "a bare Booting frame must not authorise Enter"
+        );
+    }
+
+    /// The mixed repaint the reviewer flagged: a model picker APPEARING while a
+    /// stale idle status row and the `/model` input box are still painted. The
+    /// classifier checks the picker states BEFORE Idle, so the frame must
+    /// classify as a PICKER and the submit must press NOTHING — a blind Enter
+    /// would land on the picker's focused MODEL row and start a billed session.
+    #[test]
+    fn submit_step_treats_a_mixed_picker_and_input_frame_as_a_picker() {
+        let rows: Vec<String> = vec![
+            // A live status row, so the frame is not dismissed as Booting.
+            " GLM 5.3 Flash • high · /tmp · /model to change · Chat: New chat".to_string(),
+            // Picker rows already painted over it.
+            "│ › GLM 5.3 Flash · Deep reasoning · Images │".to_string(),
+            "│   MiMo 2.6 Pro · Strong reasoning · Images │".to_string(),
+            "↓  See all 12 models".to_string(),
+            // The stale input box, still holding exactly `/model`.
+            "╭──────────────────────────────────────╮".to_string(),
+            "│  ▍/model  │".to_string(),
+            "╰──────────────────────────────────────╯".to_string(),
+        ];
+        // The box really does hold the command, so only the CLASSIFICATION
+        // stands between this frame and a blind Enter.
+        assert!(input_box_is_exactly(&rows, "/model"));
+        let state = classify(&rows);
+        assert!(
+            matches!(state, ScreenState::ModelSplash | ScreenState::ModelList),
+            "a frame painting picker rows must classify as a picker, got {state:?}"
+        );
+        assert!(
+            matches!(submit_step(&state, &rows, "/model"), Ok(SubmitStep::Opened)),
+            "a mixed picker frame must press NOTHING"
         );
     }
 
