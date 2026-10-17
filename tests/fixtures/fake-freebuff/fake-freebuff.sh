@@ -20,6 +20,11 @@ if [ -z "$CWD" ]; then
     CWD="."
 fi
 
+# One chat directory per session, reused across turns (like real freebuff,
+# which appends subsequent prompts to the same chat). Created lazily on the
+# first prompt.
+CHAT_DIR=""
+
 if [ -z "$BLINK_MANICODE_DIR" ]; then
     echo "fake-freebuff: BLINK_MANICODE_DIR is required" >&2
     exit 64
@@ -615,8 +620,10 @@ idle_prompt() {
         while true; do sleep 1; done
     fi
     TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%S.000Z")
-    CHAT_DIR="$CHATS_DIR/$TIMESTAMP"
-    mkdir -p "$CHAT_DIR"
+    if [ -z "$CHAT_DIR" ]; then
+        CHAT_DIR="$CHATS_DIR/$TIMESTAMP"
+        mkdir -p "$CHAT_DIR"
+    fi
     write_log_line '[send-message] Sending message with sdk run config' '{}'
     write_chat_messages "$line" "LITE"
     print_status_busy

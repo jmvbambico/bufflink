@@ -19,6 +19,33 @@ use crate::acp::types::{
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
+/// The prompt turn currently in flight: its cancel sender and task, tagged
+/// with a monotonically increasing generation.
+///
+/// The tag is defensive hardening, not the fix for any observed failure: the
+/// current `select!` loop cannot actually let a stale completion clear a newer
+/// turn's slot, because only one arm runs per iteration and the reap future is
+/// rebuilt each time. Tying the reap to an identity makes that invariant
+/// explicit so a future reorder or a second reaper cannot regress it silently.
+struct InFlight {
+    generation: u64,
+    cancel: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Clear `slot` only when it still holds `generation`, returning whether it
+/// cleared. A mismatch means a newer turn replaced the slot since the
+/// completing turn started, and it must be left untouched.
+fn reap_by_generation(slot: &mut Option<InFlight>, generation: u64) -> bool {
+    match slot {
+        Some(f) if f.generation == generation => {
+            *slot = None;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Serve ACP on `reader`/`writer` until stdin EOF, driving `backend`.
 pub async fn serve<B: Backend>(
     backend: Arc<B>,
@@ -56,8 +83,8 @@ async fn run_loop<B: Backend>(
 ) -> anyhow::Result<()> {
     let mut lines = reader.lines();
     let mut session_id: Option<String> = None;
-    let mut prompt_cancel: Option<watch::Sender<bool>> = None;
-    let mut prompt_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut in_flight: Option<InFlight> = None;
+    let mut next_generation: u64 = 0;
 
     loop {
         tokio::select! {
@@ -74,56 +101,62 @@ async fn run_loop<B: Backend>(
                             &line,
                             &out_tx,
                             &mut session_id,
-                            &mut prompt_cancel,
-                            &mut prompt_task,
+                            &mut in_flight,
+                            &mut next_generation,
                         )
                         .await;
                     }
                     Ok(None) => {
                         info!("ACP stdin EOF");
-                        finish_in_flight(&mut prompt_cancel, &mut prompt_task).await;
+                        finish_in_flight(&mut in_flight).await;
                         backend.shutdown().await;
                         return Ok(());
                     }
                     Err(e) => {
                         warn!(error = %e, "ACP read error");
-                        finish_in_flight(&mut prompt_cancel, &mut prompt_task).await;
+                        finish_in_flight(&mut in_flight).await;
                         backend.shutdown().await;
                         return Err(e.into());
                     }
                 }
             }
 
-            // Reap completed prompt tasks so `prompt_cancel` clears.
-            _ = async {
-                if let Some(handle) = prompt_task.as_mut() {
-                    let _ = handle.await;
-                } else {
-                    std::future::pending::<()>().await;
+            // Reap the completed prompt task so the slot clears. The arm yields
+            // the generation it awaited; the handler reaps by identity so a
+            // completion that no longer belongs to the current turn cannot
+            // clear a newer turn's cancel sender.
+            generation = async {
+                match in_flight.as_mut() {
+                    Some(f) => {
+                        let _ = (&mut f.task).await;
+                        f.generation
+                    }
+                    None => std::future::pending::<u64>().await,
                 }
-            }, if prompt_task.is_some() => {
-                prompt_task = None;
-                prompt_cancel = None;
+            }, if in_flight.is_some() => {
+                if !reap_by_generation(&mut in_flight, generation) {
+                    warn!(
+                        generation,
+                        "completed prompt was superseded by a newer turn; keeping its cancel sender"
+                    );
+                }
             }
         }
     }
 }
 
-async fn finish_in_flight(
-    prompt_cancel: &mut Option<watch::Sender<bool>>,
-    prompt_task: &mut Option<tokio::task::JoinHandle<()>>,
-) {
-    if let Some(tx) = prompt_cancel.take() {
-        let _ = tx.send(true);
-    }
-    if let Some(mut handle) = prompt_task.take() {
-        match tokio::time::timeout(SHUTDOWN_GRACE, &mut handle).await {
-            Ok(_) => {}
-            Err(_) => {
-                warn!("prompt task did not finish within {SHUTDOWN_GRACE:?} on EOF; aborting");
-                handle.abort();
-                let _ = handle.await;
-            }
+async fn finish_in_flight(in_flight: &mut Option<InFlight>) {
+    let Some(f) = in_flight.take() else {
+        return;
+    };
+    let _ = f.cancel.send(true);
+    let mut handle = f.task;
+    match tokio::time::timeout(SHUTDOWN_GRACE, &mut handle).await {
+        Ok(_) => {}
+        Err(_) => {
+            warn!("prompt task did not finish within {SHUTDOWN_GRACE:?} on EOF; aborting");
+            handle.abort();
+            let _ = handle.await;
         }
     }
 }
@@ -133,8 +166,8 @@ async fn handle_line<B: Backend>(
     line: &str,
     out_tx: &mpsc::Sender<Outgoing>,
     session_id: &mut Option<String>,
-    prompt_cancel: &mut Option<watch::Sender<bool>>,
-    prompt_task: &mut Option<tokio::task::JoinHandle<()>>,
+    in_flight: &mut Option<InFlight>,
+    next_generation: &mut u64,
 ) {
     let incoming = match parse_line(line) {
         Ok(msg) => msg,
@@ -153,13 +186,13 @@ async fn handle_line<B: Backend>(
                 params,
                 out_tx,
                 session_id,
-                prompt_cancel,
-                prompt_task,
+                in_flight,
+                next_generation,
             )
             .await;
         }
         Incoming::Notification { method, params } => {
-            dispatch_notification(&method, params, session_id, prompt_cancel).await;
+            dispatch_notification(&method, params, session_id, in_flight).await;
         }
     }
 }
@@ -172,8 +205,8 @@ async fn dispatch_request<B: Backend>(
     params: Value,
     out_tx: &mpsc::Sender<Outgoing>,
     session_id: &mut Option<String>,
-    prompt_cancel: &mut Option<watch::Sender<bool>>,
-    prompt_task: &mut Option<tokio::task::JoinHandle<()>>,
+    in_flight: &mut Option<InFlight>,
+    next_generation: &mut u64,
 ) {
     match method {
         "initialize" => {
@@ -257,13 +290,12 @@ async fn dispatch_request<B: Backend>(
                 return;
             }
             // Reap a finished prompt before accepting a new one.
-            if prompt_task.as_ref().is_some_and(|h| h.is_finished()) {
-                if let Some(h) = prompt_task.take() {
-                    let _ = h.await;
+            if in_flight.as_ref().is_some_and(|f| f.task.is_finished()) {
+                if let Some(f) = in_flight.take() {
+                    let _ = f.task.await;
                 }
-                *prompt_cancel = None;
             }
-            if prompt_task.is_some() {
+            if in_flight.is_some() {
                 send_error(out_tx, id, -32000, "prompt already in flight", None).await;
                 return;
             }
@@ -276,10 +308,16 @@ async fn dispatch_request<B: Backend>(
             let sid = req.session_id.clone();
             let out = out_tx.clone();
 
-            *prompt_cancel = Some(cancel_tx);
-            *prompt_task = Some(tokio::spawn(async move {
+            let generation = *next_generation;
+            *next_generation += 1;
+            let task = tokio::spawn(async move {
                 run_prompt(backend, sid, text, sink, cancel_rx, update_rx, out, id).await;
-            }));
+            });
+            *in_flight = Some(InFlight {
+                generation,
+                cancel: cancel_tx,
+                task,
+            });
         }
         _ => {
             send_error(
@@ -348,7 +386,7 @@ async fn dispatch_notification(
     method: &str,
     params: Value,
     session_id: &Option<String>,
-    prompt_cancel: &mut Option<watch::Sender<bool>>,
+    in_flight: &Option<InFlight>,
 ) {
     match method {
         "session/cancel" => {
@@ -361,10 +399,10 @@ async fn dispatch_notification(
             };
             match session_id {
                 Some(current) if current == &req.session_id => {
-                    if let Some(tx) = prompt_cancel.as_ref() {
-                        let _ = tx.send(true);
+                    if let Some(f) = in_flight.as_ref() {
+                        let _ = f.cancel.send(true);
                     } else {
-                        debug!("session/cancel with no prompt in flight");
+                        warn!("session/cancel with no prompt in flight");
                     }
                 }
                 Some(_) => {
@@ -445,6 +483,12 @@ mod tests {
         shutdowns: usize,
         /// When set, prompt waits until cancel becomes true, then returns Cancelled.
         wait_for_cancel: bool,
+        /// When set, the first N prompts (0-based index < N) return EndTurn
+        /// immediately; every later prompt waits for cancel. This lets a test
+        /// drive several sequential turns in one session.
+        complete_before_wait: Option<usize>,
+        /// Prompts started so far, used with `complete_before_wait`.
+        started: usize,
         /// When set, prompt ignores cancel and never returns.
         ignore_cancel: bool,
         /// Scripted updates to emit before completing.
@@ -497,20 +541,28 @@ mod tests {
         ) -> impl Future<Output = anyhow::Result<StopReason>> + Send {
             let sid = session_id.to_string();
             async move {
-                {
+                let index = {
                     let mut st = self.state.lock().unwrap();
+                    let i = st.started;
+                    st.started += 1;
                     st.prompts.push((sid, text));
-                }
+                    i
+                };
 
-                let (wait_cancel, ignore_cancel, scripted, err, delay) = {
+                let (wait_cancel_flag, complete_before_wait, ignore_cancel, scripted, err, delay) = {
                     let st = self.state.lock().unwrap();
                     (
                         st.wait_for_cancel,
+                        st.complete_before_wait,
                         st.ignore_cancel,
                         st.updates.clone(),
                         st.prompt_error.clone(),
                         st.prompt_delay,
                     )
+                };
+                let wait_cancel = match complete_before_wait {
+                    Some(n) => index >= n,
+                    None => wait_cancel_flag,
                 };
 
                 for u in scripted {
@@ -741,6 +793,79 @@ mod tests {
         assert_eq!(lines[0]["result"]["stopReason"], "cancelled");
         assert!(backend.state().last_cancel_seen);
         shutdown_serve(client_w, client_r, serve).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_on_second_turn_reaches_the_live_sender() {
+        let backend = FakeBackend::new("s1").with(|st| {
+            st.complete_before_wait = Some(1);
+        });
+        let (mut client_w, mut client_r, server_r, server_w) = open_pipe();
+
+        let serve = tokio::spawn(serve(Arc::clone(&backend), server_r, server_w));
+        write_line(&mut client_w, init_req(1)).await;
+        write_line(&mut client_w, session_new(2, "/tmp")).await;
+        let _ = collect_lines(&mut client_r, 2).await;
+
+        // Turn 1 completes immediately.
+        write_line(&mut client_w, prompt_req(3, "s1", "first")).await;
+        let lines = collect_lines(&mut client_r, 1).await;
+        assert_eq!(lines[0]["id"], 3);
+        assert_eq!(lines[0]["result"]["stopReason"], "end_turn");
+
+        // Turn 2 waits for cancel. Its request is written immediately so the
+        // server reaps turn 1 and installs turn 2's sender before the cancel
+        // line, with no sleep involved.
+        write_line(&mut client_w, prompt_req(4, "s1", "second")).await;
+        write_line(
+            &mut client_w,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": { "sessionId": "s1" }
+            }),
+        )
+        .await;
+        let lines = collect_lines(&mut client_r, 1).await;
+        assert_eq!(lines[0]["id"], 4);
+        assert_eq!(lines[0]["result"]["stopReason"], "cancelled");
+        assert!(
+            backend.state().last_cancel_seen,
+            "cancel did not reach the live turn-2 sender"
+        );
+        shutdown_serve(client_w, client_r, serve).await;
+    }
+
+    /// Structural assertion (no timing) for the defensive identity guard: a
+    /// completion tagged with an older generation must not clear a newer
+    /// turn's slot. It pins the invariant, not a fix for an observed failure —
+    /// see the `InFlight` doc comment.
+    #[tokio::test]
+    async fn a_stale_completion_cannot_clear_a_newer_turn() {
+        let (c1, _r1) = watch::channel(false);
+        let (c2, _r2) = watch::channel(false);
+
+        let mut slot = Some(InFlight {
+            generation: 1,
+            cancel: c1,
+            task: tokio::spawn(async {}),
+        });
+        assert_eq!(slot.as_ref().unwrap().generation, 1);
+        // A newer turn replaces the slot, exactly as `session/prompt` does.
+        slot = Some(InFlight {
+            generation: 2,
+            cancel: c2,
+            task: tokio::spawn(async {}),
+        });
+
+        // Turn 1's stale completion observes generation 1 and must not clear
+        // turn 2.
+        assert!(!reap_by_generation(&mut slot, 1));
+        assert_eq!(slot.as_ref().unwrap().generation, 2);
+
+        // Turn 2's own completion clears the slot.
+        assert!(reap_by_generation(&mut slot, 2));
+        assert!(slot.is_none());
     }
 
     #[tokio::test]
