@@ -198,6 +198,12 @@ opens the picker by COMMAND.
   INSIDE the input box (`/model   Choose the model for your next message`); the
   first Enter lands on the menu, not the command. Submit, re-read, submit again
   (bounded). The same swallow is why `/exit` + Enter never left freebuff.
+- **Every nudge must re-check the screen FIRST.** The picker can render between
+  the wait window expiring and the next nudge; an Enter sent blind then lands
+  inside the open picker, on its focused MODEL row, and starts a billed session
+  before any toggle guard governs it. Enter is sent only after a freshly read
+  screen is positively the idle input box still showing `/model`; anything else
+  fails closed.
 - **A burst typed the instant Idle appears is LOST.** freebuff paints its idle
   screen a beat before it starts reading input and flushes the input queue on
   init; re-type (bounded) until the box shows the command.

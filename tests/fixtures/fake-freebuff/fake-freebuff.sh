@@ -532,14 +532,18 @@ Gemini 3.8 Flash'
                         ;;
                     "$CR")
                         if [ "$line" = "/model" ]; then
-                            if [ "$submit_seen" -eq 0 ]; then
+                            if [ "$submit_seen" -eq 0 ] && [ "${FAKE_FREEBUFF_NO_SWALLOW:-0}" -ne 1 ]; then
                                 # The slash-autocomplete popup eats the first
                                 # Enter: the menu stays open with `/model` still
                                 # in the box, exactly like the real CLI.
                                 submit_seen=1
                                 menu=1
                             else
-                                # The second Enter opens the picker.
+                                # The (second) Enter opens the picker. With
+                                # FAKE_FREEBUFF_NO_SWALLOW=1 the FIRST Enter opens
+                                # it, so a caller that nudges Enter again while
+                                # the picker is already up hits a model row and
+                                # the fake exits 1 below.
                                 mode=picker
                                 menu=0
                                 expanded=0
