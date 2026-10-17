@@ -2865,10 +2865,13 @@ mod tests {
         );
         // Fail loudly: the error must name the last observed screen state and
         // carry a bounded tail of the screen, not just the elapsed time.
-        // The fake's narrow splash box wraps its continuation rows with `│`
-        // borders, so its model rows count as an expanded list.
+        // The fake's splash is the COLLAPSED picker — one model box plus
+        // `↓ See all 4 models` — so it classifies as ModelSplash. (It used to be
+        // read as ModelList because the narrow box's continuation row
+        // `│    Images · NEW` was miscounted as a second model; the name-row
+        // indent rule in `screen::model_rows` now rejects it.)
         assert!(
-            err.contains("state=ModelList"),
+            err.contains("state=ModelSplash"),
             "error should name the last observed screen state: {}",
             err
         );

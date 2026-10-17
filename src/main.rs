@@ -68,7 +68,11 @@ Usage:
   blink --list-models --json
                         Print the model catalog as JSON on stdout and exit
 
-stdout is reserved for protocol data; diagnostics go to stderr."#
+stdout is reserved for protocol data; diagnostics go to stderr.
+In --json, an entry's `section` is the picker section it was listed under
+(`unlimited` is the free tier) and `price_per_hour` is what the picker states
+for an hour on that model: 0 for `unlimited`, null when the picker states no
+price."#
     );
 }
 

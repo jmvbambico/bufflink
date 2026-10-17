@@ -20,3 +20,17 @@ hand-built from the 0.2.27 bundle.
 Both were captured through `blink`'s own PTY screen model, so they are exactly
 what `screen::classify` / `parse_catalog` / `model_rows` see (trailing padding
 trimmed).
+
+## Three consecutive SCROLL frames of the same picker
+
+The picker is a tall scrollable list, so these three frames were taken one Down
+press apart (same 2026-10-17 v0.2.29 run) and are walked together by
+`enumerate::collect_frame`'s tests:
+
+- `0229-real-picker-powerful-section-120x40.txt` — the frame where the
+  `POWERFUL` header is still on screen.
+- `0229-real-picker-wrapped-description-120x40.txt` — the next frame: the
+  header has scrolled OFF the top, and a model box's wrapped DESCRIPTION row
+  (`detail. Claude Haiku 5.5 · 100k context …`) is left-aligned at one space.
+- `0229-real-picker-tail-120x40.txt` — the tail, whose models
+  (`Gemini 3.8 Flash`, `GPT-6.1 Sol`) never had a header on screen.

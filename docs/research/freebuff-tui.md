@@ -213,6 +213,18 @@ opens the picker by COMMAND.
 - **A promo/ad box (ROUNDED `╭…╮`) is drawn inside the picker.** Model boxes are
   SQUARE. Scrolling can leave only a box's centered continuation row visible
   (`3x · Recommended`), which is not a model.
-- Real frames kept as fixtures: `tests/fixtures/screens/0229-real-startup-no-picker-120x40.txt`
-  and `0229-real-slash-model-picker-120x40.txt`.
+- **A model NAME row is indented to the focus-marker column** (`│ › Name …`
+  focused, `│   Name …` unfocused); a box's description/status rows are
+  LEFT-aligned at one space (`│ detail. …`, `│ NVIDIA's …`) or centered. That
+  indent is the only thing separating a name from a wrapped DESCRIPTION that
+  happens to contain the tagline separator — e.g.
+  `│ detail. Claude Haiku 5.5 · 100k context is the same model at a lower hourly │`
+  was previously read as a model named `detail. Claude Haiku 5.5`.
+- **A section's header scrolls off the top before its last models do,** so a
+  frame can show a section's models with no header at all (`Gemini 3.8 Flash`,
+  `GPT-6.1 Sol` arrived that way and came back section-less). The walk carries
+  the last section it saw forward across frames.
+- Real frames kept as fixtures: `tests/fixtures/screens/0229-real-startup-no-picker-120x40.txt`,
+  `0229-real-slash-model-picker-120x40.txt` (top of the picker) and the three
+  consecutive scroll frames `0229-real-picker-{powerful-section,wrapped-description,tail}-120x40.txt`.
 

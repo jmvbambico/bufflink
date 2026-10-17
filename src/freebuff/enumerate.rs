@@ -60,6 +60,15 @@ pub struct CatalogEntry {
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
+    /// Cost of an hour on this model, in the picker's own unit for the figure it
+    /// prints next to a model (`N Freebucks/hr` on older builds). The name is
+    /// kept for wire compatibility — og consumes this shape.
+    ///
+    /// The unit is deliberately NOT renamed: freebuff 0.2.x bills a session in
+    /// HOURS (`an hour on it takes N hours`), and the 0.2.29 `/model` picker
+    /// prints no `Freebucks/hr` figure at all, so this is `0` for the free
+    /// `unlimited` section and `null` (omitted) for every model whose price the
+    /// picker does not state. It is a probe result, never a computed one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price_per_hour: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -510,24 +519,60 @@ struct SeenEntry {
 }
 
 impl SeenEntry {
-    fn from_row(r: &ModelRow) -> Self {
+    fn from_row(r: &ModelRow, section: Option<String>) -> Self {
         let explicit = r
             .cost_line
             .as_deref()
             .and_then(price_per_hour_from_cost_line);
         Self {
             display_name: r.name.clone(),
-            section: section_name(r.section),
-            price: explicit.or_else(|| price_for_section(r.section)),
+            price: explicit.or_else(|| free_price(section.as_deref())),
+            section,
         }
     }
 }
+
+/// Fold one picker frame's rows into `seen`, carrying the section forward.
+///
+/// The picker is walked DOWNWARD and a section's header scrolls off the top
+/// before its last models do, so a frame can show a section's models with no
+/// header at all — freebuff 0.2.29's `Gemini 3.8 Flash` / `GPT-6.1 Sol` arrived
+/// that way and came back section-less. Because the list is one ordered walk,
+/// the last section actually seen is the section of the rows that follow it, so
+/// it is carried forward; a row that carries its own header always wins, and a
+/// later frame may fill in a section earlier left unset.
+fn collect_frame(
+    seen: &mut Vec<SeenEntry>,
+    models: &[ModelRow],
+    last_section: &mut Option<String>,
+) {
+    for r in models {
+        let own = section_name(r.section);
+        if own.is_some() {
+            *last_section = own.clone();
+        }
+        let section = own.or_else(|| last_section.clone());
+        match seen.iter_mut().find(|s| s.display_name == r.name) {
+            Some(existing) => {
+                if existing.section.is_none() {
+                    existing.section = section;
+                }
+            }
+            None => seen.push(SeenEntry::from_row(r, section)),
+        }
+    }
+}
+
+/// The `--json` section label for the free tier. freebuff 0.2.29 renders it as
+/// the `UNLIMITED` header; those models carry no `Freebucks/hr` figure because
+/// they cost nothing.
+const UNLIMITED_LABEL: &str = "unlimited";
 
 /// The `--json` section label for a parsed picker section. `Unknown` (the
 /// flat, un-sectioned pickers of older builds) is omitted rather than invented.
 fn section_name(section: ModelSection) -> Option<String> {
     match section {
-        ModelSection::Unlimited => Some("unlimited".to_string()),
+        ModelSection::Unlimited => Some(UNLIMITED_LABEL.to_string()),
         ModelSection::Optimized => Some("optimized".to_string()),
         ModelSection::Powerful => Some("powerful".to_string()),
         ModelSection::LimitedTrial => Some("limited-trial".to_string()),
@@ -535,12 +580,12 @@ fn section_name(section: ModelSection) -> Option<String> {
     }
 }
 
-/// The price of a section that carries no `Freebucks/hr` figure. The v0.2.29
-/// `/model` picker prints NO price at all: its `UNLIMITED` section is the free
-/// tier, so those are `0`; every other section leaves the price unknown rather
-/// than guessing.
-fn price_for_section(section: ModelSection) -> Option<u64> {
-    (section == ModelSection::Unlimited).then_some(0)
+/// The price of an entry whose picker shows no `Freebucks/hr` figure. The
+/// v0.2.29 `/model` picker prints NO price at all: its `unlimited` section is
+/// the free tier, so those are `0`; every other section leaves the price
+/// unknown rather than guessing.
+fn free_price(section: Option<&str>) -> Option<u64> {
+    (section == Some(UNLIMITED_LABEL)).then_some(0)
 }
 
 /// Type `cmd` into the input box and confirm the box shows it, re-typing
@@ -783,10 +828,14 @@ pub async fn enumerate_catalog(pty: &Pty) -> Result<Vec<CatalogEntry>> {
     // 4. Walk the expanded list, collecting rows while scrolling until the
     //    advertised total is seen or the walk converges. `model_rows` strips
     //    freebuff's ` • <effort>` suffix, carries each row's section, and picks
-    //    up any `Freebucks/hr` cost line. (The v0.2.29 `/model` picker prints no
-    //    price at all; its `UNLIMITED` section is the free tier, which
-    //    `price_for_section` reports as 0.)
+    //    up any `Freebucks/hr` cost line, and its section is carried across
+    //    frames (see `collect_frame`). The v0.2.29 `/model` picker prints no
+    //    price at all; its `unlimited` section is the free tier, which
+    //    `free_price` reports as 0.
     let mut seen: Vec<SeenEntry> = Vec::new();
+    // Last section actually seen on screen, carried across frames (see
+    // `collect_frame`).
+    let mut last_section: Option<String> = None;
     let mut presses = 0u32;
     let mut consecutive_empty = 0u32;
 
@@ -808,11 +857,7 @@ pub async fn enumerate_catalog(pty: &Pty) -> Result<Vec<CatalogEntry>> {
 
         let models = model_rows(&rows);
         let before_count = seen.len();
-        for r in &models {
-            if seen.iter().all(|s| s.display_name != r.name) {
-                seen.push(SeenEntry::from_row(r));
-            }
-        }
+        collect_frame(&mut seen, &models, &mut last_section);
 
         if let Some(total) = total {
             if seen.len() >= total {
@@ -940,6 +985,13 @@ mod tests {
             "0229-real-slash-model-picker-120x40" => {
                 fixture!("0229-real-slash-model-picker-120x40")
             }
+            "0229-real-picker-powerful-section-120x40" => {
+                fixture!("0229-real-picker-powerful-section-120x40")
+            }
+            "0229-real-picker-wrapped-description-120x40" => {
+                fixture!("0229-real-picker-wrapped-description-120x40")
+            }
+            "0229-real-picker-tail-120x40" => fixture!("0229-real-picker-tail-120x40"),
             _ => panic!("unknown fixture: {name}"),
         };
         content.lines().map(|s| s.to_string()).collect()
@@ -1667,5 +1719,80 @@ mod tests {
             None,
             "the idle info line must never read as a confirmation"
         );
+    }
+
+    /// BLOCKING regression, driven by three CONSECUTIVE real frames of the live
+    /// `/model` scroll: a wrapped description row must not become a model, and a
+    /// section whose header has scrolled off must still be attributed. The tail
+    /// frame alone cannot know its section, so this walks the frames the way
+    /// `enumerate_catalog` does.
+    #[test]
+    fn v0229_real_frames_drop_the_junk_row_and_keep_every_section() {
+        // The tail frame genuinely has no header on screen.
+        let tail = load_fixture("0229-real-picker-tail-120x40");
+        assert!(
+            model_rows(&tail)
+                .iter()
+                .all(|r| r.section == ModelSection::Unknown),
+            "the tail fixture must have no section header, or this test cannot bite"
+        );
+
+        let mut seen: Vec<SeenEntry> = Vec::new();
+        let mut last_section: Option<String> = None;
+        for name in [
+            // The real walk starts at the top of the list (headers on screen),
+            // then scrolls down until the headers have scrolled off.
+            "0229-real-slash-model-picker-120x40",
+            "0229-real-picker-powerful-section-120x40",
+            "0229-real-picker-wrapped-description-120x40",
+            "0229-real-picker-tail-120x40",
+        ] {
+            collect_frame(
+                &mut seen,
+                &model_rows(&load_fixture(name)),
+                &mut last_section,
+            );
+        }
+
+        // (a) the wrapped description row is gone.
+        assert!(
+            seen.iter().all(|s| !s.display_name.contains("detail")),
+            "the wrapped description row must not be a model: {:?}",
+            seen.iter()
+                .map(|s| s.display_name.as_str())
+                .collect::<Vec<_>>()
+        );
+        // (b) every real model landed in a real section, including the two that
+        //     only ever appeared after their header had scrolled off.
+        assert!(
+            seen.iter().all(|s| s.section.is_some()),
+            "every model must have a section: {:?}",
+            seen.iter()
+                .map(|s| (s.display_name.as_str(), s.section.as_deref()))
+                .collect::<Vec<_>>()
+        );
+        let section_of = |name: &str| {
+            seen.iter()
+                .find(|s| s.display_name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .section
+                .clone()
+        };
+        assert_eq!(section_of("Solar Pro 4").as_deref(), Some("unlimited"));
+        assert_eq!(
+            section_of("DeepSeek V4.1 Flash").as_deref(),
+            Some("optimized")
+        );
+        for name in [
+            "Gemini 3.8 Flash",
+            "GPT-6.1 Sol",
+            "DeepSeek V4.1 Flash Fast",
+        ] {
+            assert_eq!(
+                section_of(name).as_deref(),
+                Some("powerful"),
+                "{name} must inherit the section carried across frames"
+            );
+        }
     }
 }

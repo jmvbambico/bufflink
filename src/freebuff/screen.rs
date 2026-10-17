@@ -313,13 +313,9 @@ pub struct ModelRow {
 }
 
 /// Parse the model rows out of a splash screen (collapsed or expanded).
-/// A model row is a `│`-bordered row whose inner text starts with `›`
-/// (focused) or directly with the name (unfocused) and carries a tagline
-/// separator (` · `, or the ` • <effort>` form). Cost lines (they mention
-/// `Freebucks`) and chrome (no separator) are not names. The v0.2.29 `/model`
-/// picker is SCROLLED, so the first visible row can be the CENTERED
-/// continuation of a box whose name scrolled off (`3x · Recommended · …`); a
-/// name starts with a letter, which rejects those.
+/// A model row is a `│`-bordered NAME row ([`name_row_body`]) that carries a
+/// tagline separator (` · `, or the ` • <effort>` form). Cost lines (they
+/// mention `Freebucks`) and chrome (no separator) are not names.
 pub fn model_rows(rows: &[String]) -> Vec<ModelRow> {
     let mut out = Vec::new();
     let mut section = ModelSection::Unknown;
@@ -334,12 +330,11 @@ pub fn model_rows(rows: &[String]) -> Vec<ModelRow> {
             section = sec;
             continue;
         }
-        let Some(inner) = box_inner(row) else {
+        let Some(inner) = box_inner_untrimmed(row) else {
             continue;
         };
-        let (focused, body) = match inner.strip_prefix('›') {
-            Some(rest) => (true, rest.trim()),
-            None => (false, inner),
+        let Some((body, focused)) = name_row_body(inner) else {
+            continue;
         };
         if body.contains("Freebucks") {
             continue;
@@ -376,16 +371,53 @@ pub fn model_rows(rows: &[String]) -> Vec<ModelRow> {
     out
 }
 
+/// The name body and focus of a `│`-bordered model NAME row, or `None` when the
+/// row is not a name row.
+///
+/// freebuff indents a model NAME to the same column the focus marker sits in —
+/// `│ › Name …` (focused) or `│   Name …` (unfocused). A box's OTHER content
+/// rows are laid out differently: a description or status row is LEFT-aligned
+/// at a single space (`│ detail. …`, `│ NVIDIA's …`) and a centered row has
+/// many. That distinction is the only thing that separates a real name from a
+/// wrapped DESCRIPTION that happens to contain the tagline separator, e.g.
+/// freebuff 0.2.29's
+/// `│ detail. Claude Haiku 5.5 · 100k context is the same model at a lower hourly │`,
+/// which was previously read as a model named `detail. Claude Haiku 5.5`.
+///
+/// `inner` must be the raw inner text, BEFORE leading whitespace is trimmed.
+fn name_row_body(inner: &str) -> Option<(&str, bool)> {
+    let lead = inner.len() - inner.trim_start_matches(' ').len();
+    let trimmed = &inner[lead..];
+    if let Some(body) = trimmed.strip_prefix("› ") {
+        // The marker may be preceded by the same small indent in every layout
+        // seen (1 space at 120x40, 1–3 in the 80x24 fixtures).
+        return (lead <= 3).then(|| (body.trim(), true));
+    }
+    // Unfocused: the name sits exactly at the marker's column.
+    (lead == 3).then(|| (trimmed.trim(), false))
+}
+
 /// Inner text of a `│`-bordered row, trimmed. Returns None for rows without a
 /// border. Tolerates a missing right border (partial box at 80x24) and
 /// trailing scrollbar glyphs (`█▀▄`).
 fn box_inner(row: &str) -> Option<&str> {
+    Some(
+        box_inner_untrimmed(row)?
+            .trim()
+            .trim_end_matches(['█', '▀', '▄'])
+            .trim(),
+    )
+}
+
+/// The inner text of a `│`-bordered row WITHOUT trimming the leading padding:
+/// the name-row indent ([`name_row_body`]) is only visible before trimming.
+/// Tolerates a missing right border (partial box at 80x24).
+fn box_inner_untrimmed(row: &str) -> Option<&str> {
     let (_, after_left) = row.split_once('│')?;
-    let inner = match after_left.rsplit_once('│') {
+    Some(match after_left.rsplit_once('│') {
         Some((mid, _)) => mid,
         None => after_left,
-    };
-    Some(inner.trim().trim_end_matches(['█', '▀', '▄']).trim())
+    })
 }
 
 /// Section of the freebuff v0.2.x expanded model picker. The renderer emits
@@ -1238,6 +1270,17 @@ mod tests {
             "0229-real-slash-model-picker-120x40" => {
                 fixture!("0229-real-slash-model-picker-120x40")
             }
+            // Consecutive frames from the SAME live scroll of that picker: the
+            // `POWERFUL` section with its header on screen, the next frame whose
+            // header has scrolled off (and which carries a wrapped DESCRIPTION
+            // row), and the tail whose models never had a header on screen.
+            "0229-real-picker-powerful-section-120x40" => {
+                fixture!("0229-real-picker-powerful-section-120x40")
+            }
+            "0229-real-picker-wrapped-description-120x40" => {
+                fixture!("0229-real-picker-wrapped-description-120x40")
+            }
+            "0229-real-picker-tail-120x40" => fixture!("0229-real-picker-tail-120x40"),
             "0227-synthetic-wrapped-input-120x40" => {
                 fixture!("0227-synthetic-wrapped-input-120x40")
             }
@@ -2452,5 +2495,68 @@ mod tests {
             "↓  See all 13 models".to_string(),
         ];
         assert!(parse_catalog(&rows).entries.is_empty());
+        assert!(model_rows(&rows).is_empty());
+    }
+
+    /// BLOCKING regression (real frame): a model box's wrapped DESCRIPTION row
+    /// is LEFT-aligned at one space and can contain the tagline separator, e.g.
+    /// `detail. Claude Haiku 5.5 · 100k context is the same model at a lower
+    /// hourly`. It was read as a model named `detail. Claude Haiku 5.5` and
+    /// inflated `--json` with a junk entry.
+    #[test]
+    fn v0229_real_wrapped_description_row_is_not_a_model() {
+        let rows = load_fixture("0229-real-picker-wrapped-description-120x40");
+        // The junk row really is in the frame, or this test cannot bite.
+        assert!(
+            rows.iter()
+                .any(|r| r.contains(" detail. Claude Haiku 5.5 · ")),
+            "fixture must carry the wrapped description row"
+        );
+        let models = model_rows(&rows);
+        assert!(
+            models.iter().all(|m| !m.name.contains("detail")),
+            "the description row must not be read as a model: {:?}",
+            models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>()
+        );
+        // Only real names survive, and no name is a sentence fragment.
+        assert_eq!(
+            models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec![
+                "Claude Haiku 5.5",
+                "MiMo 2.6 Pro",
+                "DeepSeek V4.1 Flash Fast",
+                "Claude Haiku 5.5",
+            ]
+        );
+        // This frame's POWERFUL header has scrolled off, so nothing on it can
+        // know its section — the walk carries it across frames (see
+        // `enumerate::collect_frame`).
+        assert!(models.iter().all(|m| m.section == ModelSection::Unknown));
+    }
+
+    /// The frame that still has the `POWERFUL` header: its models take that
+    /// section, which is what the walk then carries forward.
+    #[test]
+    fn v0229_real_powerful_section_frame_attributes_the_section() {
+        let rows = load_fixture("0229-real-picker-powerful-section-120x40");
+        let models = model_rows(&rows);
+        // The header is the first content in this frame, so every model on it
+        // belongs to POWERFUL.
+        assert_eq!(
+            models.first().map(|m| m.name.as_str()),
+            Some("Gemini 4 Argon")
+        );
+        assert!(
+            models.iter().all(|m| m.section == ModelSection::Powerful),
+            "every model in this frame must be attributed: {:?}",
+            models
+                .iter()
+                .map(|m| (m.name.as_str(), m.section))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            models.iter().any(|m| m.name == "DeepSeek V4.1 Flash Fast"),
+            "the frame must carry the POWERFUL models"
+        );
     }
 }
