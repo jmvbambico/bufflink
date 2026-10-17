@@ -32,12 +32,24 @@ pub enum ScreenState {
     },
     /// "Freebuff is already running" dialog with Take over / Exit buttons.
     AlreadyRunning,
+    /// Free-plan TAKE-OVER modal: freebuff's free tier shares ONE session slot
+    /// across CLI and Desktop, so when a session is active ELSEWHERE (no local
+    /// freebuff process) it renders a modal reading `Limited access without a
+    /// subscription allows one session across CLI and Desktop. Take over to stop
+    /// the other session and use it here.` with an `Enter: take over  Esc: back
+    /// to draft` affordance. Taking over would steal the other session, which
+    /// AGENTS.md forbids (`docs/research/freebuff-tui.md`: never choose `Take
+    /// over`), so this is a terminal gate: never press Enter — fail fast with an
+    /// actionable error. Captured frame:
+    /// `tests/fixtures/screens/0229-real-take-over-modal-120x40.txt`.
+    TakeOver,
     /// Interactive login gate: "Press ENTER to login ...". A hard precondition
     /// the agent must NOT satisfy itself — the human logs in (AGENTS.md: never
     /// reuse credentials, never auto-dismiss an interstitial).
     Login,
     /// Idle prompt ready for input: a live session status row (active model,
-    /// optionally with "· <n>h/m left") and input placeholder visible.
+    /// optionally with "· <n>h/m left") and an input box visible — showing the
+    /// placeholder OR typed content.
     Idle,
     /// Generating a reply: status bar shows "thinking... <N>s" or "working... <N>s".
     Busy { elapsed_s: Option<u32> },
@@ -50,9 +62,19 @@ pub enum ScreenState {
 /// Key pressed to accept the model splash (Enter).
 pub const SPLASH_ACCEPT_KEY: &str = "\r";
 
+/// Operator error for the free-plan take-over modal ([`ScreenState::TakeOver`]).
+/// bufflink must NEVER press Enter here (`docs/research/freebuff-tui.md`: never
+/// choose `Take over`), so both the driver and enumeration surface this instead
+/// of waiting out a timeout. Shared so the two paths cannot describe the gate
+/// differently, and so the message always states (a) a session is active
+/// elsewhere, (b) bufflink will not take it over, and (c) what the user can do.
+pub const TAKE_OVER_ERROR: &str = "freebuff: a freebuff session is active elsewhere — the free plan shares one session \
+slot across CLI and Desktop, and no local freebuff process is running here. bufflink will not choose `Take over`; \
+close the other freebuff session (or take over manually in freebuff), then retry";
+
 /// Classify the current screen state from a list of text rows (ANSI already stripped).
 pub fn classify(rows: &[String]) -> ScreenState {
-    // Precedence: FreebucksGate > HoursGate > AlreadyRunning > Login > SessionEnded > KickedOut > Busy > ModelList > ModelSplash > Idle > Booting > Unknown
+    // Precedence: FreebucksGate > HoursGate > TakeOver > AlreadyRunning > Login > SessionEnded > KickedOut > Busy > ModelList > ModelSplash > Idle > Booting > Unknown
     //
     // Both terminal gates sit ahead of the picker states (ModelList/ModelSplash):
     // a gate renders modally over the session — and can render OVER the picker
@@ -93,6 +115,22 @@ pub fn classify(rows: &[String]) -> ScreenState {
                 hours,
                 message,
             };
+        }
+    }
+
+    // Check for the free-plan TAKE-OVER modal. freebuff's free tier shares ONE
+    // session slot across CLI and Desktop, so a session active ELSEWHERE (no
+    // local freebuff process) renders a modal offering `Enter: take over  Esc:
+    // back to draft`. Taking over would steal the other session, which AGENTS.md
+    // forbids, so this is a terminal gate — bufflink presses nothing and fails
+    // fast. Keyed on the modal's distinctive copy (the "take over" affordance
+    // alone is too generic); no healthy screen carries it. This sits ahead of
+    // the picker/Idle states because the modal REPLACES the input box.
+    for row in rows {
+        if row.contains("one session across CLI and Desktop")
+            || row.contains("Take over to stop the other")
+        {
+            return ScreenState::TakeOver;
         }
     }
 
@@ -167,16 +205,25 @@ pub fn classify(rows: &[String]) -> ScreenState {
 
     // Check for Idle: a live session status row (active model; the plan may
     // report remaining time or omit it, e.g. `GLM 5.3 Flash • max · ...`) AND
-    // an input affordance (placeholder or "✕ End session"). Keying on the
-    // status row — not a time figure, and not merely the placeholder — keeps
-    // this specific enough that screens matched earlier in the precedence
-    // chain (splash, login) are never misread as Idle.
+    // an input affordance. Keying on the status row — not a time figure, and
+    // not merely the placeholder — keeps this specific enough that screens
+    // matched earlier in the precedence chain (splash, login) are never
+    // misread as Idle.
+    //
+    // The affordance is the input PLACEHOLDER, the `✕ End session` marker, or a
+    // rendered input BOX. Typing into the box REPLACES the placeholder, so an
+    // ordinary idle screen whose box holds typed text (a prompt, `/model`) has
+    // no placeholder at all — keying only on the placeholder left it to fall
+    // through to `Booting`. The picker states are matched EARLIER in this chain,
+    // so a mixed repaint that paints any model rows still classifies as a
+    // picker and receives no key.
     let has_status_row = active_model(rows).is_some();
     let has_placeholder = rows
         .iter()
         .any(|r| r.contains("Enter a coding task or / for commands"));
     let has_end_session = rows.iter().any(|r| r.contains("✕ End session"));
-    if has_status_row && (has_placeholder || has_end_session) {
+    let has_input_box = input_box_text(rows).is_some();
+    if has_status_row && (has_placeholder || has_end_session || has_input_box) {
         return ScreenState::Idle;
     }
 
@@ -297,8 +344,14 @@ fn parse_takes_hours(text: &str) -> Option<u32> {
 /// One model entry on the splash, collapsed or in the expanded list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRow {
-    /// Display name: the text between the focus marker and the first ` · `.
+    /// Display name: the text before the first tagline separator (` · ` or the
+    /// ` • <effort>` form freebuff 0.2.29 renders). The ` • <effort>` suffix is
+    /// NOT part of the name.
     pub name: String,
+    /// Section the row appeared under — the last `UNLIMITED`/`OPTIMIZED`/
+    /// `POWERFUL` header before it, or [`ModelSection::Unknown`] for the flat
+    /// pickers that render no section labels.
+    pub section: ModelSection,
     /// True when the row carries the `›` focus marker.
     pub focused: bool,
     /// The `Freebucks/hr` line inside the same box, if visible (an 80x24
@@ -307,27 +360,37 @@ pub struct ModelRow {
 }
 
 /// Parse the model rows out of a splash screen (collapsed or expanded).
-/// A model row is a `│`-bordered row whose inner text starts with `›`
-/// (focused) or directly with the name (unfocused) and holds the name before
-/// the first ` · `. Rows mentioning Freebucks are cost lines, not names.
+/// A model row is a `│`-bordered NAME row ([`name_row_body`]) that carries a
+/// tagline separator (` · `, or the ` • <effort>` form). Cost lines (they
+/// mention `Freebucks`) and chrome (no separator) are not names.
 pub fn model_rows(rows: &[String]) -> Vec<ModelRow> {
     let mut out = Vec::new();
+    let mut section = ModelSection::Unknown;
     for (i, row) in rows.iter().enumerate() {
-        let Some(inner) = box_inner(row) else {
+        // Section labels are borderless UPPERCASE rows; they set the section for
+        // the model rows that follow.
+        let framed = strip_frame(row);
+        if is_toggle_line(&framed) {
+            continue;
+        }
+        if let Some(sec) = section_from_header(&framed) {
+            section = sec;
+            continue;
+        }
+        let Some(inner) = box_inner_untrimmed(row) else {
             continue;
         };
-        let (focused, body) = match inner.strip_prefix('›') {
-            Some(rest) => (true, rest.trim()),
-            None => (false, inner),
+        let Some((body, focused)) = name_row_body(inner) else {
+            continue;
         };
         if body.contains("Freebucks") {
             continue;
         }
-        let Some(sep) = body.find(" · ") else {
+        if !(body.contains(" · ") || body.contains(" • ")) {
             continue;
-        };
-        let name = body[..sep].trim();
-        if name.is_empty() {
+        }
+        let name = model_name(body);
+        if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
             continue;
         }
         // Cost line: first "Freebucks/hr" row further down inside the same box.
@@ -346,7 +409,8 @@ pub fn model_rows(rows: &[String]) -> Vec<ModelRow> {
             }
         }
         out.push(ModelRow {
-            name: name.to_string(),
+            name,
+            section,
             focused,
             cost_line,
         });
@@ -354,16 +418,53 @@ pub fn model_rows(rows: &[String]) -> Vec<ModelRow> {
     out
 }
 
+/// The name body and focus of a `│`-bordered model NAME row, or `None` when the
+/// row is not a name row.
+///
+/// freebuff indents a model NAME to the same column the focus marker sits in —
+/// `│ › Name …` (focused) or `│   Name …` (unfocused). A box's OTHER content
+/// rows are laid out differently: a description or status row is LEFT-aligned
+/// at a single space (`│ detail. …`, `│ NVIDIA's …`) and a centered row has
+/// many. That distinction is the only thing that separates a real name from a
+/// wrapped DESCRIPTION that happens to contain the tagline separator, e.g.
+/// freebuff 0.2.29's
+/// `│ detail. Claude Haiku 5.5 · 100k context is the same model at a lower hourly │`,
+/// which was previously read as a model named `detail. Claude Haiku 5.5`.
+///
+/// `inner` must be the raw inner text, BEFORE leading whitespace is trimmed.
+fn name_row_body(inner: &str) -> Option<(&str, bool)> {
+    let lead = inner.len() - inner.trim_start_matches(' ').len();
+    let trimmed = &inner[lead..];
+    if let Some(body) = trimmed.strip_prefix("› ") {
+        // The marker may be preceded by the same small indent in every layout
+        // seen (1 space at 120x40, 1–3 in the 80x24 fixtures).
+        return (lead <= 3).then(|| (body.trim(), true));
+    }
+    // Unfocused: the name sits exactly at the marker's column.
+    (lead == 3).then(|| (trimmed.trim(), false))
+}
+
 /// Inner text of a `│`-bordered row, trimmed. Returns None for rows without a
 /// border. Tolerates a missing right border (partial box at 80x24) and
 /// trailing scrollbar glyphs (`█▀▄`).
 fn box_inner(row: &str) -> Option<&str> {
+    Some(
+        box_inner_untrimmed(row)?
+            .trim()
+            .trim_end_matches(['█', '▀', '▄'])
+            .trim(),
+    )
+}
+
+/// The inner text of a `│`-bordered row WITHOUT trimming the leading padding:
+/// the name-row indent ([`name_row_body`]) is only visible before trimming.
+/// Tolerates a missing right border (partial box at 80x24).
+fn box_inner_untrimmed(row: &str) -> Option<&str> {
     let (_, after_left) = row.split_once('│')?;
-    let inner = match after_left.rsplit_once('│') {
+    Some(match after_left.rsplit_once('│') {
         Some((mid, _)) => mid,
         None => after_left,
-    };
-    Some(inner.trim().trim_end_matches(['█', '▀', '▄']).trim())
+    })
 }
 
 /// Section of the freebuff v0.2.x expanded model picker. The renderer emits
@@ -471,11 +572,24 @@ pub fn parse_catalog(rows: &[String]) -> ModelCatalog {
             }
             if !in_box {
                 // First content row of a box. It is a model only when the row
-                // has a tagline separator after the name; an input box,
-                // paste chip or slash-menu box has none and is skipped whole.
+                // carries a tagline separator (` · ` or its ` • <effort>` form);
+                // an input box, paste chip, slash-menu box or a square-bordered
+                // CHROME box (e.g. the info box's `⎘ Copy invite link  Learn
+                // More ↵`, which has a double space but no tagline) has none and
+                // is skipped whole. The v0.2.29 `/model` picker also draws a
+                // promo/ad box inside it, so this keeps an ad out of the catalog.
                 let (focused, body) = strip_focus(inner);
+                if !(body.contains(" · ") || body.contains(" • ")) {
+                    in_box = true;
+                    box_is_model = false;
+                    continue;
+                }
                 let name = model_name(body);
-                if name.is_empty() || name.len() == body.len() {
+                // A name starts with a letter. A scrolled picker can leave only
+                // a box's CENTERED continuation row visible (`3x · Recommended ·
+                // …`), whose derived "name" starts with a digit: that is not a
+                // model, so it is not reported as one.
+                if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
                     in_box = true;
                     box_is_model = false;
                     continue;
@@ -1106,6 +1220,76 @@ pub fn input_box_shows(rows: &[String], needle: &str) -> bool {
     squish(&text).contains(&squish(&needle))
 }
 
+/// Whether the input box's TYPED content is EXACTLY `cmd` — nothing else.
+///
+/// [`input_box_shows`] is a SUBSTRING match (it exists to prefix-match a long
+/// prompt, a different job), so a box holding `foo/model` or `/model/model`
+/// satisfies it — and submitting such a box sends a plain MESSAGE, which starts
+/// a billed session. This predicate is the strict one the `/model` submit path
+/// uses instead: after normalising the box the way [`input_box_shows`] does
+/// (bottom-most rounded box, wrapped rows joined, cursor glyph stripped,
+/// whitespace collapsed) the remaining typed lines must be exactly one line
+/// equal to `cmd`.
+///
+/// The one thing tolerated is CHROME the TUI renders INSIDE the box: the
+/// slash-command autocomplete popup draws `/command   Description` rows above
+/// the typed text ([`slash_popup_shows`]). Those are not typed content, so they
+/// are skipped; every other non-empty line must be exactly `cmd`. An empty box,
+/// a box with extra text, or no box at all, all return `false`.
+pub fn input_box_is_exactly(rows: &[String], cmd: &str) -> bool {
+    let want = collapse_ws(cmd);
+    if want.is_empty() {
+        return false;
+    }
+    let Some(text) = input_box_text(rows) else {
+        return false;
+    };
+    let mut typed: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || is_slash_menu_row(line) {
+            continue;
+        }
+        typed.push(collapse_ws(line));
+    }
+    typed.len() == 1 && typed[0] == want
+}
+
+/// Whether the input box shows freebuff's slash-command AUTOCOMPLETE popup.
+///
+/// The popup renders INSIDE the input box, above the typed text, as
+/// `/command   Description` rows (captured live from 0.2.29:
+/// `/model      Choose the model for your next message`). It is chrome the TUI
+/// draws in the box, not typed content, so [`input_box_is_exactly`] skips those
+/// rows. It does NOT swallow the Enter (measured live 2026-10-17 — see
+/// `docs/research/freebuff-tui.md`).
+pub fn slash_popup_shows(rows: &[String]) -> bool {
+    let Some(text) = input_box_text(rows) else {
+        return false;
+    };
+    text.lines().any(is_slash_menu_row)
+}
+
+/// `  /model      Choose the model for your next message` — a slash command
+/// followed by a description, i.e. an autocomplete menu row. The typed line
+/// itself (`/model`) has no description, so it never matches.
+fn is_slash_menu_row(line: &str) -> bool {
+    let line = line.trim();
+    let Some(rest) = line.strip_prefix('/') else {
+        return false;
+    };
+    let name_len = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
+        .count();
+    if name_len == 0 {
+        return false;
+    }
+    let after = &rest[name_len..];
+    let spaces = after.len() - after.trim_start_matches(' ').len();
+    spaces >= 2 && !after.trim().is_empty()
+}
+
 /// Whether the screen confirms a submitted prompt: the typed text's prefix is
 /// visible in the input box (tolerating wrapped rows and a banner above it) or
 /// a pasted-text chip is shown. This is the exact predicate the driver's submit
@@ -1196,6 +1380,31 @@ mod tests {
             // The 2026-10-16 live run's hours gate: freebuff v0.2.29 bills in
             // hours and refused the turn. VERBATIM frame from that run.
             "0229-real-hours-gate-120x40" => fixture!("0229-real-hours-gate-120x40"),
+            // VERBATIM 120x40 frames captured from the 2026-10-17 live probe of
+            // freebuff v0.2.29 (real-derived): the startup screen with NO model
+            // picker, and the `/model` picker it opens. See 0229-real-NOTE.md.
+            "0229-real-startup-no-picker-120x40" => fixture!("0229-real-startup-no-picker-120x40"),
+            "0229-real-slash-model-picker-120x40" => {
+                fixture!("0229-real-slash-model-picker-120x40")
+            }
+            // Consecutive frames from the SAME live scroll of that picker: the
+            // `POWERFUL` section with its header on screen, the next frame whose
+            // header has scrolled off (and which carries a wrapped DESCRIPTION
+            // row), and the tail whose models never had a header on screen.
+            "0229-real-picker-powerful-section-120x40" => {
+                fixture!("0229-real-picker-powerful-section-120x40")
+            }
+            "0229-real-picker-wrapped-description-120x40" => {
+                fixture!("0229-real-picker-wrapped-description-120x40")
+            }
+            "0229-real-picker-tail-120x40" => fixture!("0229-real-picker-tail-120x40"),
+            // The slash-command AUTOCOMPLETE popup, captured live right after
+            // typing `/model` (before any Enter).
+            "0229-real-slash-popup-120x40" => fixture!("0229-real-slash-popup-120x40"),
+            // VERBATIM-derived 120x40 frame of the free-plan TAKE-OVER modal,
+            // captured from the 2026-10-17 live run when a session was held on
+            // another device (the free plan shares one session slot).
+            "0229-real-take-over-modal-120x40" => fixture!("0229-real-take-over-modal-120x40"),
             "0227-synthetic-wrapped-input-120x40" => {
                 fixture!("0227-synthetic-wrapped-input-120x40")
             }
@@ -1404,6 +1613,7 @@ mod tests {
             .enumerate()
             .map(|(i, n)| ModelRow {
                 name: n.to_string(),
+                section: ModelSection::Unknown,
                 focused: Some(i) == focused,
                 cost_line: None,
             })
@@ -1883,6 +2093,47 @@ mod tests {
         }
     }
 
+    // --- free-plan TAKE-OVER modal (0229) ---------------------------------
+    //
+    // The 2026-10-17 live failure: a freebuff session was active ELSEWHERE (the
+    // free plan shares one session slot across CLI and Desktop; no local process
+    // was running), so freebuff showed a modal nothing classified and the prompt
+    // waited out the full 30 s timeout. AGENTS.md forbids taking over
+    // (`docs/research/freebuff-tui.md`), so it is a terminal gate. The fixture is
+    // the frame from that run.
+
+    #[test]
+    fn v0229_real_take_over_modal_classifies_as_take_over() {
+        let rows = load_fixture("0229-real-take-over-modal-120x40");
+        assert_eq!(classify(&rows), ScreenState::TakeOver);
+        // The distinctive copy is really on the frame, or this cannot bite.
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("one session across CLI and Desktop")));
+        // It is NOT the idle screen: the modal REPLACED the rounded input box.
+        assert!(!matches!(classify(&rows), ScreenState::Idle));
+        assert_eq!(input_box_text(&rows), None);
+        assert!(active_model(&rows).is_some());
+    }
+
+    /// The bare `Take over` button (the LOCAL already-running dialog) or a stray
+    /// `Enter: take over` affordance must NOT be read as the free-plan modal on
+    /// its own: the gate is keyed on the modal's distinctive copy.
+    #[test]
+    fn v0229_take_over_button_alone_is_not_the_free_plan_modal() {
+        let rows = vec![
+            "Freebuff is already running".to_string(),
+            "Only one freebuff instance is allowed at a time.".to_string(),
+            "  Take over    Exit".to_string(),
+        ];
+        assert_eq!(classify(&rows), ScreenState::AlreadyRunning);
+        // A stray affordance with no modal copy does not classify as the modal.
+        assert_ne!(
+            classify(&["Enter: take over  Esc: back to draft".to_string()]),
+            ScreenState::TakeOver
+        );
+    }
+
     #[test]
     fn slash_menu_classifies_as_idle_or_unknown() {
         let rows = load_fixture("slash-menu");
@@ -2197,6 +2448,7 @@ mod tests {
         let rows: Vec<ModelRow> = (0..13)
             .map(|i| ModelRow {
                 name: format!("Model {i:02}"),
+                section: ModelSection::Unknown,
                 focused: i == 0,
                 cost_line: None,
             })
@@ -2338,5 +2590,181 @@ mod tests {
             "│ low│".to_string(),
         ];
         assert_eq!(input_box_text(&rows).as_deref(), Some("low"));
+    }
+
+    // --- Real freebuff v0.2.29: no startup picker + the `/model` picker ------
+    //
+    // The 2026-10-17 live probe: freebuff 0.2.29 boots STRAIGHT to the idle
+    // input box with a model already selected (NO startup picker); the model
+    // picker is opened by the `/model` command, and it opens as a full
+    // SCROLLABLE list (sections, no `See all`/`Show fewer` toggle). Both frames
+    // below are VERBATIM from that probe.
+
+    #[test]
+    fn v0229_real_startup_frame_is_idle_not_a_picker() {
+        let rows = load_fixture("0229-real-startup-no-picker-120x40");
+        // The startup screen has no model picker: it is the idle/input state
+        // whose status row carries `/model to change`.
+        assert_eq!(classify(&rows), ScreenState::Idle);
+        assert_eq!(
+            active_model(&rows),
+            Some(("Nemotron 3.5 Lightning".to_string(), None))
+        );
+        // There is genuinely no picker on this screen.
+        assert_eq!(parse_catalog(&rows).entries.len(), 0);
+        assert!(model_rows(&rows).is_empty());
+        assert_eq!(advertised_model_count(&rows), None);
+    }
+
+    #[test]
+    fn v0229_real_slash_model_picker_parses_sections_and_names() {
+        let rows = load_fixture("0229-real-slash-model-picker-120x40");
+        assert_eq!(classify(&rows), ScreenState::ModelList);
+        let catalog = parse_catalog(&rows);
+        assert_eq!(catalog.advertised, None, "the /model picker has no See-all");
+        let got: Vec<(&str, ModelSection)> = catalog
+            .entries
+            .iter()
+            .map(|e| (e.display_name.as_str(), e.section))
+            .collect();
+        // The ` • <effort>` suffix is stripped; section headers are sections.
+        assert_eq!(
+            got,
+            vec![
+                ("Nemotron 3.5 Lightning", ModelSection::Unlimited),
+                ("Glyph Cluster", ModelSection::Unlimited),
+                ("Solar Pro 4", ModelSection::Unlimited),
+                ("Solar Mini 4", ModelSection::Unlimited),
+                ("DeepSeek V4.1 Flash", ModelSection::Optimized),
+            ]
+        );
+        // The `/model` picker prints no `Freebucks/hr` figure.
+        assert!(catalog.entries.iter().all(|e| e.price_per_hour.is_none()));
+        // The chrome (info box, `↑↓ choose model …` footer) is not a model.
+        for e in &catalog.entries {
+            assert!(!e.display_name.contains("Copy invite link"));
+            assert!(!e.display_name.contains("choose model"));
+        }
+    }
+
+    /// A scrolled picker can leave only a box's CENTERED continuation row
+    /// visible (`3x · Recommended · …`), whose derived "name" is `3x`. That is
+    /// not a model and must not be reported as one.
+    #[test]
+    fn v0229_scrolled_continuation_row_is_not_a_model() {
+        let rows = vec![
+            "│               3x · Recommended · May use data for AI training                │"
+                .to_string(),
+            "│                            Get 7x usage for $5 →                             │"
+                .to_string(),
+            "↓  See all 13 models".to_string(),
+        ];
+        assert!(parse_catalog(&rows).entries.is_empty());
+        assert!(model_rows(&rows).is_empty());
+    }
+
+    /// BLOCKING regression (real frame): a model box's wrapped DESCRIPTION row
+    /// is LEFT-aligned at one space and can contain the tagline separator, e.g.
+    /// `detail. Claude Haiku 5.5 · 100k context is the same model at a lower
+    /// hourly`. It was read as a model named `detail. Claude Haiku 5.5` and
+    /// inflated `--json` with a junk entry.
+    #[test]
+    fn v0229_real_wrapped_description_row_is_not_a_model() {
+        let rows = load_fixture("0229-real-picker-wrapped-description-120x40");
+        // The junk row really is in the frame, or this test cannot bite.
+        assert!(
+            rows.iter()
+                .any(|r| r.contains(" detail. Claude Haiku 5.5 · ")),
+            "fixture must carry the wrapped description row"
+        );
+        let models = model_rows(&rows);
+        assert!(
+            models.iter().all(|m| !m.name.contains("detail")),
+            "the description row must not be read as a model: {:?}",
+            models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>()
+        );
+        // Only real names survive, and no name is a sentence fragment.
+        assert_eq!(
+            models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec![
+                "Claude Haiku 5.5",
+                "MiMo 2.6 Pro",
+                "DeepSeek V4.1 Flash Fast",
+                "Claude Haiku 5.5",
+            ]
+        );
+        // This frame's POWERFUL header has scrolled off, so nothing on it can
+        // know its section — the walk carries it across frames (see
+        // `enumerate::collect_frame`).
+        assert!(models.iter().all(|m| m.section == ModelSection::Unknown));
+    }
+
+    /// The frame that still has the `POWERFUL` header: its models take that
+    /// section, which is what the walk then carries forward.
+    #[test]
+    fn v0229_real_powerful_section_frame_attributes_the_section() {
+        let rows = load_fixture("0229-real-picker-powerful-section-120x40");
+        let models = model_rows(&rows);
+        // The header is the first content in this frame, so every model on it
+        // belongs to POWERFUL.
+        assert_eq!(
+            models.first().map(|m| m.name.as_str()),
+            Some("Gemini 4 Argon")
+        );
+        assert!(
+            models.iter().all(|m| m.section == ModelSection::Powerful),
+            "every model in this frame must be attributed: {:?}",
+            models
+                .iter()
+                .map(|m| (m.name.as_str(), m.section))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            models.iter().any(|m| m.name == "DeepSeek V4.1 Flash Fast"),
+            "the frame must carry the POWERFUL models"
+        );
+    }
+
+    /// `  /model      Choose the model for your next message` / `  /model` — the
+    /// strict box predicate and the popup marker, on a REAL 0.2.29 popup frame.
+    ///
+    /// `input_box_shows` (a substring match) accepts `foo/model`; submitting such
+    /// a box sends a MESSAGE, which starts a billed session. The strict predicate
+    /// must not.
+    #[test]
+    fn v0229_real_slash_popup_is_detected_and_the_box_holds_exactly_the_command() {
+        let rows = load_fixture("0229-real-slash-popup-120x40");
+        assert_eq!(classify(&rows), ScreenState::Idle);
+        assert!(
+            slash_popup_shows(&rows),
+            "the real autocomplete popup must be detected"
+        );
+        assert!(
+            input_box_is_exactly(&rows, "/model"),
+            "the popup's chrome is not typed text: the box holds exactly /model"
+        );
+        assert!(!input_box_is_empty(&rows));
+        // The old substring check would also have accepted these — the strict
+        // one must not.
+        for bad in ["/model/model", "foo/model", "/mod", "/model junk", ""] {
+            assert!(
+                !input_box_is_exactly(&idle_box(bad), "/model"),
+                "box {bad:?} must NOT be accepted as exactly /model"
+            );
+        }
+        assert!(input_box_is_exactly(&idle_box("/model"), "/model"));
+        // A lone `/model` line is not a menu row, so a CLOSED popup is not
+        // mistaken for an open one.
+        assert!(!slash_popup_shows(&idle_box("/model")));
+    }
+
+    /// An idle screen whose input box holds `box_text`.
+    fn idle_box(box_text: &str) -> Vec<String> {
+        vec![
+            " GLM 5.3 Flash · 59m left · 16.4K (2%)      ✕ End session".to_string(),
+            "╭──────────────────────────────────────╮".to_string(),
+            format!("│  ▍{box_text}  │"),
+            "╰──────────────────────────────────────╯".to_string(),
+        ]
     }
 }

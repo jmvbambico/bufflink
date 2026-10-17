@@ -42,13 +42,19 @@ fn unix_millis() -> u64 {
 }
 
 /// The model the e2e run pins through bufflink's normal `BLINK_MODEL` ->
-/// `settings.json` path. freebuff otherwise picks its own default (currently
-/// `MiMo Fast`, which bills 2 hours/hour), and the test account has 1 hour, so
-/// without an explicit pin the run can never pass. `z-ai/glm-5.3-flash` (GLM
-/// 5.3 Flash) is the cheapest commonly-available model and the one the user's
-/// own settings.json already selects — pinning it here makes the run
-/// deterministic AND exercises the settings-pin path.
-const E2E_PINNED_MODEL: &str = "z-ai/glm-5.3-flash";
+/// `settings.json` path. freebuff otherwise picks its own default, which bills
+/// hours the test account does not have, so without an explicit pin the run can
+/// never pass.
+///
+/// `upstage/solar-pro4` (Solar Pro 4) is FREE: `blink --list-models` reports it
+/// under the picker's `unlimited` section, i.e. `price_per_hour == 0`. The pin
+/// this replaced was `z-ai/glm-5.3-flash` (GLM 5.3 Flash), which bills 4 hours
+/// per hour against a 3-hour balance — freebuff refused every turn at the hours
+/// gate, so the suite could never pass. A free model costs no hours, which
+/// makes the run repeatable. Solar Pro 4 is chosen over Solar Mini 4 (also
+/// free) because the test asserts the reply contains `PONG` and the more
+/// capable model is likelier to comply with an exact-word instruction.
+const E2E_PINNED_MODEL: &str = "upstage/solar-pro4";
 
 /// Path to freebuff's live `settings.json` — the file a `BLINK_MODEL` pin
 /// rewrites and restores. Mirrors `chats::manicode_dir()`: `$BLINK_MANICODE_DIR`

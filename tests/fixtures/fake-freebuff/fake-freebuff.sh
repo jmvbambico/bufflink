@@ -112,6 +112,30 @@ Only one freebuff instance is allowed at a time.
 EOF
 }
 
+# Print the free-plan TAKE-OVER modal. The free tier shares ONE session slot
+# across CLI and Desktop, so a session active ELSEWHERE (no local freebuff
+# process) renders this modal. bufflink must NEVER press Enter here (AGENTS.md
+# forbids taking over), so it is a terminal gate that fails fast. Mirrors the
+# real interstitial captured on 2026-10-17 (v0.2.29) — the frame is kept as
+# tests/fixtures/screens/0229-real-take-over-modal-120x40.txt.
+print_take_over() {
+    cat <<'EOF'
+ ┌───────────────────────────────────────────────────────────────┐
+ │ May use data for AI training                                     │
+ │ Your first message starts the session.                           │
+ │ Some models aren't available on this connection                  │
+ │ 2 day streak                                                     │
+ └───────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Limited access without a subscription allows one session across CLI and Desktop. Take over to stop the other│
+│ session and use it here.                                                                                    │
+│ Enter: take over  Esc: back to draft                                                                        │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Solar Pro 4 · /private/var/folders/kl/8t4rp31969n3ts1h9_xm09k80000gn/T/blink-e2e-00000-abc · /model to change · Chat: New chat
+ ← for history · ? for help
+EOF
+}
+
 # Print idle screen
 print_idle() {
     cat <<EOF
@@ -301,6 +325,13 @@ case "${FAKE_FREEBUFF_MODE:-}" in
         # Block forever
         while true; do sleep 1; done
         ;;
+    take-over)
+        print_take_over
+        # Block forever: the real modal waits for Enter/Esc, which bufflink must
+        # NOT send — Enter would take over the other session (AGENTS.md forbids
+        # it). bufflink must fail fast on this gate instead.
+        while true; do sleep 1; done
+        ;;
     no-auth)
         # freebuff with no usable auth token: within ~50 ms it writes the
         # signature to its own log and then goes silent forever. No login
@@ -349,6 +380,9 @@ case "${FAKE_FREEBUFF_MODE:-}" in
             printf '\033[2J\033[H'
             print_idle
             printf '\033[2A\033[4C'
+            # Typed text REPLACES the placeholder (see the note in idle_prompt
+            # below), so the caller can verify the box holds exactly a command.
+            printf '\033[K'
             read -r line || return 1
             printf '\n\n'
             ESC=$(printf '\033')
@@ -378,6 +412,9 @@ case "${FAKE_FREEBUFF_MODE:-}" in
             printf '\033[2J\033[H'
             print_idle
             printf '\033[2A\033[4C'
+            # Typed text REPLACES the placeholder (see the note in idle_prompt
+            # below), so the caller can verify the box holds exactly a command.
+            printf '\033[K'
             read -r line || return 1
             printf '\n\n'
             ESC=$(printf '\033')
@@ -403,9 +440,22 @@ case "${FAKE_FREEBUFF_MODE:-}" in
         done
         ;;
     list)
-        # 0.2.x-shaped model picker, interactive: blink drives it with Up/Down
-        # and Enter. Enter on a model row is an Enter-guard violation, so the
-        # fake exits 1 to prove blink never sends Enter on a model row.
+        # 0.2.29 flow, modelled from the live probe (2026-10-17): freebuff boots
+        # STRAIGHT to the idle input box with a model already selected — there is
+        # NO startup picker — and the model picker is opened by SUBMITTING the
+        # `/model` command. The slash-autocomplete popup is RENDERED while typing
+        # but does NOT swallow the Enter: the picker opens on the FIRST Enter
+        # (measured live 4/4 against 0.2.29; the old "first Enter is eaten" note
+        # was a misdiagnosis of the same-burst trailing-Enter quirk). idle ->
+        # `/model` -> picker, driven with Up/Down and Enter.
+        #
+        # Enter on a model row is an Enter-guard violation, so the fake exits 1
+        # to prove blink never sends Enter on a model row.
+        #
+        # When FAKE_FREEBUFF_KEYLOG names a file, every Enter received while idle
+        # (i.e. by the picker-entry path) is appended to it as `idle-enter`, so a
+        # test can assert that path writes AT MOST ONE Enter.
+        #
         # POSIX sh has no arrays and the shebang is #!/bin/sh (dash on Ubuntu):
         # keep the ten model display names, in order, as a newline-delimited
         # list and look each model's cost up by name.
@@ -436,6 +486,15 @@ Gemini 3.8 Flash'
         }
         ESC=$(printf '\033')
         CR=$(printf '\r')
+        BS=$(printf '\177')
+        keylog() {
+            if [ -n "${FAKE_FREEBUFF_KEYLOG:-}" ]; then
+                printf '%s\n' "$1" >> "$FAKE_FREEBUFF_KEYLOG"
+            fi
+        }
+        line=""
+        mode=idle
+        menu=0             # idle: is the slash-autocomplete popup shown?
         expanded=0
         focus=0            # 0..N-1 model index; N = the toggle row (expanded only)
         focus_toggle=0     # collapsed: 1 means focus on the See-all toggle
@@ -446,14 +505,39 @@ Gemini 3.8 Flash'
 
         stty raw -echo 2>/dev/null || true
 
-        draw() {
+        draw_idle() {
+            printf '\033[2J\033[H'
+            printf 'Freebuff will run commands on your behalf to help you build.\r\n'
+            printf '\r\n'
+            printf 'Directory %s\r\n' "$CWD"
+            printf '\r\n'
+            printf 'GLM 5.3 Flash · 59m left · 16.4K (2%%)      ✕ End session\r\n'
+            printf '╭──────────────────────────────────────────────────────╮\r\n'
+            if [ "$menu" -eq 1 ]; then
+                # The slash-command autocomplete popup renders INSIDE the input
+                # box, ABOVE the typed line, as `/command   Description` rows —
+                # captured verbatim from freebuff 0.2.29 (see the note in
+                # tests/fixtures/screens/0229-real-NOTE.md).
+                printf '│  /model      Choose the model for your next message  │\r\n'
+                printf '│  /reasoning  Choose reasoning effort for your next message model  │\r\n'
+                printf '│                                                      │\r\n'
+            fi
+            if [ -n "$line" ]; then
+                printf '│  ▍%s  │\r\n' "$line"
+            else
+                printf '│  ▍Enter a coding task or / for commands  │\r\n'
+            fi
+            printf '╰──────────────────────────────────────────────────────╯\r\n'
+        }
+
+        draw_picker() {
             printf '\033[2J\033[H'
             printf '████████████████████████████████████████\r\n'
             printf '█                                                      █\r\n'
             printf '█   F  R  E  E  B  U  F  F                            █\r\n'
             printf '█                                                      █\r\n'
             printf '████████████████████████████████████████\r\n'
-            printf '\r\nStart coding for free\r\n\r\n'
+            printf '\r\nChoose a model to start a new session\r\n\r\n'
             if [ "$expanded" -eq 0 ]; then
                 first_name=$(printf '%s\n' "$MODEL_NAMES" | head -n 1)
                 if [ "$focus_toggle" -eq 1 ]; then
@@ -482,63 +566,240 @@ Gemini 3.8 Flash'
             fi
         }
 
-        draw
+        draw_idle
         while true; do
             # Read one byte reliably: `read -n 1` cannot capture '\r' (Enter),
             # so use `dd bs=1 count=1` which passes every byte through.
             c=$(dd bs=1 count=1 2>/dev/null) || break
             [ -n "$c" ] || break # EOF: the PTY was closed.
-            case "$c" in
-                "$ESC")
-                    c2=$(dd bs=1 count=1 2>/dev/null) || continue
-                    [ "$c2" = "[" ] || continue
-                    c3=$(dd bs=1 count=1 2>/dev/null) || continue
-                    case "$c3" in
-                        B)
-                            if [ "$expanded" -eq 0 ]; then
-                                focus_toggle=1
-                            elif [ "$focus" -lt "$N" ]; then
-                                focus=$(( focus + 1 ))
-                                if [ "$focus" -ge $(( scroll + V )) ]; then
-                                    scroll=$(( focus - V + 1 ))
-                                fi
-                            fi
-                            ;;
-                        A)
-                            if [ "$expanded" -eq 0 ]; then
-                                focus_toggle=0
-                            elif [ "$focus" -gt 0 ]; then
-                                focus=$(( focus - 1 ))
-                                if [ "$focus" -lt "$scroll" ]; then
-                                    scroll=$focus
-                                fi
-                            fi
-                            ;;
-                    esac
-                    ;;
-                "$CR")
-                    if [ "$expanded" -eq 0 ]; then
-                        if [ "$focus_toggle" -eq 1 ]; then
-                            expanded=1
+
+            if [ "$mode" = "idle" ]; then
+                case "$c" in
+                    "$ESC")
+                        # Discard a following arrow sequence (ESC [ X) so it is
+                        # not appended to the typed line.
+                        c2=$(dd bs=1 count=1 2>/dev/null) || c2=""
+                        if [ "$c2" = "[" ]; then
+                            dd bs=1 count=1 2>/dev/null >/dev/null || true
+                        fi
+                        ;;
+                    "$BS")
+                        # Backspace deletes the last typed character, so a caller
+                        # clearing the box before typing really does clear it.
+                        line=$(printf '%s' "$line" | sed 's/.$//')
+                        case "$line" in
+                            /*) menu=1 ;;
+                            *) menu=0 ;;
+                        esac
+                        ;;
+                    "$CR")
+                        keylog idle-enter
+                        if [ "$line" = "/model" ]; then
+                            # The FIRST Enter opens the picker: the popup does
+                            # NOT swallow it. A caller that nudges Enter again
+                            # while the picker is already up hits a model row and
+                            # the fake exits 1 below.
+                            mode=picker
+                            menu=0
+                            expanded=0
                             focus=0
+                            focus_toggle=0
                             scroll=0
+                            draw_picker
+                            continue
+                        elif [ "$line" = "/exit" ]; then
+                            print_exit
+                            exit 0
+                        fi
+                        ;;
+                    *)
+                        line="${line}${c}"
+                        # `/` opens the autocomplete popup, exactly as the real
+                        # CLI does on the FIRST character, not on submit.
+                        case "$line" in
+                            /*) menu=1 ;;
+                            *) menu=0 ;;
+                        esac
+                        ;;
+                esac
+                draw_idle
+            else
+                case "$c" in
+                    "$ESC")
+                        c2=$(dd bs=1 count=1 2>/dev/null) || continue
+                        if [ "$c2" != "[" ]; then
+                            # A bare Esc leaves the picker without selecting.
+                            mode=idle
+                            line=""
+                            draw_idle
+                            continue
+                        fi
+                        c3=$(dd bs=1 count=1 2>/dev/null) || continue
+                        case "$c3" in
+                            B)
+                                if [ "$expanded" -eq 0 ]; then
+                                    focus_toggle=1
+                                elif [ "$focus" -lt "$N" ]; then
+                                    focus=$(( focus + 1 ))
+                                    if [ "$focus" -ge $(( scroll + V )) ]; then
+                                        scroll=$(( focus - V + 1 ))
+                                    fi
+                                fi
+                                ;;
+                            A)
+                                if [ "$expanded" -eq 0 ]; then
+                                    focus_toggle=0
+                                elif [ "$focus" -gt 0 ]; then
+                                    focus=$(( focus - 1 ))
+                                    if [ "$focus" -lt "$scroll" ]; then
+                                        scroll=$focus
+                                    fi
+                                fi
+                                ;;
+                        esac
+                        draw_picker
+                        ;;
+                    "$CR")
+                        if [ "$expanded" -eq 0 ]; then
+                            if [ "$focus_toggle" -eq 1 ]; then
+                                expanded=1
+                                focus=0
+                                scroll=0
+                            else
+                                printf 'freebuff: Enter on a model row starts a session and spends Freebucks\n' >&2
+                                exit 1
+                            fi
+                        elif [ "$focus" -eq "$N" ]; then
+                            expanded=0
+                            focus_toggle=0
                         else
                             printf 'freebuff: Enter on a model row starts a session and spends Freebucks\n' >&2
                             exit 1
                         fi
-                    elif [ "$focus" -eq "$N" ]; then
-                        expanded=0
-                        focus_toggle=0
-                    else
-                        printf 'freebuff: Enter on a model row starts a session and spends Freebucks\n' >&2
-                        exit 1
+                        draw_picker
+                        ;;
+                    q|Q)
+                        exit 0
+                        ;;
+                esac
+            fi
+        done
+        ;;
+    exit-tui|exit-flush|exit-busy)
+        # 0.2.x idle TUI as an APP: raw mode, no tty echo, and the input box is
+        # DRAWN by this script — so typed text is visible on the screen only once
+        # the app renders it, exactly like the real CLI. This is the mode that
+        # exercises bufflink's type-and-confirm discipline at shutdown (a blind
+        # `/exit` + Enter leaves the freebuff session held server-side).
+        #
+        #   FAKE_FREEBUFF_FLUSH_BYTES  how many TYPED bytes are silently DROPPED,
+        #     never rendered, before the TUI starts rendering them — freebuff
+        #     flushes its input queue (the same flush that loses a first
+        #     `/model`). Default: 5 in `exit-flush`, i.e. exactly one `/exit`
+        #     burst, so a caller that types once and then presses Enter blind
+        #     exits nothing; 0 in `exit-tui`/`exit-busy`. `all` drops every
+        #     typed byte, i.e. a queue that never drains.
+        #   FAKE_FREEBUFF_BUSY_TRIGGER  a path: once that file exists the TUI
+        #     draws its busy status row, and a bare Esc returns it to the idle
+        #     box — the screen bufflink must Esc first before it can exit.
+        #   FAKE_FREEBUFF_KEYLOG  a path: every key received is appended as
+        #     `esc` | `enter` | `bs` | `char:<c>`, so a test can assert the exact
+        #     key sequence AND that Enter is never sent onto an unconfirmed box.
+        #
+        # POSIX sh only: no arrays, no `[[ ]]`, no `$'\x1b'`.
+        ESC=$(printf '\033')
+        CR=$(printf '\r')
+        BS=$(printf '\177')
+        case "$FAKE_FREEBUFF_MODE" in
+            exit-flush)
+                FLUSH_LEFT="${FAKE_FREEBUFF_FLUSH_BYTES:-5}"
+                ;;
+            *)
+                FLUSH_LEFT="${FAKE_FREEBUFF_FLUSH_BYTES:-0}"
+                ;;
+        esac
+        line=""
+        busy=0
+
+        exit_keylog() {
+            if [ -n "${FAKE_FREEBUFF_KEYLOG:-}" ]; then
+                printf '%s\n' "$1" >> "$FAKE_FREEBUFF_KEYLOG"
+            fi
+        }
+
+        # The idle frame the 0.2.29 probe captured: session status row plus the
+        # rounded input box. `busy` replaces it with the busy status row, which
+        # `classify` matches BEFORE Idle.
+        draw_exit_tui() {
+            printf '\033[2J\033[H'
+            printf 'Freebuff will run commands on your behalf to help you build.\r\n'
+            printf '\r\n'
+            printf 'Directory %s\r\n' "$CWD"
+            printf '\r\n'
+            printf 'GLM 5.3 Flash · 59m left · 16.4K (2%%)      ✕ End session\r\n'
+            if [ "$busy" -eq 1 ]; then
+                printf 'thinking... 1s  ■ Esc\r\n'
+            fi
+            printf '╭──────────────────────────────────────────────────────╮\r\n'
+            if [ -n "$line" ]; then
+                printf '│  ▍%s  │\r\n' "$line"
+            else
+                printf '│  ▍Enter a coding task or / for commands  │\r\n'
+            fi
+            printf '╰──────────────────────────────────────────────────────╯\r\n'
+        }
+
+        stty raw -echo 2>/dev/null || true
+        # min 0 time 1: a read returns after 0.1 s with no byte, so the busy
+        # trigger is polled without a blocking read (there is no `read -t` in
+        # POSIX sh).
+        stty min 0 time 1 2>/dev/null || true
+        draw_exit_tui
+        while true; do
+            c=$(dd bs=1 count=1 2>/dev/null) || break
+            if [ -z "$c" ]; then
+                if [ "$busy" -eq 0 ] \
+                    && [ -n "${FAKE_FREEBUFF_BUSY_TRIGGER:-}" ] \
+                    && [ -f "$FAKE_FREEBUFF_BUSY_TRIGGER" ]; then
+                    busy=1
+                    draw_exit_tui
+                fi
+                continue
+            fi
+            case "$c" in
+                "$ESC")
+                    exit_keylog esc
+                    if [ "$busy" -eq 1 ]; then
+                        busy=0
                     fi
+                    draw_exit_tui
                     ;;
-                q|Q)
-                    exit 0
+                "$BS")
+                    exit_keylog bs
+                    line=$(printf '%s' "$line" | sed 's/.$//')
+                    draw_exit_tui
+                    ;;
+                "$CR")
+                    exit_keylog enter
+                    if [ "$line" = "/exit" ]; then
+                        print_exit
+                        exit 0
+                    fi
+                    line=""
+                    draw_exit_tui
+                    ;;
+                *)
+                    exit_keylog "char:$c"
+                    if [ "$FLUSH_LEFT" = "all" ]; then
+                        : # the queue never drains: the byte is lost to the TUI
+                    elif [ "$FLUSH_LEFT" -gt 0 ] 2>/dev/null; then
+                        FLUSH_LEFT=$((FLUSH_LEFT - 1))
+                    else
+                        line="${line}${c}"
+                    fi
+                    draw_exit_tui
                     ;;
             esac
-            draw
         done
         ;;
 esac
@@ -571,6 +832,12 @@ idle_prompt() {
         stty sane 2>/dev/null || true
     else
         printf '\033[2A\033[4C'
+        # freebuff REPLACES the placeholder with what you type. Cooked-mode echo
+        # can only OVERWRITE, so the line is cleared first: without it the box
+        # shows the typed text glued to the placeholder, and a caller that
+        # requires the box to hold EXACTLY a command (bufflink's `/exit`
+        # confirmation before Enter) can never see it.
+        printf '\033[K'
         read -r line || return 1
     fi
     printf '\n\n'

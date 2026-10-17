@@ -1,0 +1,40 @@
+ ███ ██▀    ██▀    ▀█████   ▀████▀  ██████▀   ▀████▀   ██    ██
+
+ ┌──────────────────────────────────────────────────────────────────┐
+ │ May use data for AI training                                     │
+ │ Your first message starts the session.                           │
+ │ 3/5 hours remaining                                              │
+ │ 2 day streak                                                     │
+ │                                                                  │
+ │ ✦ Refer friends → earn hours:                                    │
+ │                                                                  │
+ │ ⎘ Copy invite link  Learn More ↵                                 │
+ └──────────────────────────────────────────────────────────────────┘                                                  █
+                                                                                                                       █
+ ↑↓ choose model · Tab reasoning · Enter select · Esc cancel
+ └──────────────────────────────────────────────────────────────────────────────┘
+
+ POWERFUL · Frontier models like GPT-6.1 Sol and more
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │   Gemini 4 Argon • medium · Google flagship · Images · Promotional · 1       │
+ │ session a day                                                                │
+ │                                  Paid plan                                   │
+ └──────────────────────────────────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │   Claude Haiku 5.5 · 100k context • medium · Anthropic · fast · Images · New │
+ │                                  Paid plan                                   │
+ └──────────────────────────────────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │   MiMo 2.6 Pro · Strong reasoning · Images                                   │
+ │                                  Paid plan                                   │
+ └──────────────────────────────────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │ › DeepSeek V4.1 Flash Fast • high · Parallel agents · Images                 │▀
+ │                                  Paid plan                                   │
+ │ Gathers context with parallel subagents. Runs on DeepSeek’s own API.         │
+ │ Peak: 10x Mon–Fri, 7 AM–5 PM GMT+7, when DeepSeek’s API costs double. 5x     │
+ │ otherwise.                                                                   │
+ │ Included with a paid plan.                                                   │
+ └──────────────────────────────────────────────────────────────────────────────┘
+ Nemotron 3.5 Lightning · /private/var/folders/kl/8t4rp31969n3ts1h9_xm09k80000gn/T · /model to change · Chat: New chat
+ ← for history · ? for help

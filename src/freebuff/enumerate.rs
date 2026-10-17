@@ -14,7 +14,8 @@
 //! name is dropped from the plain output (and flagged on stderr / in `--json`).
 
 use crate::freebuff::screen::{
-    classify, model_rows, nav_ring, toggle_row_has_focus_marker, ScreenState,
+    classify, input_box_is_empty, input_box_is_exactly, model_rows, nav_ring,
+    toggle_row_has_focus_marker, ModelRow, ModelSection, ScreenState, TAKE_OVER_ERROR,
 };
 use crate::pty::{Key, Pty};
 use anyhow::{anyhow, Result};
@@ -27,6 +28,14 @@ const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SETTLE: Duration = Duration::from_millis(300);
 /// Max Down presses before giving up (prevents an infinite scroll walk).
 const MAX_DOWN_PRESSES: u32 = 100;
+/// Max times `/model` is typed before giving up. freebuff flushes its input
+/// queue when it finishes initialising, so the first attempt can vanish; a
+/// single re-type covers it, and the bound keeps a wedged TUI from looping.
+const MAX_TYPE_ATTEMPTS: u32 = 4;
+/// Max Backspaces used to clear a NON-EMPTY input box before typing. Bounded,
+/// and the box is re-read afterwards and must be empty: a counted clear against
+/// arbitrary text cannot be trusted, so an unclearable box aborts instead.
+const MAX_CLEAR_BACKSPACES: u32 = 64;
 /// How many unreadable frames to tolerate before refusing to press Enter. A
 /// half-painted frame can classify as the splash before its model row is drawn;
 /// re-reading a few times is safe because no Enter is sent while unverified.
@@ -51,6 +60,15 @@ pub struct CatalogEntry {
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
+    /// Cost of an hour on this model, in the picker's own unit for the figure it
+    /// prints next to a model (`N Freebucks/hr` on older builds). The name is
+    /// kept for wire compatibility — og consumes this shape.
+    ///
+    /// The unit is deliberately NOT renamed: freebuff 0.2.x bills a session in
+    /// HOURS (`an hour on it takes N hours`), and the 0.2.29 `/model` picker
+    /// prints no `Freebucks/hr` figure at all, so this is `0` for the free
+    /// `unlimited` section and `null` (omitted) for every model whose price the
+    /// picker does not state. It is a probe result, never a computed one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price_per_hour: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -411,6 +429,426 @@ async fn settle_after(pty: &Pty, before: &str, deadline: Instant) -> Result<()> 
     Ok(())
 }
 
+/// Where the model picker is, given the first stable screen.
+///
+/// freebuff 0.2.29 has NO startup picker: it boots to the idle input box with a
+/// model already selected (`/model to change` in the status row), so the picker
+/// must be opened by submitting the `/model` command. Older builds (and the
+/// scripted fake) render the picker directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerEntry {
+    /// A picker is already on screen.
+    Visible,
+    /// The idle input box is on screen: the picker must be opened with `/model`.
+    Open,
+}
+
+/// Classify the entry path from a stable screen, or `None` when the screen is
+/// neither a picker nor the idle input box.
+fn picker_entry(state: &ScreenState) -> Option<PickerEntry> {
+    match state {
+        ScreenState::ModelSplash | ScreenState::ModelList => Some(PickerEntry::Visible),
+        ScreenState::Idle => Some(PickerEntry::Open),
+        _ => None,
+    }
+}
+
+/// Whether the screen is a terminal gate: a hard precondition that can never
+/// resolve by waiting (so neither the entry wait nor the `/model` submit may
+/// spin on it). Mirrors the driver's `is_terminal_gate`; kept local so a gate
+/// error here is always specific.
+fn is_terminal_state(state: &ScreenState) -> bool {
+    matches!(
+        state,
+        ScreenState::AlreadyRunning
+            | ScreenState::HoursGate { .. }
+            | ScreenState::FreebucksGate { .. }
+            | ScreenState::TakeOver
+            | ScreenState::Login
+            | ScreenState::KickedOut
+            | ScreenState::SessionEnded
+    )
+}
+
+/// The terminal gate on screen as an operator error, or `None`. Enumeration is
+/// a read-only probe: a gate (no hours/Freebucks, login, already running, a
+/// resume prompt) is surfaced, never dismissed (AGENTS.md).
+fn gate_error(state: &ScreenState) -> Option<anyhow::Error> {
+    match state {
+        ScreenState::AlreadyRunning => Some(anyhow!(
+            "freebuff: already running — only one instance may run at a time; \
+             wait for it to end or stop the other instance"
+        )),
+        ScreenState::HoursGate { message, .. } => {
+            Some(anyhow!("freebuff: not enough hours — {message}"))
+        }
+        ScreenState::FreebucksGate { message } => {
+            Some(anyhow!("freebuff: not enough Freebucks — {message}"))
+        }
+        ScreenState::TakeOver => Some(anyhow!("{}", TAKE_OVER_ERROR)),
+        ScreenState::Login => Some(anyhow!(
+            "freebuff needs an interactive login: run `freebuff` once in a terminal and log in, then retry"
+        )),
+        ScreenState::KickedOut => Some(anyhow!(
+            "freebuff: another instance took over this account"
+        )),
+        ScreenState::SessionEnded => Some(anyhow!(
+            "freebuff: session-ended screen — refusing to resume a session to enumerate models"
+        )),
+        _ => None,
+    }
+}
+
+/// Whether `row` carries freebuff's MODAL AFFORDANCE: an `Enter: <action>` and
+/// an `Esc: <action>` on the SAME row.
+///
+/// This is the idiom BOTH live modal interstitials use — the hours gate
+/// (`Enter: retry  Esc: back to draft`) and the free-plan take-over modal
+/// (`Enter: take over  Esc: back to draft`). It is STRUCTURAL: it catches either
+/// modal regardless of wording, and it does NOT match ordinary transcript prose
+/// such as `Enter to retry`, the idle placeholder `Enter a coding task or / for
+/// commands`, or the info line `Your first message starts the session.` — none
+/// of which carries an `Esc:` affordance. It replaces an earlier spend-KEYWORD
+/// list, which missed `take over` (no spend word) and false-matched transcript
+/// `retry`.
+///
+/// Matched PER ROW, not screen-wide. Both observed modals render the two
+/// affordances on one physical row and they are short (32 / 36 chars), so they
+/// do not wrap even at 80 columns; per-row matching is far less prone to false
+/// hits than a screen-wide `Enter:`-anywhere + `Esc:`-anywhere check, which would
+/// flag any screen carrying the two in unrelated places. The all-fixtures scan
+/// (`no_healthy_fixture_reads_as_a_confirmation`) proves no healthy frame is
+/// flagged by it.
+///
+/// NOTE: this is a BACKSTOP, not the primary guard. What actually protects the
+/// user is the SUBMIT ALLOWLIST in [`submit_step`]: Enter is sent ONLY when the
+/// state is [`ScreenState::Idle`] AND the bottom-most rounded box holds EXACTLY
+/// `/model`. Every interstitial captured so far REPLACES the input box (a
+/// square-bordered modal, with no rounded box at all), so [`input_box_is_exactly`]
+/// already fails closed on them. Do not weaken the allowlist believing this
+/// detector covers it.
+fn is_modal_affordance_row(row: &str) -> bool {
+    has_affordance(row, "Enter") && has_affordance(row, "Esc")
+}
+
+/// Whether `row` renders a `<key>: <action>` affordance: the key, a colon, then a
+/// non-empty action. `key` is matched case-sensitively as freebuff renders it
+/// (`Enter` / `Esc`), so a lowercase token inside another word is not read as one.
+fn has_affordance(row: &str, key: &str) -> bool {
+    let marker = format!("{key}:");
+    match row.find(&marker) {
+        Some(i) => !row[i + marker.len()..].trim_start().is_empty(),
+        None => false,
+    }
+}
+
+/// A modal interstitial that would commit if Enter were pressed (take over, or
+/// the hours gate's retry), or `None`: the first row carrying freebuff's modal
+/// affordance (see [`is_modal_affordance_row`]). A fail-closed BACKSTOP — see the
+/// note there.
+fn confirmation_text(rows: &[String]) -> Option<String> {
+    rows.iter()
+        .find(|r| is_modal_affordance_row(r))
+        .map(|r| r.trim().to_string())
+}
+
+/// One catalog row collected from a picker frame, before id mapping. Carries
+/// everything `--json` reports so the mapping step is pure.
+#[derive(Debug, Clone)]
+struct SeenEntry {
+    display_name: String,
+    section: Option<String>,
+    price: Option<u64>,
+}
+
+impl SeenEntry {
+    fn from_row(r: &ModelRow, section: Option<String>) -> Self {
+        let explicit = r
+            .cost_line
+            .as_deref()
+            .and_then(price_per_hour_from_cost_line);
+        Self {
+            display_name: r.name.clone(),
+            price: explicit.or_else(|| free_price(section.as_deref())),
+            section,
+        }
+    }
+}
+
+/// Fold one picker frame's rows into `seen`, carrying the section forward.
+///
+/// The picker is walked DOWNWARD and a section's header scrolls off the top
+/// before its last models do, so a frame can show a section's models with no
+/// header at all — freebuff 0.2.29's `Gemini 3.8 Flash` / `GPT-6.1 Sol` arrived
+/// that way and came back section-less. Because the list is one ordered walk,
+/// the last section actually seen is the section of the rows that follow it, so
+/// it is carried forward; a row that carries its own header always wins, and a
+/// later frame may fill in a section earlier left unset.
+fn collect_frame(
+    seen: &mut Vec<SeenEntry>,
+    models: &[ModelRow],
+    last_section: &mut Option<String>,
+) {
+    for r in models {
+        let own = section_name(r.section);
+        if own.is_some() {
+            *last_section = own.clone();
+        }
+        let section = own.or_else(|| last_section.clone());
+        match seen.iter_mut().find(|s| s.display_name == r.name) {
+            Some(existing) => {
+                if existing.section.is_none() {
+                    existing.section = section;
+                }
+            }
+            None => seen.push(SeenEntry::from_row(r, section)),
+        }
+    }
+}
+
+/// The `--json` section label for the free tier. freebuff 0.2.29 renders it as
+/// the `UNLIMITED` header; those models carry no `Freebucks/hr` figure because
+/// they cost nothing.
+const UNLIMITED_LABEL: &str = "unlimited";
+
+/// The `--json` section label for a parsed picker section. `Unknown` (the
+/// flat, un-sectioned pickers of older builds) is omitted rather than invented.
+fn section_name(section: ModelSection) -> Option<String> {
+    match section {
+        ModelSection::Unlimited => Some(UNLIMITED_LABEL.to_string()),
+        ModelSection::Optimized => Some("optimized".to_string()),
+        ModelSection::Powerful => Some("powerful".to_string()),
+        ModelSection::LimitedTrial => Some("limited-trial".to_string()),
+        ModelSection::Unknown => None,
+    }
+}
+
+/// The price of an entry whose picker shows no `Freebucks/hr` figure. The
+/// v0.2.29 `/model` picker prints NO price at all: its `unlimited` section is
+/// the free tier, so those are `0`; every other section leaves the price
+/// unknown rather than guessing.
+fn free_price(section: Option<&str>) -> Option<u64> {
+    (section == Some(UNLIMITED_LABEL)).then_some(0)
+}
+
+/// Clear the input box if it is not already empty (the placeholder state).
+///
+/// Returns `Ok(true)` only when a FRESH read shows the box empty. Returns
+/// `Ok(false)` when it could not be cleared. NEVER presses Enter, so it cannot
+/// submit anything however the clear goes.
+async fn ensure_input_box_empty(pty: &Pty, deadline: Instant) -> Result<bool> {
+    if input_box_is_empty(&pty.screen().rows) {
+        return Ok(true);
+    }
+    for _ in 0..MAX_CLEAR_BACKSPACES {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        pty.key(Key::Backspace).await?;
+    }
+    tokio::time::sleep(SETTLE).await;
+    // Re-verify from a fresh read: a counted clear is a guess, and guessing
+    // against unknown text is how a stray MESSAGE gets submitted.
+    Ok(input_box_is_empty(&pty.screen().rows))
+}
+
+/// Get the input box to hold EXACTLY `cmd`, or fail loudly without pressing
+/// Enter.
+///
+/// Two rules, both because a stray MESSAGE starts a billed session:
+///
+/// * The box must be EMPTY before we type. If it is not, it is cleared with a
+///   bounded number of Backspaces and RE-VERIFIED empty; an unclearable box
+///   aborts rather than being typed into blind.
+/// * After typing, the box must hold EXACTLY `cmd`
+///   ([`input_box_is_exactly`], not the substring [`input_box_shows`]), because
+///   a box like `foo/model` or `/model/model` would otherwise pass and be
+///   submitted as a message. A retry clears deterministically again first, so
+///   leftovers can never accumulate.
+///
+/// Shared with `FreebuffBackend::shutdown`, which types `/exit` through it for
+/// the same reason `/model` is typed through it: freebuff flushes its input
+/// queue, so a command typed once can vanish, and Enter must never be pressed
+/// onto a box that does not positively hold it.
+pub(crate) async fn type_and_confirm_command(
+    pty: &Pty,
+    cmd: &str,
+    deadline: Instant,
+) -> Result<()> {
+    for _ in 0..MAX_TYPE_ATTEMPTS {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("freebuff enumeration deadline expired"));
+        }
+        if !ensure_input_box_empty(pty, deadline).await? {
+            let _ = pty.key(Key::Escape).await;
+            return Err(anyhow!(
+                "freebuff: the input box is not empty and could not be cleared, so `{cmd}` was \
+                 NOT typed into it (typing into unknown content could submit a MESSAGE, which \
+                 starts a billed session)"
+            ));
+        }
+        pty.type_text(cmd).await?;
+        let window = Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now()));
+        if window.is_zero() {
+            return Err(anyhow!("freebuff enumeration deadline expired"));
+        }
+        if pty
+            .wait_for(|s| input_box_is_exactly(&s.rows, cmd), window)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    let _ = pty.key(Key::Escape).await;
+    Err(anyhow!(
+        "freebuff: the input box never held exactly `{cmd}`, so Enter was NOT sent \
+         (a box with leftover text would submit a MESSAGE, which starts a billed session)"
+    ))
+}
+
+/// The action the `/model` submit may take. A value, so every path is
+/// assertable without a live PTY — the same shape as [`ToggleStep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitStep {
+    /// A picker is already on screen: stop WITHOUT pressing anything.
+    Opened,
+    /// Positively the idle input box showing the command: Enter is safe.
+    Enter,
+}
+
+/// Decide whether the ONE `/model` submit may be sent, from a FRESHLY read
+/// screen.
+///
+/// `Err` means "press nothing": the caller Esc's and aborts with this error.
+///
+/// Two hazards, both money-safety:
+///
+/// * A blind Enter. A picker that has rendered receives it on its focused MODEL
+///   row — where Enter STARTS A BILLED SESSION, before [`toggle_walk_next`]
+///   governs anything.
+/// * A SUBSTRING match. `input_box_shows` is a contains match, so a box holding
+///   `foo/model` would be "confirmed" and submitted as a MESSAGE, which starts a
+///   billed session. The box must hold EXACTLY the command
+///   ([`input_box_is_exactly`]).
+///
+/// The screen must classify STRICTLY as [`ScreenState::Idle`]: the classifier
+/// recognises the typed-in idle box itself (see `classify`), and the picker
+/// states are matched BEFORE Idle, so a mixed repaint that paints any picker
+/// rows classifies as a picker and presses nothing. Nothing is widened here.
+///
+/// Exactly ONE Enter is ever sent. `pty.key` only WRITES the key — it does not
+/// wait for freebuff to consume it — so a repeat guarded on a screen snapshot
+/// could still be delivered AFTER the first Enter opened the picker, landing on
+/// a focused model row and starting a billed session. There is deliberately no
+/// repeat path here (see [`open_picker_via_slash_model`]); anything that cannot
+/// be verified fails closed.
+fn submit_step(state: &ScreenState, rows: &[String], cmd: &str) -> Result<SubmitStep> {
+    if matches!(state, ScreenState::ModelSplash | ScreenState::ModelList) {
+        return Ok(SubmitStep::Opened);
+    }
+    if let Some(err) = gate_error(state) {
+        return Err(err);
+    }
+    if let Some(line) = confirmation_text(rows) {
+        return Err(anyhow!(
+            "freebuff: refusing to confirm a screen that would start a session: {line}"
+        ));
+    }
+    if !matches!(state, ScreenState::Idle) {
+        return Err(anyhow!(
+            "freebuff: the screen is not the idle input box ({state:?}); Enter was NOT sent \
+             — Enter on an unrecognised screen could start a billed session"
+        ));
+    }
+    if !input_box_is_exactly(rows, cmd) {
+        return Err(anyhow!(
+            "freebuff: the input box does not hold exactly `{cmd}`, so Enter was NOT sent \
+             (leftover text would submit a MESSAGE, which starts a billed session)"
+        ));
+    }
+    Ok(SubmitStep::Enter)
+}
+
+/// Type `/model` into the idle input box and submit it with a SINGLE Enter,
+/// opening the picker.
+///
+/// Hazards, all handled explicitly because this can SPEND the user's money:
+///
+/// * A malformed submission would send a plain MESSAGE, and freebuff's first
+///   message STARTS A BILLED SESSION. The box must be EMPTY before typing and
+///   hold EXACTLY `/model` before submitting ([`input_box_is_exactly`], never the
+///   substring [`input_box_shows`]) — re-confirmed by [`submit_step`].
+/// * freebuff renders its idle screen a beat before it starts reading input and
+///   FLUSHES the input queue when it finishes initialising, so a burst typed the
+///   instant Idle appears is silently lost (measured live against 0.2.29: the
+///   box still showed the placeholder after typing). The command is therefore
+///   re-typed, bounded, and the box is cleared deterministically and
+///   re-verified empty before each retry ([`type_and_confirm_command`]).
+/// * A REPEAT Enter is NEVER sent. `pty.key` only WRITES the key — it does not
+///   wait for freebuff to consume it — so a repeat guarded on a screen snapshot
+///   can be delivered AFTER the first Enter opened the picker, where it lands on
+///   a focused MODEL row and starts a billed session. Measured live against
+///   0.2.29 (4/4 attempts, one per round of a single session): the picker opens
+///   on the FIRST Enter — the autocomplete popup does NOT swallow it — so no
+///   repeat is needed. If the picker does not open, this fails LOUDLY instead of
+///   nudging again.
+///
+/// No model row is ever Entered here, so nothing is selected or billed.
+async fn open_picker_via_slash_model(pty: &Pty, deadline: Instant) -> Result<()> {
+    const MODEL_COMMAND: &str = "/model";
+
+    // Only submit when the box holds EXACTLY the command — a stray message
+    // would start a session.
+    type_and_confirm_command(pty, MODEL_COMMAND, deadline).await?;
+
+    // Re-read and classify IMMEDIATELY before pressing Enter. The picker may
+    // have rendered since we typed; a blind Enter would land on its focused
+    // MODEL row and start a billed session.
+    let snap = pty.screen();
+    match submit_step(&classify(&snap.rows), &snap.rows, MODEL_COMMAND) {
+        Ok(SubmitStep::Opened) => return Ok(()),
+        Ok(SubmitStep::Enter) => {}
+        Err(err) => {
+            let _ = pty.key(Key::Escape).await;
+            return Err(err);
+        }
+    }
+
+    // Exactly ONE Enter — never a repeat.
+    pty.key(Key::Enter).await?;
+
+    // Give the picker a bounded moment to render. A timeout is a LOUD failure,
+    // NOT a reason to send another Enter: a queued second Enter could be
+    // delivered after this one opened the picker and land on a model row.
+    let open_window =
+        Duration::from_secs(3).min(deadline.saturating_duration_since(Instant::now()));
+    if open_window.is_zero() {
+        return Err(anyhow!("freebuff enumeration deadline expired"));
+    }
+    let opened = pty
+        .wait_for(
+            |s| {
+                matches!(
+                    classify(&s.rows),
+                    ScreenState::ModelSplash | ScreenState::ModelList
+                )
+            },
+            open_window,
+        )
+        .await;
+    if opened.is_err() {
+        let _ = pty.key(Key::Escape).await;
+        return Err(anyhow!(
+            "freebuff: the model picker did not open after submitting /model once; no repeat \
+             Enter is sent, because a queued second Enter could land on a model row and start a \
+             billed session — see docs/research/freebuff-tui.md"
+        ));
+    }
+    tokio::time::sleep(SETTLE).await;
+    Ok(())
+}
+
 /// Enumerate the model catalog by driving `pty` through freebuff's picker.
 ///
 /// Sequence: wait for the model picker, expand via the toggle row (Enter only
@@ -421,35 +859,45 @@ async fn settle_after(pty: &Pty, before: &str, deadline: Instant) -> Result<()> 
 pub async fn enumerate_catalog(pty: &Pty) -> Result<Vec<CatalogEntry>> {
     let deadline = Instant::now() + ENUMERATION_TIMEOUT;
 
-    // 1. Wait for the model picker; fail fast on a terminal gate such as
-    //    "already running" (single-instance) rather than spinning.
+    // 1. Wait for a stable screen from which the picker can be reached, or a
+    //    terminal gate to fail fast on (never spin on "already running",
+    //    hours/freebucks/login — AGENTS.md: never dismiss an interstitial).
+    //
+    //    freebuff 0.2.29 has NO startup model picker: it boots STRAIGHT to the
+    //    idle input box with a model already selected (`/model to change` in the
+    //    status row), which is why waiting for ModelSplash/ModelList timed out
+    //    against the real CLI while passing against the scripted fake. Older
+    //    builds (and the fake) DO render the picker directly, so both are
+    //    accepted here and the idle case is opened by command below.
     let snap = pty
         .wait_for(
             |s| {
                 let st = classify(&s.rows);
-                matches!(st, ScreenState::ModelSplash | ScreenState::ModelList)
-                    || st == ScreenState::AlreadyRunning
+                picker_entry(&st).is_some() || is_terminal_state(&st)
             },
             ENUMERATION_TIMEOUT,
         )
         .await?;
     let state = classify(&snap.rows);
-    match state {
-        ScreenState::AlreadyRunning => {
+    if let Some(err) = gate_error(&state) {
+        return Err(err);
+    }
+
+    // 2. If freebuff did not already show the picker, open it by COMMAND: type
+    //    `/model` into the idle input box and submit it. Submitting a command is
+    //    safe; a stray MESSAGE would start a billed session (see
+    //    `open_picker_via_slash_model`, which verifies the box first).
+    match picker_entry(&state) {
+        Some(PickerEntry::Visible) => {}
+        Some(PickerEntry::Open) => open_picker_via_slash_model(pty, deadline).await?,
+        None => {
             return Err(anyhow!(
-                "freebuff: already running — only one instance may run at a time; \
-                 wait for it to end or stop the other instance"
-            ));
-        }
-        ScreenState::ModelSplash | ScreenState::ModelList => {}
-        st => {
-            return Err(anyhow!(
-                "freebuff: unexpected screen while enumerating models: {st:?}"
+                "freebuff: unexpected screen while enumerating models: {state:?}"
             ));
         }
     }
 
-    // 2. Expand the picker if it is collapsed. Enter is sent ONLY when the
+    // 3. Expand the picker if it is collapsed. Enter is sent ONLY when the
     //    validated walk (see `toggle_walk_next`) proves focus has arrived at the
     //    toggle row; any unverifiable frame aborts without pressing Enter. The
     //    collapsed splash advertises the lineup size (`↓ See all N models`);
@@ -517,9 +965,17 @@ pub async fn enumerate_catalog(pty: &Pty) -> Result<Vec<CatalogEntry>> {
         }
     }
 
-    // 3. Walk the expanded list, collecting names and prices while scrolling
-    //    until the advertised total is seen or the walk converges.
-    let mut seen: Vec<(String, Option<u64>)> = Vec::new(); // (display_name, price)
+    // 4. Walk the expanded list, collecting rows while scrolling until the
+    //    advertised total is seen or the walk converges. `model_rows` strips
+    //    freebuff's ` • <effort>` suffix, carries each row's section, and picks
+    //    up any `Freebucks/hr` cost line, and its section is carried across
+    //    frames (see `collect_frame`). The v0.2.29 `/model` picker prints no
+    //    price at all; its `unlimited` section is the free tier, which
+    //    `free_price` reports as 0.
+    let mut seen: Vec<SeenEntry> = Vec::new();
+    // Last section actually seen on screen, carried across frames (see
+    // `collect_frame`).
+    let mut last_section: Option<String> = None;
     let mut presses = 0u32;
     let mut consecutive_empty = 0u32;
 
@@ -541,17 +997,7 @@ pub async fn enumerate_catalog(pty: &Pty) -> Result<Vec<CatalogEntry>> {
 
         let models = model_rows(&rows);
         let before_count = seen.len();
-        let mut newly_seen: Vec<(String, Option<u64>)> = Vec::new();
-        for row in &models {
-            if seen.iter().all(|(n, _)| *n != row.name) {
-                let price = row
-                    .cost_line
-                    .as_deref()
-                    .and_then(price_per_hour_from_cost_line);
-                newly_seen.push((row.name.clone(), price));
-            }
-        }
-        seen.extend(newly_seen);
+        collect_frame(&mut seen, &models, &mut last_section);
 
         if let Some(total) = total {
             if seen.len() >= total {
@@ -591,17 +1037,25 @@ pub async fn enumerate_catalog(pty: &Pty) -> Result<Vec<CatalogEntry>> {
         settle_after(pty, &before, deadline).await?;
     }
 
+    // Leave the picker WITHOUT selecting anything: Esc dismisses it. Every Enter
+    // inside the picker went through `toggle_walk_next` and landed on the toggle
+    // row only, so no model row was ever Entered and nothing is selected or
+    // billed. (The caller still kills the PTY on every exit path, so no orphan
+    // freebuff is left behind.)
+    let _ = pty.key(Key::Escape).await;
+    tokio::time::sleep(SETTLE).await;
+
     let catalog: Vec<CatalogEntry> = seen
         .into_iter()
-        .map(|(name, price)| {
-            let (id, id_source) = map_display_name(&name);
+        .map(|s| {
+            let (id, id_source) = map_display_name(&s.display_name);
             CatalogEntry {
                 id,
-                display_name: name,
+                display_name: s.display_name,
                 // `id` is `None` for an unmapped name; the entry is kept so the
                 // rotation is visible in `--json` / the stderr warning.
-                section: None,
-                price_per_hour: price,
+                section: s.section,
+                price_per_hour: s.price,
                 recommended: None,
                 available: None,
                 id_source,
@@ -665,6 +1119,21 @@ mod tests {
             "0227-synthetic-splash-collapsed-120x40" => {
                 fixture!("0227-synthetic-splash-collapsed-120x40")
             }
+            // VERBATIM 120x40 frames captured from the 2026-10-17 live probe of
+            // freebuff v0.2.29 (real-derived, not synthetic).
+            "0229-real-startup-no-picker-120x40" => fixture!("0229-real-startup-no-picker-120x40"),
+            "0229-real-slash-model-picker-120x40" => {
+                fixture!("0229-real-slash-model-picker-120x40")
+            }
+            "0229-real-picker-powerful-section-120x40" => {
+                fixture!("0229-real-picker-powerful-section-120x40")
+            }
+            "0229-real-picker-wrapped-description-120x40" => {
+                fixture!("0229-real-picker-wrapped-description-120x40")
+            }
+            "0229-real-picker-tail-120x40" => fixture!("0229-real-picker-tail-120x40"),
+            "0229-real-slash-popup-120x40" => fixture!("0229-real-slash-popup-120x40"),
+            "0229-real-take-over-modal-120x40" => fixture!("0229-real-take-over-modal-120x40"),
             _ => panic!("unknown fixture: {name}"),
         };
         content.lines().map(|s| s.to_string()).collect()
@@ -1293,6 +1762,623 @@ mod tests {
                 .iter()
                 .all(|e| matches!(e.id_source, IdSource::Mapped)),
             "every scrolled-in model mapped"
+        );
+        Ok(())
+    }
+
+    // --- Real freebuff v0.2.29: no startup picker, open it with `/model` -----
+    //
+    // The 2026-10-17 live probe showed freebuff 0.2.29 boots STRAIGHT to the
+    // idle input box with a model already selected and `/model to change` in the
+    // status row — there is NO startup picker. `--list-models` therefore has to
+    // open the picker by submitting `/model`. The startup frame below is
+    // VERBATIM from that probe.
+
+    /// The real startup screen is recognised as the idle/input state that needs
+    /// `/model` — NOT a picker, NOT a terminal gate, NOT an error.
+    #[test]
+    fn v0229_real_startup_without_a_picker_opens_via_slash_model() {
+        let rows = load_fixture("0229-real-startup-no-picker-120x40");
+        let state = classify(&rows);
+        assert_eq!(
+            state,
+            ScreenState::Idle,
+            "real startup must classify as Idle"
+        );
+        assert_eq!(
+            picker_entry(&state),
+            Some(PickerEntry::Open),
+            "the picker must be opened by command, not read off the startup screen"
+        );
+        assert!(
+            !matches!(state, ScreenState::ModelSplash | ScreenState::ModelList),
+            "there is no startup picker to read"
+        );
+        assert!(gate_error(&state).is_none(), "startup is not an error");
+        // The status row really does carry the model and the `/model` hint.
+        assert_eq!(
+            crate::freebuff::screen::active_model(&rows),
+            Some(("Nemotron 3.5 Lightning".to_string(), None))
+        );
+    }
+
+    /// The real `/model` picker frame is read by the existing parsers: it is a
+    /// picker, and every rendered model row is collected. This is the parser
+    /// tested against a REAL picker instead of a synthetic frame.
+    #[test]
+    fn v0229_real_slash_model_picker_is_a_picker_with_rows() {
+        let rows = load_fixture("0229-real-slash-model-picker-120x40");
+        let state = classify(&rows);
+        assert!(
+            matches!(state, ScreenState::ModelSplash | ScreenState::ModelList),
+            "the real /model picker must classify as a picker, got {state:?}"
+        );
+        assert_eq!(picker_entry(&state), Some(PickerEntry::Visible));
+        assert!(gate_error(&state).is_none());
+        // `model_rows` — the parser enumeration reads — must read the real
+        // picker with the ` • <effort>` suffix stripped and the section set.
+        let rows_parsed = model_rows(&rows);
+        assert!(
+            rows_parsed
+                .iter()
+                .any(|r| r.name == "Nemotron 3.5 Lightning"
+                    && r.section == ModelSection::Unlimited),
+            "the real picker must yield clean names + sections: {:?}",
+            rows_parsed
+                .iter()
+                .map(|r| (r.name.as_str(), r.section))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            rows_parsed.iter().all(|r| !r.name.contains('•')),
+            "the effort suffix must not leak into display names"
+        );
+        // The scrolled-continuation artifact (`3x · Recommended`) is not a name.
+        assert!(
+            rows_parsed.iter().all(|r| !r.name.starts_with('3')),
+            "a multiplier row must not be read as a model"
+        );
+    }
+
+    /// `confirmation_text` fires on freebuff's modal affordance — an
+    /// `Enter: <action>` and an `Esc: <action>` on one row — and is deliberately
+    /// blind to the idle info line (`Your first message starts the session.`)
+    /// that is present on the REAL startup screen: otherwise every enumeration
+    /// would abort before it began.
+    #[test]
+    fn confirmation_text_detects_modal_affordance_but_not_the_idle_info_line() {
+        assert_eq!(
+            confirmation_text(&["Enter: retry  Esc: back to draft".to_string()]).as_deref(),
+            Some("Enter: retry  Esc: back to draft")
+        );
+        let startup = load_fixture("0229-real-startup-no-picker-120x40");
+        // The idle info box literally says "starts the session".
+        assert!(
+            startup.iter().any(|r| r.contains("starts the session")),
+            "fixture must carry the info line for this guard to bite"
+        );
+        assert_eq!(
+            confirmation_text(&startup),
+            None,
+            "the idle info line must never read as a confirmation"
+        );
+    }
+
+    /// The detector matches by freebuff's AFFORDANCE IDIOM — an `Enter: <action>`
+    /// AND an `Esc: <action>` on one row — so BOTH live modals fire (the hours
+    /// gate and the free-plan take-over modal) regardless of wording, while
+    /// ordinary transcript prose and the healthy idle lines do not. It replaced a
+    /// spend-KEYWORD list that missed `take over` and false-matched `retry`.
+    #[test]
+    fn confirmation_detector_matches_modal_affordances_not_transcript_prose() {
+        for row in [
+            // The two REAL modal affordances captured live (2026-10-16/17).
+            "│ Enter: retry  Esc: back to draft                     │",
+            "│ Enter: take over  Esc: back to draft                 │",
+        ] {
+            assert!(
+                is_modal_affordance_row(row),
+                "must be read as a modal affordance: {row:?}"
+            );
+        }
+        // Fail-closed in BOTH directions: an `Enter:` with no `Esc:`, an `Esc:`
+        // with no `Enter:`, and ordinary prose with no colon affordance must
+        // never fire — including the transcript-style `Enter to retry` the old
+        // keyword detector false-matched on `retry`.
+        for row in [
+            "Enter to retry",
+            "│  ▍Enter a coding task or / for commands  │",
+            "│ Your first message starts the session. │",
+            "Press Enter to continue in a new session",
+            "Not enough Freebucks — 5 Freebucks/hr against 0 left. Enter opens plans.",
+            "↑↓ choose model · Tab reasoning · Enter select · Esc cancel",
+            "Enter: retry",
+            "Esc: back to draft",
+            "│ 25/25 Freebucks remaining │",
+            "│ 3/5 hours remaining │",
+            "📋 Pasted text (5,001 chars)",
+        ] {
+            assert!(!is_modal_affordance_row(row), "must NOT match: {row:?}");
+        }
+    }
+
+    /// Guard against a false positive that would break enumeration OUTRIGHT:
+    /// across EVERY screen fixture, only the frames carrying freebuff's modal
+    /// affordance may read as a confirmation. With the per-row affordance
+    /// detector that is EXACTLY the two real modal interstitials — the hours
+    /// gate and the free-plan take-over modal — both of which classify as
+    /// terminal gates first (so this is only a fail-closed backstop). The
+    /// idle/picker/transcript frames — including the real idle screens whose info
+    /// box carries `Freebucks`/`hours` copy and the resume/gate screens whose
+    /// `Enter ...` has no `Esc:` affordance — must not.
+    #[test]
+    fn no_healthy_fixture_reads_as_a_confirmation() {
+        // Fixtures that render freebuff's `Enter: x  Esc: y` modal affordance.
+        // Both are terminal gates (the hours gate and the take-over modal), so
+        // this list is a fail-closed backstop, not the thing that protects money.
+        const EXPECTED: &[&str] = &[
+            "0229-real-hours-gate-120x40.txt",
+            "0229-real-take-over-modal-120x40.txt",
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/screens");
+        let mut scanned = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("fixtures dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let content = std::fs::read_to_string(&path).expect("read fixture");
+            let rows: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+            let flagged = confirmation_text(&rows);
+            if EXPECTED.contains(&name.as_str()) {
+                assert!(flagged.is_some(), "{name} must read as a confirmation");
+            } else {
+                assert!(
+                    flagged.is_none(),
+                    "healthy fixture {name} must not be flagged: {flagged:?}"
+                );
+            }
+            scanned += 1;
+        }
+        assert!(
+            scanned >= 30,
+            "expected to scan every screen fixture, saw {scanned}"
+        );
+    }
+
+    /// BLOCKING regression, driven by three CONSECUTIVE real frames of the live
+    /// `/model` scroll: a wrapped description row must not become a model, and a
+    /// section whose header has scrolled off must still be attributed. The tail
+    /// frame alone cannot know its section, so this walks the frames the way
+    /// `enumerate_catalog` does.
+    #[test]
+    fn v0229_real_frames_drop_the_junk_row_and_keep_every_section() {
+        // The tail frame genuinely has no header on screen.
+        let tail = load_fixture("0229-real-picker-tail-120x40");
+        assert!(
+            model_rows(&tail)
+                .iter()
+                .all(|r| r.section == ModelSection::Unknown),
+            "the tail fixture must have no section header, or this test cannot bite"
+        );
+
+        let mut seen: Vec<SeenEntry> = Vec::new();
+        let mut last_section: Option<String> = None;
+        for name in [
+            // The real walk starts at the top of the list (headers on screen),
+            // then scrolls down until the headers have scrolled off.
+            "0229-real-slash-model-picker-120x40",
+            "0229-real-picker-powerful-section-120x40",
+            "0229-real-picker-wrapped-description-120x40",
+            "0229-real-picker-tail-120x40",
+        ] {
+            collect_frame(
+                &mut seen,
+                &model_rows(&load_fixture(name)),
+                &mut last_section,
+            );
+        }
+
+        // (a) the wrapped description row is gone.
+        assert!(
+            seen.iter().all(|s| !s.display_name.contains("detail")),
+            "the wrapped description row must not be a model: {:?}",
+            seen.iter()
+                .map(|s| s.display_name.as_str())
+                .collect::<Vec<_>>()
+        );
+        // (b) every real model landed in a real section, including the two that
+        //     only ever appeared after their header had scrolled off.
+        assert!(
+            seen.iter().all(|s| s.section.is_some()),
+            "every model must have a section: {:?}",
+            seen.iter()
+                .map(|s| (s.display_name.as_str(), s.section.as_deref()))
+                .collect::<Vec<_>>()
+        );
+        let section_of = |name: &str| {
+            seen.iter()
+                .find(|s| s.display_name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .section
+                .clone()
+        };
+        assert_eq!(section_of("Solar Pro 4").as_deref(), Some("unlimited"));
+        assert_eq!(
+            section_of("DeepSeek V4.1 Flash").as_deref(),
+            Some("optimized")
+        );
+        for name in [
+            "Gemini 3.8 Flash",
+            "GPT-6.1 Sol",
+            "DeepSeek V4.1 Flash Fast",
+        ] {
+            assert_eq!(
+                section_of(name).as_deref(),
+                Some("powerful"),
+                "{name} must inherit the section carried across frames"
+            );
+        }
+    }
+
+    // --- `/model` submit safety: exactly one Enter, no blind nudge ----------
+
+    /// A screen that is POSITIVELY the idle input box holding `box_text`.
+    fn idle_rows(box_text: &str) -> Vec<String> {
+        vec![
+            " GLM 5.3 Flash · 59m left · 16.4K (2%)      ✕ End session".to_string(),
+            "╭──────────────────────────────────────╮".to_string(),
+            format!("│  ▍{box_text}  │"),
+            "╰──────────────────────────────────────╯".to_string(),
+        ]
+    }
+
+    /// The real 0.2.29 idle-with-typed-text layout (verbatim shape from the
+    /// 2026-10-17 live probe): FREEBUFF banner + info box + input box + a status
+    /// row that carries `/model to change` and NO `✕ End session`.
+    fn real_typed_idle_rows(box_text: &str) -> Vec<String> {
+        vec![
+            " ███████████                        ██                 ▄████  ▄██".to_string(),
+            " ┌──────────────────────────────────────────────────────────┐".to_string(),
+            " │ Your first message starts the session.                   │".to_string(),
+            " │ Some models aren't available on this connection          │".to_string(),
+            " └──────────────────────────────────────────────────────────┘".to_string(),
+            "╭──────────────────────────────────────────────────────────╮".to_string(),
+            "│  /model      Choose the model for your next message      │".to_string(),
+            format!("│  ▍{box_text}                                              │"),
+            "╰──────────────────────────────────────────────────────────╯".to_string(),
+            " GLM 5.3 Flash • high · /private/tmp · /model to change · Chat: New chat".to_string(),
+            " ← for history · ? for help".to_string(),
+        ]
+    }
+
+    /// The single Enter is returned only for a confirmed idle screen whose box
+    /// holds EXACTLY the command. Leftover text that merely CONTAINS the command
+    /// must never authorise a keystroke — that is how a stray MESSAGE, which
+    /// starts a billed session, gets submitted.
+    #[test]
+    fn submit_step_enters_only_on_a_confirmed_idle_box_holding_exactly_the_command() {
+        let rows = idle_rows("/model");
+        assert_eq!(classify(&rows), ScreenState::Idle);
+        assert!(matches!(
+            submit_step(&classify(&rows), &rows, "/model"),
+            Ok(SubmitStep::Enter)
+        ));
+
+        // Every one of these SATISFIES the substring helper `input_box_shows`
+        // and yet would be submitted as a MESSAGE (or a different command).
+        for box_text in [
+            "/model/model",
+            "foo/model",
+            "/mod",
+            "/model junk",
+            "Enter a coding task or / for commands",
+            "",
+        ] {
+            let rows = idle_rows(box_text);
+            assert!(matches!(classify(&rows), ScreenState::Idle), "{box_text:?}");
+            assert!(
+                submit_step(&classify(&rows), &rows, "/model").is_err(),
+                "box {box_text:?} must NOT authorise Enter"
+            );
+        }
+    }
+
+    /// The real 0.2.29 idle-with-typed-text screen IS the idle input box: a live
+    /// session status row plus a rendered box holding exactly the command.
+    /// Typing into the box REPLACED the placeholder, so it must classify as
+    /// `Idle` — the classifier recognises the typed-in box itself rather than
+    /// reporting `Booting`, which is why nothing needs to widen the
+    /// authorisation. It authorises the single Enter; a bare `Booting` frame
+    /// with no status row and no box still fails closed.
+    #[test]
+    fn submit_step_accepts_the_real_typed_idle_screen_but_not_a_bare_booting_frame() {
+        let rows = real_typed_idle_rows("/model");
+        assert_eq!(
+            classify(&rows),
+            ScreenState::Idle,
+            "a typed idle box must classify as Idle, not Booting"
+        );
+        assert!(
+            crate::freebuff::screen::active_model(&rows).is_some(),
+            "a live status row is present"
+        );
+        assert!(input_box_is_exactly(&rows, "/model"));
+        assert!(matches!(
+            submit_step(&classify(&rows), &rows, "/model"),
+            Ok(SubmitStep::Enter)
+        ));
+
+        // A Booting frame (no status row, no box) authorises nothing.
+        let bare = vec![" ██████".to_string()];
+        assert_eq!(classify(&bare), ScreenState::Booting);
+        assert!(
+            submit_step(&classify(&bare), &bare, "/model").is_err(),
+            "a bare Booting frame must not authorise Enter"
+        );
+    }
+
+    /// The mixed repaint the reviewer flagged: a model picker APPEARING while a
+    /// stale idle status row and the `/model` input box are still painted. The
+    /// classifier checks the picker states BEFORE Idle, so the frame must
+    /// classify as a PICKER and the submit must press NOTHING — a blind Enter
+    /// would land on the picker's focused MODEL row and start a billed session.
+    #[test]
+    fn submit_step_treats_a_mixed_picker_and_input_frame_as_a_picker() {
+        let rows: Vec<String> = vec![
+            // A live status row, so the frame is not dismissed as Booting.
+            " GLM 5.3 Flash • high · /tmp · /model to change · Chat: New chat".to_string(),
+            // Picker rows already painted over it.
+            "│ › GLM 5.3 Flash · Deep reasoning · Images │".to_string(),
+            "│   MiMo 2.6 Pro · Strong reasoning · Images │".to_string(),
+            "↓  See all 12 models".to_string(),
+            // The stale input box, still holding exactly `/model`.
+            "╭──────────────────────────────────────╮".to_string(),
+            "│  ▍/model  │".to_string(),
+            "╰──────────────────────────────────────╯".to_string(),
+        ];
+        // The box really does hold the command, so only the CLASSIFICATION
+        // stands between this frame and a blind Enter.
+        assert!(input_box_is_exactly(&rows, "/model"));
+        let state = classify(&rows);
+        assert!(
+            matches!(state, ScreenState::ModelSplash | ScreenState::ModelList),
+            "a frame painting picker rows must classify as a picker, got {state:?}"
+        );
+        assert!(
+            matches!(submit_step(&state, &rows, "/model"), Ok(SubmitStep::Opened)),
+            "a mixed picker frame must press NOTHING"
+        );
+    }
+
+    /// The picker rendered before the read: the step must be `Opened`, i.e. the
+    /// caller returns WITHOUT pressing anything — a keypress here would land on
+    /// the picker's focused MODEL row (Enter on a model row starts a session and
+    /// spends Freebucks).
+    #[test]
+    fn submit_step_stops_without_pressing_when_a_picker_is_already_up() {
+        for name in [
+            "0229-real-slash-model-picker-120x40",
+            "0227-synthetic-splash-collapsed-120x40",
+        ] {
+            let rows = load_fixture(name);
+            let state = classify(&rows);
+            assert!(
+                matches!(state, ScreenState::ModelSplash | ScreenState::ModelList),
+                "{name}: {state:?}"
+            );
+            assert!(
+                matches!(submit_step(&state, &rows, "/model"), Ok(SubmitStep::Opened)),
+                "{name}: a picker already on screen must never authorise a keypress"
+            );
+        }
+    }
+
+    /// A gate or a start/spend confirmation aborts (Esc + a loud error) instead
+    /// of being confirmed.
+    #[test]
+    fn submit_step_aborts_on_a_gate_or_a_confirmation() {
+        let gate =
+            vec!["│ Not enough hours for MiMo Fast: an hour on it takes 2 hours. │".to_string()];
+        assert!(matches!(classify(&gate), ScreenState::HoursGate { .. }));
+        let err = submit_step(&classify(&gate), &gate, "/model")
+            .expect_err("a gate must not authorise Enter")
+            .to_string();
+        assert!(err.contains("not enough hours"), "{err}");
+
+        let confirm = vec!["Enter: take over  Esc: back to draft".to_string()];
+        let err = submit_step(&classify(&confirm), &confirm, "/model")
+            .expect_err("a modal affordance must not authorise Enter")
+            .to_string();
+        assert!(err.contains("take over"), "{err}");
+    }
+
+    /// BLOCKING: the free-plan take-over modal (a session is held ELSEWHERE; the
+    /// free plan shares one session slot across CLI and Desktop) is a terminal
+    /// gate. Enumeration must FAIL FAST with the actionable error and press
+    /// NOTHING on it — Enter would take over the other session, which AGENTS.md
+    /// forbids. The modal has NO rounded input box, so the allowlist already
+    /// fails closed; the gate turns the silent timeout into an actionable error.
+    #[test]
+    fn submit_step_refuses_on_the_take_over_modal() {
+        let rows = load_fixture("0229-real-take-over-modal-120x40");
+        let state = classify(&rows);
+        assert_eq!(
+            state,
+            ScreenState::TakeOver,
+            "the free-plan take-over modal must classify as its gate"
+        );
+        // Keyed on the modal's distinctive copy, not a bare `Take over`.
+        assert!(gate_error(&state).is_some(), "TakeOver is a terminal gate");
+        // No bottom-most ROUNDED box: the allowlist alone already fails closed.
+        assert_eq!(crate::freebuff::screen::input_box_text(&rows), None);
+        assert!(!input_box_is_exactly(&rows, "/model"));
+        let err = submit_step(&state, &rows, "/model")
+            .expect_err("the take-over modal must not authorise Enter")
+            .to_string();
+        assert!(err.contains("active elsewhere"), "{err}");
+        assert!(err.contains("will not choose `Take over`"), "{err}");
+    }
+
+    /// Fail closed: anything that is not POSITIVELY the idle screen — a repaint
+    /// with an empty grid, or unrecognised prose — authorises nothing.
+    #[test]
+    fn submit_step_fails_closed_on_an_unrecognised_screen() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(classify(&empty), ScreenState::Booting);
+        assert!(
+            submit_step(&classify(&empty), &empty, "/model").is_err(),
+            "an empty/repainting screen must never authorise Enter"
+        );
+
+        let unknown = vec!["some prose".to_string()];
+        assert_eq!(classify(&unknown), ScreenState::Unknown);
+        assert!(
+            submit_step(&classify(&unknown), &unknown, "/model").is_err(),
+            "an unrecognised screen must never authorise Enter"
+        );
+    }
+
+    /// Structural end-to-end proof: the fake opens the picker on the FIRST
+    /// Enter, so any further nudge lands on its focused MODEL row — where the
+    /// fake exits 1 (exactly what it does for a model-row Enter). The catalog
+    /// must still come back complete, proving the picker-entry path pressed
+    /// nothing after the picker opened. Guards against a nudge being
+    /// reintroduced.
+    #[tokio::test]
+    async fn enumerate_never_nudges_enter_once_the_picker_is_open() -> anyhow::Result<()> {
+        let _env_guard = ENV_LOCK.lock().await;
+        let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake-freebuff/fake-freebuff.sh");
+        let manicode =
+            std::env::temp_dir().join(format!("blink-enumerate-noswallow-{}", std::process::id()));
+        std::fs::create_dir_all(&manicode)?;
+
+        let prev_manicode = env::var("BLINK_MANICODE_DIR").ok();
+        let prev_lines = env::var("LINES").ok();
+        let prev_mode = env::var("FAKE_FREEBUFF_MODE").ok();
+        env::set_var("BLINK_MANICODE_DIR", &manicode);
+        env::set_var("LINES", "40");
+        env::set_var("FAKE_FREEBUFF_MODE", "list");
+
+        let result = (async {
+            let pty = Pty::spawn(PtyConfig {
+                program: fake.to_string_lossy().to_string(),
+                args: vec![],
+                cwd: Some(manicode.clone()),
+                env: vec![],
+                cols: 120,
+                rows: 40,
+            })
+            .await
+            .map_err(|e| anyhow!("spawn fake: {e:#}"))?;
+            let catalog = tokio::time::timeout(Duration::from_secs(20), enumerate_catalog(&pty))
+                .await
+                .map_err(|_| anyhow!("enumeration timed out"))??;
+            let _ = pty.kill().await;
+            Ok::<_, anyhow::Error>(catalog)
+        })
+        .await;
+
+        match prev_manicode {
+            Some(v) => env::set_var("BLINK_MANICODE_DIR", v),
+            None => env::remove_var("BLINK_MANICODE_DIR"),
+        }
+        match prev_lines {
+            Some(v) => env::set_var("LINES", v),
+            None => env::remove_var("LINES"),
+        }
+        match prev_mode {
+            Some(v) => env::set_var("FAKE_FREEBUFF_MODE", v),
+            None => env::remove_var("FAKE_FREEBUFF_MODE"),
+        }
+        let _ = std::fs::remove_dir_all(&manicode);
+
+        let catalog = result?;
+        assert_eq!(
+            catalog.len(),
+            10,
+            "every model must still be read, with no stray nudge after the picker opened"
+        );
+        Ok(())
+    }
+
+    /// STRUCTURAL guard: the picker-entry path writes EXACTLY ONE Enter.
+    ///
+    /// `pty.key(Enter)` only WRITES the key; it does not wait for freebuff to
+    /// consume it. A repeat guarded on a screen snapshot could therefore still be
+    /// delivered AFTER the previous Enter opened the picker — landing on a
+    /// focused MODEL row and starting a billed session. The fake records every
+    /// Enter it receives while idle, i.e. by the picker-entry path (in-picker
+    /// Enters from the toggle walk are governed separately and are not logged);
+    /// the recorded sequence must contain exactly one. Structural, not
+    /// timing-based: it asserts the recorded key sequence.
+    #[tokio::test]
+    async fn picker_entry_path_writes_exactly_one_enter() -> anyhow::Result<()> {
+        let _env_guard = ENV_LOCK.lock().await;
+        let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake-freebuff/fake-freebuff.sh");
+        let base =
+            std::env::temp_dir().join(format!("blink-enumerate-oneenter-{}", std::process::id()));
+        let manicode = base.join("manicode");
+        let keylog = base.join("keys.log");
+        std::fs::create_dir_all(&manicode)?;
+
+        let prev_manicode = env::var("BLINK_MANICODE_DIR").ok();
+        let prev_lines = env::var("LINES").ok();
+        let prev_mode = env::var("FAKE_FREEBUFF_MODE").ok();
+        let prev_keylog = env::var("FAKE_FREEBUFF_KEYLOG").ok();
+        env::set_var("BLINK_MANICODE_DIR", &manicode);
+        env::set_var("LINES", "40");
+        env::set_var("FAKE_FREEBUFF_MODE", "list");
+        env::set_var("FAKE_FREEBUFF_KEYLOG", &keylog);
+
+        let result = (async {
+            let pty = Pty::spawn(PtyConfig {
+                program: fake.to_string_lossy().to_string(),
+                args: vec![],
+                cwd: Some(manicode.clone()),
+                env: vec![],
+                cols: 120,
+                rows: 40,
+            })
+            .await
+            .map_err(|e| anyhow!("spawn fake: {e:#}"))?;
+            let catalog = tokio::time::timeout(Duration::from_secs(20), enumerate_catalog(&pty))
+                .await
+                .map_err(|_| anyhow!("enumeration timed out"))??;
+            let _ = pty.kill().await;
+            Ok::<_, anyhow::Error>(catalog)
+        })
+        .await;
+
+        match prev_manicode {
+            Some(v) => env::set_var("BLINK_MANICODE_DIR", v),
+            None => env::remove_var("BLINK_MANICODE_DIR"),
+        }
+        match prev_lines {
+            Some(v) => env::set_var("LINES", v),
+            None => env::remove_var("LINES"),
+        }
+        match prev_mode {
+            Some(v) => env::set_var("FAKE_FREEBUFF_MODE", v),
+            None => env::remove_var("FAKE_FREEBUFF_MODE"),
+        }
+        match prev_keylog {
+            Some(v) => env::set_var("FAKE_FREEBUFF_KEYLOG", v),
+            None => env::remove_var("FAKE_FREEBUFF_KEYLOG"),
+        }
+
+        let catalog = result?;
+        assert_eq!(catalog.len(), 10, "the catalog must still be read");
+
+        let log = std::fs::read_to_string(&keylog).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&base);
+        let enters = log.lines().filter(|l| *l == "idle-enter").count();
+        assert_eq!(
+            enters, 1,
+            "the picker-entry path must write EXACTLY ONE Enter; recorded key log:\n{log}"
         );
         Ok(())
     }

@@ -19,11 +19,13 @@ use crate::acp::{
 use crate::freebuff::chats::{
     chats_dir, instance_owner, newest_new_chat, snapshot, CHAT_MESSAGES, LOG,
 };
+use crate::freebuff::enumerate::type_and_confirm_command;
 use crate::freebuff::log::{outcome, parse_log_line, saw_auth_failure, LogEvent, TurnOutcome};
 use crate::freebuff::screen::{
     active_model, check_active_model, classify, input_box_is_empty, input_box_shows,
     input_box_text, match_model, model_rows, nav_ring, pasted_chip_chars, plan_select_step,
     prompt_visible, resolve_model_id, ModelMatch, ScreenState, SelectStep, SPLASH_ACCEPT_KEY,
+    TAKE_OVER_ERROR,
 };
 use crate::freebuff::settings::{settings_path, SettingsPin};
 use crate::freebuff::transcript::{diff, parse_messages, Block, Cursor, Delta, Message};
@@ -154,6 +156,7 @@ fn is_terminal_gate(state: &ScreenState) -> bool {
         state,
         ScreenState::HoursGate { .. }
             | ScreenState::FreebucksGate { .. }
+            | ScreenState::TakeOver
             | ScreenState::AlreadyRunning
             | ScreenState::Login
             | ScreenState::KickedOut
@@ -192,6 +195,7 @@ fn terminal_gate_error(state: &ScreenState, manicode_dir: &Path) -> Option<anyho
         ScreenState::FreebucksGate { message } => {
             Some(anyhow!("freebuff: not enough Freebucks — {}", message))
         }
+        ScreenState::TakeOver => Some(anyhow!("{}", TAKE_OVER_ERROR)),
         ScreenState::AlreadyRunning => {
             let owner_pid = instance_owner(manicode_dir)
                 .map(|(_, pid)| pid.to_string())
@@ -1034,6 +1038,16 @@ impl FreebuffBackend {
                     return Err(terminal_gate_error(&state, &self.manicode_dir())
                         .expect("FreebucksGate is terminal (see is_terminal_gate)"));
                 }
+                ScreenState::TakeOver => {
+                    // The free plan shares one session slot across CLI and
+                    // Desktop: a session is active ELSEWHERE. bufflink never
+                    // presses Enter on this modal (AGENTS.md forbids taking
+                    // over), so fail fast with the actionable error.
+                    info!("startup: free-plan take-over modal detected");
+                    let _ = pty.kill().await;
+                    return Err(terminal_gate_error(&state, &self.manicode_dir())
+                        .expect("TakeOver is terminal (see is_terminal_gate)"));
+                }
                 ScreenState::AlreadyRunning => {
                     info!("startup: already running dialog detected");
                     let _ = pty.kill().await;
@@ -1482,6 +1496,16 @@ impl Backend for FreebuffBackend {
         }
     }
 
+    /// End the session: Esc a busy screen, type `/exit` and CONFIRM it reached
+    /// the input box before Enter, wait for the child, then kill its whole
+    /// process group, then restore the settings pin.
+    ///
+    /// Always returns, on every path: the confirmation is bounded by
+    /// `exit_timeout` (as are the wait and the busy-Esc settle), and the kill is
+    /// unconditional because a surviving descendant would keep the
+    /// single-instance lock. A session that could NOT be exited cleanly is
+    /// reported loudly — see [`STRANDED_SESSION_WARNING`] — because freebuff
+    /// may still hold it server-side.
     fn shutdown(&self) -> impl Future<Output = ()> + Send {
         let this = self;
         async move {
@@ -1507,10 +1531,34 @@ impl Backend for FreebuffBackend {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
 
-            // Send /exit and Enter
-            info!("shutdown: sending /exit");
-            let _ = pty.type_text(EXIT_COMMAND).await;
-            let _ = pty.key(Key::Enter).await;
+            // Send /exit — and CONFIRM it reached the input box before Enter.
+            //
+            // Typing it blind is what stranded the user's session: freebuff
+            // FLUSHES its input queue (the same flush that loses a first
+            // `/model`), so `/exit` can silently vanish, Enter then submits
+            // nothing, `wait_exit` times out and the pty is killed — while
+            // freebuff's BACKEND keeps the session held. freebuff's free plan
+            // allows ONE session slot shared across CLI and Desktop, so that is
+            // a lockout of the user's own account, and the command is therefore
+            // typed through the same type-and-confirm discipline `/model` uses,
+            // bounded by `exit_timeout` so shutdown cannot hang on it.
+            info!("shutdown: typing /exit and confirming it reached the input box");
+            let confirm_deadline = Instant::now() + this.cfg.exit_timeout;
+            match type_and_confirm_command(&pty, EXIT_COMMAND, confirm_deadline).await {
+                Ok(()) => {
+                    info!("shutdown: /exit confirmed in the input box, sending Enter");
+                    let _ = pty.key(Key::Enter).await;
+                }
+                Err(e) => {
+                    warn!(
+                        error = %format!("{e:#}"),
+                        "shutdown: {} was NOT confirmed in the input box, so Enter was NOT sent \
+                         and this session was not exited cleanly. {}",
+                        EXIT_COMMAND,
+                        STRANDED_SESSION_WARNING
+                    );
+                }
+            }
 
             // Wait for exit, then always kill the whole process group.
             // `pty.kill()` is a no-op once the child is reaped, but the
@@ -1523,12 +1571,16 @@ impl Backend for FreebuffBackend {
                 }
                 Ok(None) => {
                     warn!(
-                        "shutdown: child did not exit within {:?}, killing",
-                        this.cfg.exit_timeout
+                        "shutdown: child did not exit within {:?} of {} + Enter, killing it. {}",
+                        this.cfg.exit_timeout, EXIT_COMMAND, STRANDED_SESSION_WARNING
                     );
                 }
                 Err(e) => {
-                    error!(error = %e, "shutdown: error waiting for exit");
+                    error!(
+                        error = %e,
+                        "shutdown: error waiting for exit, killing the child. {}",
+                        STRANDED_SESSION_WARNING
+                    );
                 }
             }
             let _ = pty.kill().await;
@@ -1540,6 +1592,20 @@ impl Backend for FreebuffBackend {
         }
     }
 }
+
+/// Appended to every shutdown warning where freebuff's session may still be
+/// held server-side.
+///
+/// A stranded session is INVISIBLE otherwise: the process is gone, nothing
+/// fails, and the user only discovers it when their next launch renders the
+/// `Take over` modal. freebuff's free plan allows ONE session slot shared
+/// across the CLI and Desktop, so the backend still holding the session locks
+/// the user out of their own account until it expires. Every path that can
+/// leave it held says so, and says how to reclaim it.
+const STRANDED_SESSION_WARNING: &str = "The freebuff SESSION MAY STILL BE HELD SERVER-SIDE: the \
+     free plan allows ONE session slot shared across the CLI and Desktop, so a session this \
+     backend did not exit cleanly locks this account out of freebuff until it expires. Reclaim \
+     it by running `freebuff` and choosing `Take over`.";
 
 /// Last-resort settings restore when the backend itself is dropped.
 ///
@@ -2500,6 +2566,51 @@ mod tests {
         );
     }
 
+    /// The free plan shares one session slot across CLI and Desktop. When a
+    /// session is held ELSEWHERE (no local freebuff process), freebuff shows the
+    /// take-over modal. Startup must fail FAST on it — never press Enter (AGENTS.md
+    /// forbids taking over), never burn the whole startup timeout — with an error
+    /// that says a session is active elsewhere, that bufflink will not take it
+    /// over, and what the user can do.
+    #[tokio::test]
+    async fn t20_startup_fails_fast_on_take_over_modal() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("take-over"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let start = Instant::now();
+        let result = backend.new_session(temp_dir.clone()).await;
+        let elapsed = start.elapsed();
+
+        let err = result
+            .expect_err("startup must fail on the take-over modal")
+            .to_string();
+        assert!(
+            err.contains("active elsewhere"),
+            "must state the session is held elsewhere: {err}"
+        );
+        assert!(
+            err.contains("will not choose `Take over`"),
+            "must state bufflink will not take over: {err}"
+        );
+        assert!(
+            err.contains("close the other freebuff session")
+                && err.contains("take over manually in freebuff"),
+            "must say what the user can do: {err}"
+        );
+        assert!(
+            !err.contains("startup timeout"),
+            "must fail fast, not time out: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "fast-fail should be well under the {elapsed:?} it took"
+        );
+
+        backend.shutdown().await;
+    }
+
     /// Fail-fast guard for the v0.3.1 no-auth signature. The log line cannot
     /// prove a single cause (a second freebuff instance produces the same
     /// lines), so the error states what was OBSERVED and the checks to make,
@@ -2638,6 +2749,7 @@ mod tests {
             ScreenState::FreebucksGate {
                 message: "Not enough Freebucks — 5 Freebucks/hr against 0 left.".to_string(),
             },
+            ScreenState::TakeOver,
             ScreenState::AlreadyRunning,
             ScreenState::Login,
             ScreenState::KickedOut,
@@ -2844,6 +2956,300 @@ mod tests {
         }
     }
 
+    /// A `tracing` writer that keeps every event in a buffer, so a test can
+    /// assert on the logs a path actually emitted. `set_default` installs a
+    /// THREAD-LOCAL dispatcher, and `#[tokio::test]` runs the current-thread
+    /// runtime, so everything the backend emits while the guard is alive lands
+    /// here.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogBuf {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    /// Warnings-only subscriber writing into `buf`.
+    fn capture_warnings(buf: &LogBuf) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    /// The fake's key log, one key per line (`exit-tui` modes only).
+    fn read_keylog(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    /// The bytes the caller TYPED, per the key log — including the ones the fake
+    /// dropped without rendering.
+    fn typed_bytes(keys: &[String]) -> String {
+        keys.iter()
+            .filter_map(|k| k.strip_prefix("char:"))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn count_key(keys: &[String], key: &str) -> usize {
+        keys.iter().filter(|k| k.as_str() == key).count()
+    }
+
+    /// Take the live pty out of the backend so a test can inspect the screen and
+    /// reap the child after shutdown.
+    async fn session_pty(backend: &FreebuffBackend) -> Arc<Pty> {
+        let guard = backend.session.lock().await;
+        guard.as_ref().expect("a live session").pty.clone()
+    }
+
+    /// The settings the pin must put back, byte for byte.
+    fn pinned_settings() -> serde_json::Value {
+        serde_json::json!({
+            "mode": "DEFAULT",
+            "adsEnabled": true,
+            "freebuffModel": "mimo/mimo-v2.5",
+            "freebuffModelKey": "m-00032eaeec"
+        })
+    }
+
+    /// The bug this fixes: shutdown typed `/exit` blind, and because freebuff
+    /// FLUSHES its input queue the command could vanish — Enter then submitted
+    /// nothing, the pty was killed, and freebuff's backend kept the session held
+    /// (one slot across CLI and Desktop on the free plan). With the queue
+    /// flushing exactly one `/exit` burst, shutdown must notice, re-type,
+    /// confirm the box holds `/exit`, and only THEN send ONE Enter — and the
+    /// child must exit cleanly, so nothing is stranded.
+    #[tokio::test]
+    async fn shutdown_retypes_exit_after_an_input_flush_and_enters_once() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(&temp_dir, pinned_settings());
+        let original_bytes = std::fs::read(settings_path(&temp_dir)).unwrap();
+
+        let keylog = temp_dir.join("keys.log");
+        let mut cfg = test_config(&temp_dir, Some("exit-flush"));
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        // The flushed burst burns a full confirm window before the retry, so the
+        // budget `exit_timeout` bounds has to outlive one attempt.
+        cfg.exit_timeout = Duration::from_secs(8);
+        cfg.env.push((
+            "FAKE_FREEBUFF_KEYLOG".to_string(),
+            keylog.to_string_lossy().to_string(),
+        ));
+
+        let backend = FreebuffBackend::new(cfg);
+        let _session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+        let pty = session_pty(&backend).await;
+
+        let logs = LogBuf::default();
+        let guard = capture_warnings(&logs);
+        let result = timeout(Duration::from_secs(30), backend.shutdown()).await;
+        drop(guard);
+        assert!(result.is_ok(), "shutdown timed out");
+
+        let keys = read_keylog(&keylog);
+        assert_eq!(
+            typed_bytes(&keys),
+            "/exit/exit",
+            "the flushed burst must be re-typed: {keys:?}"
+        );
+        assert_eq!(count_key(&keys, "enter"), 1, "exactly one Enter: {keys:?}");
+        assert_eq!(
+            keys.last().map(String::as_str),
+            Some("enter"),
+            "Enter only once the box held /exit: {keys:?}"
+        );
+        assert!(
+            pty.wait_exit(Duration::from_secs(2))
+                .await
+                .unwrap()
+                .is_some(),
+            "a confirmed /exit must let the child exit cleanly"
+        );
+        assert!(
+            !logs.text().contains("MAY STILL BE HELD SERVER-SIDE"),
+            "a confirmed, clean exit must not claim the session is stranded: {}",
+            logs.text()
+        );
+
+        assert_eq!(
+            std::fs::read(settings_path(&temp_dir)).unwrap(),
+            original_bytes,
+            "shutdown must restore the settings pin"
+        );
+        assert!(backend.settings_pin.lock().await.is_none());
+    }
+
+    /// The loud half of the fix: when `/exit` can NOT be confirmed, Enter must
+    /// NOT be sent onto a box that does not hold it, and the warning must say
+    /// the session may still be held server-side, that the free plan shares one
+    /// slot across CLI and Desktop, and how to reclaim it. Shutdown must still
+    /// return, still kill the child (no orphan), and still restore the pin.
+    #[tokio::test]
+    async fn shutdown_warns_loudly_when_exit_cannot_be_confirmed() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        write_settings(&temp_dir, pinned_settings());
+        let original_bytes = std::fs::read(settings_path(&temp_dir)).unwrap();
+        let backup = backup_path(&settings_path(&temp_dir));
+
+        let keylog = temp_dir.join("keys.log");
+        let mut cfg = test_config(&temp_dir, Some("exit-flush"));
+        cfg.model = Some("z-ai/glm-5.3-flash".to_string());
+        cfg.exit_timeout = Duration::from_secs(2);
+        cfg.env.push((
+            "FAKE_FREEBUFF_KEYLOG".to_string(),
+            keylog.to_string_lossy().to_string(),
+        ));
+        // The queue never drains: nothing typed is ever rendered, so the box can
+        // never be confirmed.
+        cfg.env
+            .push(("FAKE_FREEBUFF_FLUSH_BYTES".to_string(), "all".to_string()));
+
+        let backend = FreebuffBackend::new(cfg);
+        let _session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+        assert!(backup.exists(), "the pin must have captured a backup");
+        let pty = session_pty(&backend).await;
+
+        let logs = LogBuf::default();
+        let guard = capture_warnings(&logs);
+        let result = timeout(Duration::from_secs(30), backend.shutdown()).await;
+        drop(guard);
+        assert!(
+            result.is_ok(),
+            "shutdown must always return, even when /exit never lands"
+        );
+
+        let keys = read_keylog(&keylog);
+        assert_eq!(
+            typed_bytes(&keys),
+            "/exit",
+            "the command must have been typed, and only re-typed while the budget lasts: {keys:?}"
+        );
+        assert_eq!(
+            count_key(&keys, "enter"),
+            0,
+            "Enter must NEVER be sent onto an unconfirmed box: {keys:?}"
+        );
+
+        let text = logs.text();
+        assert!(
+            text.contains("MAY STILL BE HELD SERVER-SIDE"),
+            "the warning must say the session may still be held: {text}"
+        );
+        assert!(
+            text.contains(
+                "the free plan allows ONE session slot shared across the CLI and Desktop"
+            ),
+            "the warning must explain the single shared slot: {text}"
+        );
+        assert!(
+            text.contains("running `freebuff` and choosing `Take over`"),
+            "the warning must say how to reclaim the session: {text}"
+        );
+
+        assert!(
+            pty.wait_exit(Duration::from_secs(2))
+                .await
+                .unwrap()
+                .is_some(),
+            "the kill fallback must still reap the child"
+        );
+
+        assert_eq!(
+            std::fs::read(settings_path(&temp_dir)).unwrap(),
+            original_bytes,
+            "shutdown must restore the settings pin on this path too"
+        );
+        assert!(backend.settings_pin.lock().await.is_none());
+        assert!(!backup.exists());
+    }
+
+    /// A busy screen still gets Esc first (the behaviour is unchanged): the
+    /// screen is busy until the fake receives that Esc, and only then can the
+    /// idle box hold `/exit`.
+    #[tokio::test]
+    async fn shutdown_escs_a_busy_screen_before_confirming_exit() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let keylog = temp_dir.join("keys.log");
+        let trigger = temp_dir.join("busy.trigger");
+
+        let mut cfg = test_config(&temp_dir, Some("exit-busy"));
+        cfg.env.push((
+            "FAKE_FREEBUFF_KEYLOG".to_string(),
+            keylog.to_string_lossy().to_string(),
+        ));
+        cfg.env.push((
+            "FAKE_FREEBUFF_BUSY_TRIGGER".to_string(),
+            trigger.to_string_lossy().to_string(),
+        ));
+
+        let backend = FreebuffBackend::new(cfg);
+        let _session_id = backend.new_session(temp_dir.clone()).await.unwrap();
+        let pty = session_pty(&backend).await;
+
+        // Go busy, and wait for the STATE rather than sleeping: the fake draws
+        // its busy status row as soon as the trigger file exists.
+        std::fs::write(&trigger, b"").unwrap();
+        pty.wait_for(
+            |s| matches!(classify(&s.rows), ScreenState::Busy { .. }),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the fake must reach Busy");
+
+        let result = timeout(Duration::from_secs(30), backend.shutdown()).await;
+        assert!(result.is_ok(), "shutdown timed out");
+
+        let keys = read_keylog(&keylog);
+        assert_eq!(
+            keys.first().map(String::as_str),
+            Some("esc"),
+            "Esc must be sent first on a busy screen: {keys:?}"
+        );
+        assert_eq!(typed_bytes(&keys), "/exit", "typed keys: {keys:?}");
+        assert_eq!(count_key(&keys, "enter"), 1, "exactly one Enter: {keys:?}");
+        assert_eq!(
+            keys.last().map(String::as_str),
+            Some("enter"),
+            "Enter only after the box held /exit: {keys:?}"
+        );
+        assert!(
+            pty.wait_exit(Duration::from_secs(2))
+                .await
+                .unwrap()
+                .is_some(),
+            "the child must exit cleanly after the busy Esc"
+        );
+    }
+
     #[tokio::test]
     async fn t10_startup_timeout_kills_child() {
         let tmp = test_temp_dir();
@@ -2865,10 +3271,13 @@ mod tests {
         );
         // Fail loudly: the error must name the last observed screen state and
         // carry a bounded tail of the screen, not just the elapsed time.
-        // The fake's narrow splash box wraps its continuation rows with `│`
-        // borders, so its model rows count as an expanded list.
+        // The fake's splash is the COLLAPSED picker — one model box plus
+        // `↓ See all 4 models` — so it classifies as ModelSplash. (It used to be
+        // read as ModelList because the narrow box's continuation row
+        // `│    Images · NEW` was miscounted as a second model; the name-row
+        // indent rule in `screen::model_rows` now rejects it.)
         assert!(
-            err.contains("state=ModelList"),
+            err.contains("state=ModelSplash"),
             "error should name the last observed screen state: {}",
             err
         );

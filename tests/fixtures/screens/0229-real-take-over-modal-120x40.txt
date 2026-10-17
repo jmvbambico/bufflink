@@ -1,0 +1,14 @@
+ ┌────────────────────────────────────────────────────────────────┐
+ │ May use data for AI training                                   │
+ │ Your first message starts the session.                         │
+ │ Some models aren't available on this connection                │
+ │ 2 day streak                                                   │
+ └────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Limited access without a subscription allows one session across CLI and Desktop. Take over to stop the other│
+│ session and use it here.                                                                                    │
+│ Enter: take over  Esc: back to draft                                                                        │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Solar Pro 4 · /private/var/folders/kl/8t4rp31969n3ts1h9_xm09k80000gn/T/blink-e2e-50327-abc · /model to change · Chat: New chat
+ ← for history · ? for help

@@ -40,6 +40,7 @@ usable as parser fixtures in `captures/`.
 | 1b Freebucks gate | inside the model box: `Not enough Freebucks — … Enter opens plans.` | **stop**: surface an ACP error; never press Enter (opens purchase). |
 | 1b′ hours gate (v0.2.29, 2026-10-16) | freebuff 0.2.x bills a session in HOURS, and refuses a turn with a bordered interstitial: `Not enough hours for <Model>: an hour on it takes N hours.` / `Choose another model with /model or visit https://freebuff.com/plans.` / `Enter: retry  Esc: back to draft`, plus a session banner `N/M hours remaining`. The model and the `N hours` figure vary. Captured frame: `tests/fixtures/screens/0229-real-hours-gate-120x40.txt`. | **stop**: surface an ACP error naming the model and the shortfall; never press Enter (retry could start a session the user cannot afford) and never auto-dismiss. Detected in both startup and prompt-submit paths. |
 | 1c already running | `Freebuff is already running` / `Only one freebuff instance is allowed at a time.` / buttons `Take over` (default, highlighted) `Exit` | **stop**: choose `Exit` (→ arrow then Enter, or just report and kill) and surface an ACP error naming the owner pid from `freebuff-instance-owner.json`. Never take over. |
+| 1e free-plan take-over (v0.2.29, 2026-10-17) | freebuff's free tier shares ONE session slot across CLI and Desktop, so a session active **elsewhere** (no local freebuff process) shows a modal: `Limited access without a subscription allows one session across CLI and Desktop. Take over to stop the other session and use it here.` / `Enter: take over  Esc: back to draft`. Captured frame: `tests/fixtures/screens/0229-real-take-over-modal-120x40.txt`. | **stop**: surface an ACP error — a freebuff session is active elsewhere; close the other session, or take over manually in freebuff. **Never** press Enter (AGENTS.md: never choose `Take over`). Detected in the startup loop, the prompt-submit wait, and `--list-models` enumeration, so each fails fast instead of timing out. |
 | 2 idle | `Freebuff will run commands on your behalf to help you build.`, `Directory <cwd>`, status `GLM 5.3 Flash · 59m left · 16.4K (2%)` + `✕ End session` on the right, bordered input box with `▍Enter a coding task or / for commands` | ready |
 | 3 busy | status bar becomes `thinking... <N>s  ■ Esc` (or `working... <N>s  ■ Esc`); content shows `• Thinking` (or `▸ Thinking` collapsed), tool lines like `$ echo hello` / `• Create probe.txt`, then the reply, then `⌘ • <N>s • △▽`. The elapsed counter is absent in the first instant (` working...   ■ Esc`); after a large paste it can take >5 s to appear. | poll transcript on disk |
 | 4 kicked out | `Another freebuff instance took over this account.` / `Only one CLI per account can be active at a time.` / `Close the other instance, then restart freebuff here.` / `Press Ctrl+C to exit.` | surface ACP error; Ctrl-C exits it |
@@ -94,7 +95,9 @@ entry and fails loudly when it does not match the request.
 - `freebuff-instance-owner.json` (`{instanceId, pid}`) is written when the
   splash is accepted, **never removed**; a stale pid does not block the next
   start. On SIGTERM the bridge should type `/exit` and give it ~3 s before
-  killing the child (omnigent's SIGTERM→SIGKILL budget is 5 s).
+  killing the child (omnigent's SIGTERM→SIGKILL budget is 5 s). The `/exit` must
+  be CONFIRMED in the input box before the Enter — a blind `/exit` can be
+  flushed away and strand the session (see the bridge-runs note below).
 
 ## Approvals — there are none in this build
 
@@ -176,9 +179,103 @@ never choose `Take over`.
 - The chat directory is created at **launch** (splash accept), before the
   first prompt; `chat-messages.json` appears only after the first turn.
 - Typing `/exit` + Enter from the bridge did **not** exit freebuff within 3 s
-  in any of the three runs (it did in the manual tmux probe). Suspect the
-  slash-autocomplete popup swallows the first Enter. The bridge falls back to
-  SIGTERM/SIGKILL on the child's **process group**: the npm launcher forwards
-  no signals, and the real Bun binary survives SIGHUP from the closing PTY.
+  in any of the three runs (it did in the manual tmux probe). The popup was
+  blamed then, and the Enter written in the SAME burst as the text after that —
+  the popup does **not** swallow Enter (v0.2.29 note below). The likelier cause
+  is freebuff's **input-queue flush**: it paints the idle screen a beat before it
+  starts reading input and flushes whatever arrived in between, the same flush
+  that loses a first `/model` (measured live 2026-10-17). A flushed `/exit`
+  vanishes, the Enter then submits nothing, `wait_exit` times out and the pty is
+  killed — with the session still held server-side. Nothing verified the command
+  had landed, because shutdown typed and Entered blind.
+  **Consequence — a STRANDED session.** freebuff's free plan allows ONE session
+  slot shared across CLI and Desktop, so a session the backend still holds locks
+  the user out of their own account until it expires, and it shows up only as the
+  `Take over` modal on their next launch (observed 2026-10-17: exactly that,
+  after a bridge run). Fixed by typing `/exit` through the same type-and-confirm
+  discipline `/model` uses — the box must hold EXACTLY `/exit`
+  (`input_box_is_exactly`) before ONE Enter, bounded by `exit_timeout` — and by
+  warning LOUDLY, naming the single shared slot and `freebuff` → `Take over`, on
+  every path that cannot confirm it or that kills the child.
+  The bridge falls back to SIGTERM/SIGKILL on the child's **process
+  group**: the npm launcher forwards no signals, and the real Bun binary
+  survives SIGHUP from the closing PTY.
 - Splash → Idle takes ~2.3 s; a trivial turn 3–7 s; Esc cancel is honoured
   in < 0.4 s and the next prompt works in the same session.
+
+## v0.2.29 — NO startup picker; `/model` opens the picker (probed 2026-10-17)
+
+freebuff **0.2.29 has no startup model picker**: it boots straight to the idle
+input box with a model ALREADY selected and `/model to change` in the status
+row. A driver that waits for a splash waits forever. `blink --list-models` now
+opens the picker by COMMAND.
+
+- **Open it:** type `/model` into the input box and submit. Typing must only be
+  submitted once the box positively shows `/model`: freebuff's first MESSAGE
+  starts a billed session, so a stray keystroke is expensive. The enumeration
+  path never types a message.
+- **The first Enter is NOT swallowed.** `/` pops a slash-autocomplete menu
+  rendered INSIDE the input box, ABOVE the typed line (`/model      Choose the
+  model for your next message`), from the first character typed — but submitting
+  `/model` opens the picker on the FIRST Enter. Measured live 2026-10-17 against
+  0.2.29 (4/4 attempts, one per round of a single session): type `/model`, send
+  ONE Enter, the picker opens. The earlier "first Enter is swallowed" note was a
+  misdiagnosis of the same-burst quirk — a trailing Enter written in the SAME
+  burst as the text does not submit, and blink sends the Enter as its own write
+  after the box is confirmed. A blind `/exit` + Enter in one burst never left
+  freebuff — and the likelier reason is the input-queue flush, not the popup or
+  the burst (see the 2026-09-20 note above), which is why shutdown now verifies
+  the box holds exactly `/exit` before Enter. Popup frame kept as
+  `tests/fixtures/screens/0229-real-slash-popup-120x40.txt`. The popup is
+  detected by a `/command` followed by 2+ spaces and a description; the typed
+  line itself has no description, so a CLOSED popup is never mistaken for one.
+- **EXACTLY ONE Enter — never a repeat.** `pty.key` only WRITES a key; it does
+  not wait for freebuff to consume it (`pty.key(Enter)` returns as soon as the
+  bytes are written). A repeat guarded on a screen snapshot can therefore be
+  delivered AFTER the first Enter opened the picker, landing on its focused MODEL
+  row and starting a billed session — so no repeat is sent at all. Enter is sent
+  only after a freshly read screen POSITIVELY shows the idle input box holding
+  EXACTLY `/model` (never the substring `input_box_shows`); anything else fails
+  closed. If the picker does not open on that one Enter, `--list-models` fails
+  loudly (og falls back to its own list) rather than nudging again.
+- **The idle-with-typed-text screen classifies as `Booting`, not `Idle`.** The
+  banner is up and the input placeholder is gone, so `classify` cannot reach
+  `Idle`; the positive idle evidence the submit path uses is a live session
+  STATUS ROW (`active_model`) plus the box holding exactly the command. A
+  `Booting` frame with no status row (a half-painted repaint) still fails closed.
+- **Verify the box by EQUALITY, not substring.** `input_box_shows` is a contains
+  match (it prefix-matches a long prompt), so a box holding `foo/model` or
+  `/model/model` passes it — and submitting that sends a MESSAGE, which starts a
+  billed session. The submit path uses `input_box_is_exactly`: the box must be
+  EMPTY before typing (cleared with bounded Backspaces and re-verified, never
+  typed into blind) and hold exactly the command before submitting.
+- **A burst typed the instant Idle appears is LOST.** freebuff paints its idle
+  screen a beat before it starts reading input and flushes the input queue on
+  init; re-type (bounded) until the box shows the command.
+- **The picker is a full SCROLLABLE list, not the collapsed splash.** UPPERCASE
+  section labels (`UNLIMITED · …`, `OPTIMIZED · …`, `POWERFUL · …`), one model
+  per SQUARE box with a ` • <effort>` suffix and a ` · ` tagline, and a
+  `↑↓ choose model · Tab reasoning · Enter select · Esc cancel` footer. There is
+  **no `See all` / `Show fewer` toggle** — so the guarded toggle walk is not
+  used here, and the list is read by scrolling with Down.
+- **No `Freebucks/hr` price is shown at all.** `UNLIMITED` is the free tier
+  (`price_per_hour: 0`); other sections show a multiplier (`2x`, `3x`…) or
+  `Paid plan`, which the JSON reports as an unknown price, never a guess.
+- **A promo/ad box (ROUNDED `╭…╮`) is drawn inside the picker.** Model boxes are
+  SQUARE. Scrolling can leave only a box's centered continuation row visible
+  (`3x · Recommended`), which is not a model.
+- **A model NAME row is indented to the focus-marker column** (`│ › Name …`
+  focused, `│   Name …` unfocused); a box's description/status rows are
+  LEFT-aligned at one space (`│ detail. …`, `│ NVIDIA's …`) or centered. That
+  indent is the only thing separating a name from a wrapped DESCRIPTION that
+  happens to contain the tagline separator — e.g.
+  `│ detail. Claude Haiku 5.5 · 100k context is the same model at a lower hourly │`
+  was previously read as a model named `detail. Claude Haiku 5.5`.
+- **A section's header scrolls off the top before its last models do,** so a
+  frame can show a section's models with no header at all (`Gemini 3.8 Flash`,
+  `GPT-6.1 Sol` arrived that way and came back section-less). The walk carries
+  the last section it saw forward across frames.
+- Real frames kept as fixtures: `tests/fixtures/screens/0229-real-startup-no-picker-120x40.txt`,
+  `0229-real-slash-model-picker-120x40.txt` (top of the picker) and the three
+  consecutive scroll frames `0229-real-picker-{powerful-section,wrapped-description,tail}-120x40.txt`.
+
