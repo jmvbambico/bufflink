@@ -14,8 +14,8 @@
 //! name is dropped from the plain output (and flagged on stderr / in `--json`).
 
 use crate::freebuff::screen::{
-    classify, input_box_shows, model_rows, nav_ring, toggle_row_has_focus_marker, ModelRow,
-    ModelSection, ScreenState,
+    classify, input_box_is_empty, input_box_is_exactly, model_rows, nav_ring, slash_popup_shows,
+    toggle_row_has_focus_marker, ModelRow, ModelSection, ScreenState,
 };
 use crate::pty::{Key, Pty};
 use anyhow::{anyhow, Result};
@@ -36,6 +36,10 @@ const MAX_MODEL_SUBMITS: u32 = 3;
 /// queue when it finishes initialising, so the first attempt can vanish; a
 /// single re-type covers it, and the bound keeps a wedged TUI from looping.
 const MAX_TYPE_ATTEMPTS: u32 = 4;
+/// Max Backspaces used to clear a NON-EMPTY input box before typing. Bounded,
+/// and the box is re-read afterwards and must be empty: a counted clear against
+/// arbitrary text cannot be trusted, so an unclearable box aborts instead.
+const MAX_CLEAR_BACKSPACES: u32 = 64;
 /// How many unreadable frames to tolerate before refusing to press Enter. A
 /// half-painted frame can classify as the splash before its model row is drawn;
 /// re-reading a few times is safe because no Enter is sent while unverified.
@@ -588,39 +592,71 @@ fn free_price(section: Option<&str>) -> Option<u64> {
     (section == Some(UNLIMITED_LABEL)).then_some(0)
 }
 
-/// Type `cmd` into the input box and confirm the box shows it, re-typing
-/// (bounded) until it does. Before each re-type the line is cleared with
-/// Backspace so a partial landing cannot corrupt the command. Returns `Ok(true)`
-/// once the box shows `cmd`, `Ok(false)` when the attempts or deadline run out.
+/// Clear the input box if it is not already empty (the placeholder state).
 ///
-/// This is the guard that keeps a stray MESSAGE from ever being submitted: the
-/// caller must not press Enter until this returns `true`.
-async fn type_and_confirm_command(pty: &Pty, cmd: &str, deadline: Instant) -> Result<bool> {
-    for attempt in 0..MAX_TYPE_ATTEMPTS {
+/// Returns `Ok(true)` only when a FRESH read shows the box empty. Returns
+/// `Ok(false)` when it could not be cleared. NEVER presses Enter, so it cannot
+/// submit anything however the clear goes.
+async fn ensure_input_box_empty(pty: &Pty, deadline: Instant) -> Result<bool> {
+    if input_box_is_empty(&pty.screen().rows) {
+        return Ok(true);
+    }
+    for _ in 0..MAX_CLEAR_BACKSPACES {
         if Instant::now() >= deadline {
             return Ok(false);
         }
-        if attempt > 0 {
-            // Clear anything a previous (possibly partial) attempt left behind.
-            for _ in 0..cmd.chars().count() + 2 {
-                pty.key(Key::Backspace).await?;
-            }
-            tokio::time::sleep(SETTLE).await;
+        pty.key(Key::Backspace).await?;
+    }
+    tokio::time::sleep(SETTLE).await;
+    // Re-verify from a fresh read: a counted clear is a guess, and guessing
+    // against unknown text is how a stray MESSAGE gets submitted.
+    Ok(input_box_is_empty(&pty.screen().rows))
+}
+
+/// Get the input box to hold EXACTLY `cmd`, or fail loudly without pressing
+/// Enter.
+///
+/// Two rules, both because a stray MESSAGE starts a billed session:
+///
+/// * The box must be EMPTY before we type. If it is not, it is cleared with a
+///   bounded number of Backspaces and RE-VERIFIED empty; an unclearable box
+///   aborts rather than being typed into blind.
+/// * After typing, the box must hold EXACTLY `cmd`
+///   ([`input_box_is_exactly`], not the substring [`input_box_shows`]), because
+///   a box like `foo/model` or `/model/model` would otherwise pass and be
+///   submitted as a message. A retry clears deterministically again first, so
+///   leftovers can never accumulate.
+async fn type_and_confirm_command(pty: &Pty, cmd: &str, deadline: Instant) -> Result<()> {
+    for _ in 0..MAX_TYPE_ATTEMPTS {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("freebuff enumeration deadline expired"));
+        }
+        if !ensure_input_box_empty(pty, deadline).await? {
+            let _ = pty.key(Key::Escape).await;
+            return Err(anyhow!(
+                "freebuff: the input box is not empty and could not be cleared, so `{cmd}` was \
+                 NOT typed into it (typing into unknown content could submit a MESSAGE, which \
+                 starts a billed session)"
+            ));
         }
         pty.type_text(cmd).await?;
         let window = Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now()));
         if window.is_zero() {
-            return Ok(false);
+            return Err(anyhow!("freebuff enumeration deadline expired"));
         }
         if pty
-            .wait_for(|s| input_box_shows(&s.rows, cmd), window)
+            .wait_for(|s| input_box_is_exactly(&s.rows, cmd), window)
             .await
             .is_ok()
         {
-            return Ok(true);
+            return Ok(());
         }
     }
-    Ok(false)
+    let _ = pty.key(Key::Escape).await;
+    Err(anyhow!(
+        "freebuff: the input box never held exactly `{cmd}`, so Enter was NOT sent \
+         (a box with leftover text would submit a MESSAGE, which starts a billed session)"
+    ))
 }
 
 /// The action the `/model` submit loop may take next. A value, so every path is
@@ -633,23 +669,32 @@ enum SubmitStep {
     Enter,
 }
 
-/// Decide whether the next Enter may be sent, from a FRESHLY read screen.
+/// Decide whether the `already_entered`-th Enter may be sent, from a FRESHLY
+/// read screen.
 ///
 /// `Err` means "press nothing": the caller Esc's and aborts with this error.
 ///
-/// The submit loop used to press Enter at the top of each iteration and only
-/// THEN look at the screen. That leaves a race: if the picker renders in the
-/// window between the previous wait expiring and the next nudge, the blind
-/// Enter lands INSIDE the open picker, on whatever row is focused — and in the
-/// real 0.2.29 picker the initially focused row is a MODEL row, where Enter
-/// STARTS A BILLED SESSION. That Enter also fires before the walk begins, so
-/// [`toggle_walk_next`] never governs it.
+/// Two separate hazards, both money-safety:
 ///
-/// So Enter requires POSITIVE evidence: the screen is Idle *and* the input box
-/// still shows the command. Anything that cannot be positively established —
-/// a picker already up, a terminal gate, a start/spend confirmation, a
-/// transient repaint, an empty box — fails closed with no keystroke (or Esc).
-fn submit_step(state: &ScreenState, rows: &[String], cmd: &str) -> Result<SubmitStep> {
+/// * A blind Enter. The loop presses Enter and only then reads, so a picker that
+///   renders in between receives that Enter on its focused MODEL row — where
+///   Enter STARTS A BILLED SESSION, before [`toggle_walk_next`] governs anything.
+/// * A SUBSTRING match. `input_box_shows` is a contains match, so a box holding
+///   `foo/model` would be "confirmed" and submitted as a MESSAGE, which starts a
+///   billed session. The box must hold EXACTLY the command
+///   ([`input_box_is_exactly`]).
+///
+/// The FIRST Enter is the legitimate submit: Idle, box exactly the command. A
+/// REPEAT (`already_entered >= 1`) needs those PLUS positive evidence that the
+/// autocomplete popup which swallowed the first Enter is still on screen
+/// ([`slash_popup_shows`]) — a nudge is never sent merely because the picker is
+/// not up yet. Anything else fails closed.
+fn submit_step(
+    state: &ScreenState,
+    rows: &[String],
+    cmd: &str,
+    already_entered: u32,
+) -> Result<SubmitStep> {
     if matches!(state, ScreenState::ModelSplash | ScreenState::ModelList) {
         return Ok(SubmitStep::Opened);
     }
@@ -667,10 +712,17 @@ fn submit_step(state: &ScreenState, rows: &[String], cmd: &str) -> Result<Submit
              — Enter on an unrecognised screen could start a billed session"
         ));
     }
-    if !input_box_shows(rows, cmd) {
+    if !input_box_is_exactly(rows, cmd) {
         return Err(anyhow!(
-            "freebuff: the input box no longer shows {cmd}, so Enter was NOT sent \
-             (a stray message would start a billed session)"
+            "freebuff: the input box does not hold exactly `{cmd}`, so Enter was NOT sent \
+             (leftover text would submit a MESSAGE, which starts a billed session)"
+        ));
+    }
+    if already_entered > 0 && !slash_popup_shows(rows) {
+        return Err(anyhow!(
+            "freebuff: the picker has not opened and the slash-command popup is NOT on screen, \
+             so no further Enter was sent — a blind nudge could land on a picker's model row and \
+             start a billed session (see docs/research/freebuff-tui.md)"
         ));
     }
     Ok(SubmitStep::Enter)
@@ -678,39 +730,34 @@ fn submit_step(state: &ScreenState, rows: &[String], cmd: &str) -> Result<Submit
 
 /// Type `/model` into the idle input box and submit it, opening the picker.
 ///
-/// Three hazards are handled explicitly, because this can SPEND the user's money:
+/// Hazards, all handled explicitly because this can SPEND the user's money:
 ///
 /// * A malformed submission would send a plain MESSAGE, and freebuff's first
-///   message STARTS A BILLED SESSION. The command is therefore only submitted
-///   once the input box positively shows `/model` ([`input_box_shows`]), never
-///   blind — and re-confirmed before EVERY Enter by [`submit_step`].
+///   message STARTS A BILLED SESSION. The box must be EMPTY before typing and
+///   hold EXACTLY `/model` before submitting ([`input_box_is_exactly`], never the
+///   substring [`input_box_shows`]) — re-confirmed before EVERY Enter by
+///   [`submit_step`].
 /// * freebuff renders its idle screen a beat before it starts reading input and
 ///   FLUSHES the input queue when it finishes initialising, so a burst typed the
 ///   instant Idle appears is silently lost (measured live against 0.2.29: the
 ///   box still showed the placeholder after typing). The command is therefore
-///   re-typed, bounded, clearing the line first so a partial landing cannot
-///   corrupt it ([`type_and_confirm_command`]).
+///   re-typed, bounded, and the box is cleared deterministically and
+///   re-verified empty before each retry ([`type_and_confirm_command`]).
 /// * freebuff pops a slash-autocomplete menu on `/` that can SWALLOW the first
-///   Enter (documented in `docs/research/freebuff-tui.md`). The submit is
-///   therefore nudged — re-read, submit, re-read, submit again — bounded by
-///   [`MAX_MODEL_SUBMITS`] and the enumeration deadline.
+///   Enter (documented in `docs/research/freebuff-tui.md`). ONE repeat Enter is
+///   allowed, and only while that popup is positively on screen
+///   ([`slash_popup_shows`]) — never as a blind nudge.
 ///
-/// Every nudge is gated by [`submit_step`]: the picker can render between the
-/// wait window and the next nudge, and a blind Enter there would start a billed
-/// session. No model row is ever Entered here, so nothing is selected or billed.
+/// No model row is ever Entered here, so nothing is selected or billed.
 async fn open_picker_via_slash_model(pty: &Pty, deadline: Instant) -> Result<()> {
     const MODEL_COMMAND: &str = "/model";
 
-    // Only submit when the box ACTUALLY shows the command — a stray message
+    // Only submit when the box holds EXACTLY the command — a stray message
     // would start a session.
-    if !type_and_confirm_command(pty, MODEL_COMMAND, deadline).await? {
-        return Err(anyhow!(
-            "freebuff: /model did not appear in the input box, so it was NOT submitted \
-             (a stray message would start a billed session)"
-        ));
-    }
+    type_and_confirm_command(pty, MODEL_COMMAND, deadline).await?;
 
-    for _ in 0..MAX_MODEL_SUBMITS {
+    let mut entered = 0u32;
+    while entered < MAX_MODEL_SUBMITS {
         if Instant::now() >= deadline {
             return Err(anyhow!("freebuff enumeration deadline expired"));
         }
@@ -719,7 +766,7 @@ async fn open_picker_via_slash_model(pty: &Pty, deadline: Instant) -> Result<()>
         // picker may have rendered since the last wait; a blind Enter would land
         // on its focused MODEL row and start a billed session.
         let snap = pty.screen();
-        match submit_step(&classify(&snap.rows), &snap.rows, MODEL_COMMAND) {
+        match submit_step(&classify(&snap.rows), &snap.rows, MODEL_COMMAND, entered) {
             Ok(SubmitStep::Opened) => return Ok(()),
             Ok(SubmitStep::Enter) => {}
             Err(err) => {
@@ -729,10 +776,17 @@ async fn open_picker_via_slash_model(pty: &Pty, deadline: Instant) -> Result<()>
         }
 
         pty.key(Key::Enter).await?;
+        entered += 1;
 
         // Give the picker or the autocomplete popup a bounded moment to render,
         // then let the next iteration re-read. A timeout here just means "not
         // open yet".
+        //
+        // NB: read-then-write over a PTY cannot be made atomic, so a picker that
+        // renders in the microseconds between the read above and this Enter is
+        // not eliminated — it is only reachable on a REPEAT Enter, which
+        // `submit_step` allows solely while the popup is still on screen, i.e.
+        // while the picker demonstrably is not.
         let open_window =
             Duration::from_secs(3).min(deadline.saturating_duration_since(Instant::now()));
         if open_window.is_zero() {
@@ -1042,6 +1096,7 @@ mod tests {
                 fixture!("0229-real-picker-wrapped-description-120x40")
             }
             "0229-real-picker-tail-120x40" => fixture!("0229-real-picker-tail-120x40"),
+            "0229-real-slash-popup-120x40" => fixture!("0229-real-slash-popup-120x40"),
             _ => panic!("unknown fixture: {name}"),
         };
         content.lines().map(|s| s.to_string()).collect()
@@ -1848,7 +1903,7 @@ mod tests {
 
     // --- `/model` submit-loop safety: no blind Enter ------------------------
 
-    /// A screen that is POSITIVELY the idle input box showing `box_text`.
+    /// A screen that is POSITIVELY the idle input box holding `box_text`.
     fn idle_rows(box_text: &str) -> Vec<String> {
         vec![
             " GLM 5.3 Flash · 59m left · 16.4K (2%)      ✕ End session".to_string(),
@@ -1858,24 +1913,33 @@ mod tests {
         ]
     }
 
-    /// The ONLY key-authorising step is `Enter`, and it is returned only for a
-    /// confirmed idle screen whose box still shows the command. An empty box or
-    /// leftover text must never authorise a keystroke — that is how a stray
-    /// MESSAGE, which starts a billed session, would get submitted.
+    /// The FIRST Enter is the legitimate submit, and it is returned only for a
+    /// confirmed idle screen whose box holds EXACTLY the command. Leftover text
+    /// that merely CONTAINS the command must never authorise a keystroke — that
+    /// is how a stray MESSAGE, which starts a billed session, gets submitted.
     #[test]
-    fn submit_step_enters_only_on_a_confirmed_idle_box_showing_the_command() {
+    fn submit_step_enters_only_on_a_confirmed_idle_box_holding_exactly_the_command() {
         let rows = idle_rows("/model");
         assert_eq!(classify(&rows), ScreenState::Idle);
         assert!(matches!(
-            submit_step(&classify(&rows), &rows, "/model"),
+            submit_step(&classify(&rows), &rows, "/model", 0),
             Ok(SubmitStep::Enter)
         ));
 
-        for box_text in ["Enter a coding task or / for commands", "python", ""] {
+        // Every one of these SATISFIES the substring helper `input_box_shows`
+        // and yet would be submitted as a MESSAGE (or a different command).
+        for box_text in [
+            "/model/model",
+            "foo/model",
+            "/mod",
+            "/model junk",
+            "Enter a coding task or / for commands",
+            "",
+        ] {
             let rows = idle_rows(box_text);
             assert!(matches!(classify(&rows), ScreenState::Idle), "{box_text:?}");
             assert!(
-                submit_step(&classify(&rows), &rows, "/model").is_err(),
+                submit_step(&classify(&rows), &rows, "/model", 0).is_err(),
                 "box {box_text:?} must NOT authorise Enter"
             );
         }
@@ -1897,11 +1961,49 @@ mod tests {
                 matches!(state, ScreenState::ModelSplash | ScreenState::ModelList),
                 "{name}: {state:?}"
             );
-            assert!(
-                matches!(submit_step(&state, &rows, "/model"), Ok(SubmitStep::Opened)),
-                "{name}: a picker already on screen must never authorise a keypress"
-            );
+            for prior in [0u32, 1] {
+                assert!(
+                    matches!(
+                        submit_step(&state, &rows, "/model", prior),
+                        Ok(SubmitStep::Opened)
+                    ),
+                    "{name} (entered={prior}): a picker already on screen must never \
+                     authorise a keypress"
+                );
+            }
         }
+    }
+
+    /// A REPEAT Enter needs positive evidence that the popup which swallowed the
+    /// first one is still on screen. Without the popup, a nudge would be blind:
+    /// the picker may be rendering right now, and Enter would land on its model
+    /// row. Structural, not timing-based.
+    #[test]
+    fn submit_step_refuses_a_repeat_enter_without_popup_evidence() {
+        // The real popup frame: typed command + menu chrome.
+        let popup = load_fixture("0229-real-slash-popup-120x40");
+        assert_eq!(classify(&popup), ScreenState::Idle);
+        assert!(input_box_is_exactly(&popup, "/model"));
+        assert!(slash_popup_shows(&popup));
+        // First submit: allowed (it is the legitimate submit).
+        assert!(matches!(
+            submit_step(&classify(&popup), &popup, "/model", 0),
+            Ok(SubmitStep::Enter)
+        ));
+        // Repeat: allowed ONLY because the popup is still there.
+        assert!(matches!(
+            submit_step(&classify(&popup), &popup, "/model", 1),
+            Ok(SubmitStep::Enter)
+        ));
+
+        // Same idle box, command still exact, but the popup is CLOSED and the
+        // picker has not opened: a nudge here would be blind.
+        let closed = idle_rows("/model");
+        assert!(submit_step(&classify(&closed), &closed, "/model", 0).is_ok());
+        let err = submit_step(&classify(&closed), &closed, "/model", 1)
+            .expect_err("a repeat Enter without popup evidence must be refused")
+            .to_string();
+        assert!(err.contains("popup"), "{err}");
     }
 
     /// A gate or a start/spend confirmation appearing between nudges aborts
@@ -1911,13 +2013,13 @@ mod tests {
         let gate =
             vec!["│ Not enough hours for MiMo Fast: an hour on it takes 2 hours. │".to_string()];
         assert!(matches!(classify(&gate), ScreenState::HoursGate { .. }));
-        let err = submit_step(&classify(&gate), &gate, "/model")
+        let err = submit_step(&classify(&gate), &gate, "/model", 0)
             .expect_err("a gate must not authorise Enter")
             .to_string();
         assert!(err.contains("not enough hours"), "{err}");
 
         let confirm = vec!["Press Enter to continue in a new session".to_string()];
-        let err = submit_step(&classify(&confirm), &confirm, "/model")
+        let err = submit_step(&classify(&confirm), &confirm, "/model", 0)
             .expect_err("a confirmation must not authorise Enter")
             .to_string();
         assert!(err.contains("a new session"), "{err}");
@@ -1930,14 +2032,14 @@ mod tests {
         let empty: Vec<String> = Vec::new();
         assert_eq!(classify(&empty), ScreenState::Booting);
         assert!(
-            submit_step(&classify(&empty), &empty, "/model").is_err(),
+            submit_step(&classify(&empty), &empty, "/model", 0).is_err(),
             "an empty/repainting screen must never authorise Enter"
         );
 
         let unknown = vec!["some prose".to_string()];
         assert_eq!(classify(&unknown), ScreenState::Unknown);
         assert!(
-            submit_step(&classify(&unknown), &unknown, "/model").is_err(),
+            submit_step(&classify(&unknown), &unknown, "/model", 0).is_err(),
             "an unrecognised screen must never authorise Enter"
         );
     }

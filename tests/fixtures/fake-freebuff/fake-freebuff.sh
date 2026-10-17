@@ -444,6 +444,7 @@ Gemini 3.8 Flash'
         }
         ESC=$(printf '\033')
         CR=$(printf '\r')
+        BS=$(printf '\177')
         line=""
         mode=idle
         submit_seen=0      # idle: has the first (swallowed) Enter been sent?
@@ -466,15 +467,21 @@ Gemini 3.8 Flash'
             printf '\r\n'
             printf 'GLM 5.3 Flash · 59m left · 16.4K (2%%)      ✕ End session\r\n'
             printf '╭──────────────────────────────────────────────────────╮\r\n'
+            if [ "$menu" -eq 1 ]; then
+                # The slash-command autocomplete popup renders INSIDE the input
+                # box, ABOVE the typed line, as `/command   Description` rows —
+                # captured verbatim from freebuff 0.2.29 (see the note in
+                # tests/fixtures/screens/0229-real-NOTE.md).
+                printf '│  /model      Choose the model for your next message  │\r\n'
+                printf '│  /reasoning  Choose reasoning effort for your next message model  │\r\n'
+                printf '│                                                      │\r\n'
+            fi
             if [ -n "$line" ]; then
-                printf '│  ▍%s\r\n' "$line"
+                printf '│  ▍%s  │\r\n' "$line"
             else
-                printf '│  ▍Enter a coding task or / for commands\r\n'
+                printf '│  ▍Enter a coding task or / for commands  │\r\n'
             fi
             printf '╰──────────────────────────────────────────────────────╯\r\n'
-            if [ "$menu" -eq 1 ]; then
-                printf '  /model      Choose the model for your next message\r\n'
-            fi
         }
 
         draw_picker() {
@@ -530,6 +537,15 @@ Gemini 3.8 Flash'
                             dd bs=1 count=1 2>/dev/null >/dev/null || true
                         fi
                         ;;
+                    "$BS")
+                        # Backspace deletes the last typed character, so a caller
+                        # clearing the box before typing really does clear it.
+                        line=$(printf '%s' "$line" | sed 's/.$//')
+                        case "$line" in
+                            /*) menu=1 ;;
+                            *) menu=0 ;;
+                        esac
+                        ;;
                     "$CR")
                         if [ "$line" = "/model" ]; then
                             if [ "$submit_seen" -eq 0 ] && [ "${FAKE_FREEBUFF_NO_SWALLOW:-0}" -ne 1 ]; then
@@ -560,7 +576,12 @@ Gemini 3.8 Flash'
                         ;;
                     *)
                         line="${line}${c}"
-                        menu=0
+                        # `/` opens the autocomplete popup, exactly as the real
+                        # CLI does on the FIRST character, not on submit.
+                        case "$line" in
+                            /*) menu=1 ;;
+                            *) menu=0 ;;
+                        esac
                         ;;
                 esac
                 draw_idle

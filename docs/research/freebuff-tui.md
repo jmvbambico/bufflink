@@ -195,15 +195,30 @@ opens the picker by COMMAND.
   starts a billed session, so a stray keystroke is expensive. The enumeration
   path never types a message.
 - **The first Enter is swallowed.** `/` pops a slash-autocomplete menu rendered
-  INSIDE the input box (`/model   Choose the model for your next message`); the
-  first Enter lands on the menu, not the command. Submit, re-read, submit again
-  (bounded). The same swallow is why `/exit` + Enter never left freebuff.
+  INSIDE the input box, ABOVE the typed line (`/model      Choose the model for
+  your next message`), from the first character typed; the first Enter lands on
+  the menu, not the command. Submit, re-read, submit again (bounded). The same
+  swallow is why `/exit` + Enter never left freebuff. Popup frame kept as
+  `tests/fixtures/screens/0229-real-slash-popup-120x40.txt`. The popup is
+  detected by a `/command` followed by 2+ spaces and a description; the typed
+  line itself has no description, so a CLOSED popup is never mistaken for one.
 - **Every nudge must re-check the screen FIRST.** The picker can render between
   the wait window expiring and the next nudge; an Enter sent blind then lands
   inside the open picker, on its focused MODEL row, and starts a billed session
   before any toggle guard governs it. Enter is sent only after a freshly read
-  screen is positively the idle input box still showing `/model`; anything else
-  fails closed.
+  screen is positively the idle input box holding EXACTLY `/model`; anything else
+  fails closed. A REPEAT Enter additionally requires the popup to still be on
+  screen — never "the picker is not up yet".
+  Read-then-write over a PTY cannot be made atomic, so the residual exposure is
+  a picker that renders in the microseconds between the read and the Enter: it
+  is reachable only on a repeat, i.e. only while the popup demonstrably still
+  holds the command-entry UI. It is reduced, not eliminated.
+- **Verify the box by EQUALITY, not substring.** `input_box_shows` is a contains
+  match (it prefix-matches a long prompt), so a box holding `foo/model` or
+  `/model/model` passes it — and submitting that sends a MESSAGE, which starts a
+  billed session. The submit path uses `input_box_is_exactly`: the box must be
+  EMPTY before typing (cleared with bounded Backspaces and re-verified, never
+  typed into blind) and hold exactly the command before submitting.
 - **A burst typed the instant Idle appears is LOST.** freebuff paints its idle
   screen a beat before it starts reading input and flushes the input queue on
   init; re-type (bounded) until the box shows the command.

@@ -1173,6 +1173,77 @@ pub fn input_box_shows(rows: &[String], needle: &str) -> bool {
     squish(&text).contains(&squish(&needle))
 }
 
+/// Whether the input box's TYPED content is EXACTLY `cmd` — nothing else.
+///
+/// [`input_box_shows`] is a SUBSTRING match (it exists to prefix-match a long
+/// prompt, a different job), so a box holding `foo/model` or `/model/model`
+/// satisfies it — and submitting such a box sends a plain MESSAGE, which starts
+/// a billed session. This predicate is the strict one the `/model` submit path
+/// uses instead: after normalising the box the way [`input_box_shows`] does
+/// (bottom-most rounded box, wrapped rows joined, cursor glyph stripped,
+/// whitespace collapsed) the remaining typed lines must be exactly one line
+/// equal to `cmd`.
+///
+/// The one thing tolerated is CHROME the TUI renders INSIDE the box: the
+/// slash-command autocomplete popup draws `/command   Description` rows above
+/// the typed text ([`slash_popup_shows`]). Those are not typed content, so they
+/// are skipped; every other non-empty line must be exactly `cmd`. An empty box,
+/// a box with extra text, or no box at all, all return `false`.
+pub fn input_box_is_exactly(rows: &[String], cmd: &str) -> bool {
+    let want = collapse_ws(cmd);
+    if want.is_empty() {
+        return false;
+    }
+    let Some(text) = input_box_text(rows) else {
+        return false;
+    };
+    let mut typed: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || is_slash_menu_row(line) {
+            continue;
+        }
+        typed.push(collapse_ws(line));
+    }
+    typed.len() == 1 && typed[0] == want
+}
+
+/// Whether the input box shows freebuff's slash-command AUTOCOMPLETE popup.
+///
+/// The popup renders INSIDE the input box, above the typed text, as
+/// `/command   Description` rows (captured live from 0.2.29:
+/// `/model      Choose the model for your next message`). It is the ONLY
+/// documented reason a first Enter is swallowed
+/// (`docs/research/freebuff-tui.md`), so it is the positive evidence a REPEAT
+/// Enter requires — a repeat must never be sent merely because "the picker is
+/// not up yet".
+pub fn slash_popup_shows(rows: &[String]) -> bool {
+    let Some(text) = input_box_text(rows) else {
+        return false;
+    };
+    text.lines().any(is_slash_menu_row)
+}
+
+/// `  /model      Choose the model for your next message` — a slash command
+/// followed by a description, i.e. an autocomplete menu row. The typed line
+/// itself (`/model`) has no description, so it never matches.
+fn is_slash_menu_row(line: &str) -> bool {
+    let line = line.trim();
+    let Some(rest) = line.strip_prefix('/') else {
+        return false;
+    };
+    let name_len = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
+        .count();
+    if name_len == 0 {
+        return false;
+    }
+    let after = &rest[name_len..];
+    let spaces = after.len() - after.trim_start_matches(' ').len();
+    spaces >= 2 && !after.trim().is_empty()
+}
+
 /// Whether the screen confirms a submitted prompt: the typed text's prefix is
 /// visible in the input box (tolerating wrapped rows and a banner above it) or
 /// a pasted-text chip is shown. This is the exact predicate the driver's submit
@@ -1281,6 +1352,9 @@ mod tests {
                 fixture!("0229-real-picker-wrapped-description-120x40")
             }
             "0229-real-picker-tail-120x40" => fixture!("0229-real-picker-tail-120x40"),
+            // The slash-command AUTOCOMPLETE popup, captured live right after
+            // typing `/model` (before any Enter).
+            "0229-real-slash-popup-120x40" => fixture!("0229-real-slash-popup-120x40"),
             "0227-synthetic-wrapped-input-120x40" => {
                 fixture!("0227-synthetic-wrapped-input-120x40")
             }
@@ -2558,5 +2632,48 @@ mod tests {
             models.iter().any(|m| m.name == "DeepSeek V4.1 Flash Fast"),
             "the frame must carry the POWERFUL models"
         );
+    }
+
+    /// `  /model      Choose the model for your next message` / `  /model` — the
+    /// strict box predicate and the popup marker, on a REAL 0.2.29 popup frame.
+    ///
+    /// `input_box_shows` (a substring match) accepts `foo/model`; submitting such
+    /// a box sends a MESSAGE, which starts a billed session. The strict predicate
+    /// must not.
+    #[test]
+    fn v0229_real_slash_popup_is_detected_and_the_box_holds_exactly_the_command() {
+        let rows = load_fixture("0229-real-slash-popup-120x40");
+        assert_eq!(classify(&rows), ScreenState::Idle);
+        assert!(
+            slash_popup_shows(&rows),
+            "the real autocomplete popup must be detected"
+        );
+        assert!(
+            input_box_is_exactly(&rows, "/model"),
+            "the popup's chrome is not typed text: the box holds exactly /model"
+        );
+        assert!(!input_box_is_empty(&rows));
+        // The old substring check would also have accepted these — the strict
+        // one must not.
+        for bad in ["/model/model", "foo/model", "/mod", "/model junk", ""] {
+            assert!(
+                !input_box_is_exactly(&idle_box(bad), "/model"),
+                "box {bad:?} must NOT be accepted as exactly /model"
+            );
+        }
+        assert!(input_box_is_exactly(&idle_box("/model"), "/model"));
+        // A lone `/model` line is not a menu row, so a CLOSED popup is not
+        // mistaken for an open one.
+        assert!(!slash_popup_shows(&idle_box("/model")));
+    }
+
+    /// An idle screen whose input box holds `box_text`.
+    fn idle_box(box_text: &str) -> Vec<String> {
+        vec![
+            " GLM 5.3 Flash · 59m left · 16.4K (2%)      ✕ End session".to_string(),
+            "╭──────────────────────────────────────╮".to_string(),
+            format!("│  ▍{box_text}  │"),
+            "╰──────────────────────────────────────╯".to_string(),
+        ]
     }
 }

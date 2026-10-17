@@ -34,3 +34,10 @@ press apart (same 2026-10-17 v0.2.29 run) and are walked together by
   (`detail. Claude Haiku 5.5 · 100k context …`) is left-aligned at one space.
 - `0229-real-picker-tail-120x40.txt` — the tail, whose models
   (`Gemini 3.8 Flash`, `GPT-6.1 Sol`) never had a header on screen.
+
+## The slash-command autocomplete popup
+
+`0229-real-slash-popup-120x40.txt` — captured right after typing `/model` and
+BEFORE any Enter. The popup renders INSIDE the input box, above the typed line,
+as `/command   Description` rows; the first Enter lands on it instead of the
+command. This frame is what the repeat-Enter guard checks for.
