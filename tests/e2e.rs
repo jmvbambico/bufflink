@@ -126,9 +126,26 @@ impl AcpClient {
     }
 
     pub async fn next_message(&mut self, timeout: Duration) -> Result<Value> {
+        match self.next_message_within(timeout).await? {
+            Some(msg) => Ok(msg),
+            None => Err(anyhow!(
+                "timeout; recent: {}",
+                self.recent.iter().cloned().collect::<Vec<_>>().join(" | ")
+            )),
+        }
+    }
+
+    /// Read the next non-empty JSON line, waiting at most `timeout`. Returns
+    /// `Ok(None)` when the timeout elapses first, so a caller can poll the
+    /// stream mid-turn without treating a quiet period as a hard error.
+    pub async fn next_message_within(&mut self, timeout: Duration) -> Result<Option<Value>> {
+        let deadline = std::time::Instant::now() + timeout;
         let mut buf = String::new();
         loop {
-            let result = time::timeout(timeout, self.stdout.read_line(&mut buf)).await;
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
+            let result = time::timeout(remaining, self.stdout.read_line(&mut buf)).await;
             match result {
                 Ok(Ok(0)) => return Err(anyhow!("blink closed stdout")),
                 Ok(Ok(_)) => {
@@ -141,15 +158,12 @@ impl AcpClient {
                     if self.recent.len() > 20 {
                         self.recent.pop_front();
                     }
-                    return serde_json::from_str(&line).map_err(|e| anyhow!("parse JSON: {}", e));
+                    return serde_json::from_str(&line)
+                        .map(Some)
+                        .map_err(|e| anyhow!("parse JSON: {}", e));
                 }
                 Ok(Err(e)) => return Err(anyhow!("read error: {}", e)),
-                Err(_) => {
-                    return Err(anyhow!(
-                        "timeout; recent: {}",
-                        self.recent.iter().cloned().collect::<Vec<_>>().join(" | ")
-                    ))
-                }
+                Err(_) => return Ok(None),
             }
         }
     }
@@ -316,13 +330,28 @@ async fn e2e_single_launch_pong_cancel_exit() {
         )
         .await
         .unwrap();
-    loop {
-        let msg = c.next_message(Duration::from_secs(90)).await.unwrap();
-        if msg.get("id").and_then(Value::as_u64) == Some(id) {
-            panic!("turn finished before we could cancel");
-        }
-        if msg.get("method").and_then(Value::as_str) == Some("session/update") {
+    // Trigger the cancel on ELAPSED TIME, not on a `session/update`. freebuff
+    // writes `chat-messages.json` once, at the END of the turn (see
+    // docs/research/freebuff-tui.md), so no update is emitted while it is
+    // thinking. Waiting for one blocks until the turn has already finished,
+    // and the cancel then lands after the fact: the turn reports `end_turn`,
+    // never `cancelled`. The fake streams updates mid-turn, which is exactly
+    // why only the real run failed. Do NOT "helpfully" change this back to
+    // waiting for an update — against real freebuff there will never be one.
+    // freebuff goes busy ~0.7-2.0s after Enter, a turn takes 8-14s and cancel
+    // takes effect in <2s, so 3s lands safely mid-turn. While we wait we keep
+    // draining the stream and fail loudly if the turn manages to finish first,
+    // preserving the intent of the old `turn finished before we could cancel`
+    // guard rather than silently cancelling a completed turn.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        if remaining.is_zero() {
             break;
+        }
+        if let Some(msg) = c.next_message_within(remaining).await.unwrap() {
+            if msg.get("id").and_then(Value::as_u64) == Some(id) {
+                panic!("turn finished before we could cancel");
+            }
         }
     }
     c.notify("session/cancel", json!({"sessionId": sid}))
