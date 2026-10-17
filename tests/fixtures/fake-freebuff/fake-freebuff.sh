@@ -403,9 +403,17 @@ case "${FAKE_FREEBUFF_MODE:-}" in
         done
         ;;
     list)
-        # 0.2.x-shaped model picker, interactive: blink drives it with Up/Down
-        # and Enter. Enter on a model row is an Enter-guard violation, so the
-        # fake exits 1 to prove blink never sends Enter on a model row.
+        # 0.2.29 flow, modelled from the live probe (2026-10-17): freebuff boots
+        # STRAIGHT to the idle input box with a model already selected — there is
+        # NO startup picker — and the model picker is opened by SUBMITTING the
+        # `/model` command. The fake mirrors that, including the slash-
+        # autocomplete popup that SWALLOWS the first Enter (documented in
+        # docs/research/freebuff-tui.md): idle -> `/model` (first Enter eaten) ->
+        # picker, driven with Up/Down and Enter.
+        #
+        # Enter on a model row is an Enter-guard violation, so the fake exits 1
+        # to prove blink never sends Enter on a model row.
+        #
         # POSIX sh has no arrays and the shebang is #!/bin/sh (dash on Ubuntu):
         # keep the ten model display names, in order, as a newline-delimited
         # list and look each model's cost up by name.
@@ -436,6 +444,10 @@ Gemini 3.8 Flash'
         }
         ESC=$(printf '\033')
         CR=$(printf '\r')
+        line=""
+        mode=idle
+        submit_seen=0      # idle: has the first (swallowed) Enter been sent?
+        menu=0             # idle: is the slash-autocomplete popup shown?
         expanded=0
         focus=0            # 0..N-1 model index; N = the toggle row (expanded only)
         focus_toggle=0     # collapsed: 1 means focus on the See-all toggle
@@ -446,14 +458,33 @@ Gemini 3.8 Flash'
 
         stty raw -echo 2>/dev/null || true
 
-        draw() {
+        draw_idle() {
+            printf '\033[2J\033[H'
+            printf 'Freebuff will run commands on your behalf to help you build.\r\n'
+            printf '\r\n'
+            printf 'Directory %s\r\n' "$CWD"
+            printf '\r\n'
+            printf 'GLM 5.3 Flash · 59m left · 16.4K (2%%)      ✕ End session\r\n'
+            printf '╭──────────────────────────────────────────────────────╮\r\n'
+            if [ -n "$line" ]; then
+                printf '│  ▍%s\r\n' "$line"
+            else
+                printf '│  ▍Enter a coding task or / for commands\r\n'
+            fi
+            printf '╰──────────────────────────────────────────────────────╯\r\n'
+            if [ "$menu" -eq 1 ]; then
+                printf '  /model      Choose the model for your next message\r\n'
+            fi
+        }
+
+        draw_picker() {
             printf '\033[2J\033[H'
             printf '████████████████████████████████████████\r\n'
             printf '█                                                      █\r\n'
             printf '█   F  R  E  E  B  U  F  F                            █\r\n'
             printf '█                                                      █\r\n'
             printf '████████████████████████████████████████\r\n'
-            printf '\r\nStart coding for free\r\n\r\n'
+            printf '\r\nChoose a model to start a new session\r\n\r\n'
             if [ "$expanded" -eq 0 ]; then
                 first_name=$(printf '%s\n' "$MODEL_NAMES" | head -n 1)
                 if [ "$focus_toggle" -eq 1 ]; then
@@ -482,63 +513,114 @@ Gemini 3.8 Flash'
             fi
         }
 
-        draw
+        draw_idle
         while true; do
             # Read one byte reliably: `read -n 1` cannot capture '\r' (Enter),
             # so use `dd bs=1 count=1` which passes every byte through.
             c=$(dd bs=1 count=1 2>/dev/null) || break
             [ -n "$c" ] || break # EOF: the PTY was closed.
-            case "$c" in
-                "$ESC")
-                    c2=$(dd bs=1 count=1 2>/dev/null) || continue
-                    [ "$c2" = "[" ] || continue
-                    c3=$(dd bs=1 count=1 2>/dev/null) || continue
-                    case "$c3" in
-                        B)
-                            if [ "$expanded" -eq 0 ]; then
-                                focus_toggle=1
-                            elif [ "$focus" -lt "$N" ]; then
-                                focus=$(( focus + 1 ))
-                                if [ "$focus" -ge $(( scroll + V )) ]; then
-                                    scroll=$(( focus - V + 1 ))
-                                fi
-                            fi
-                            ;;
-                        A)
-                            if [ "$expanded" -eq 0 ]; then
+
+            if [ "$mode" = "idle" ]; then
+                case "$c" in
+                    "$ESC")
+                        # Discard a following arrow sequence (ESC [ X) so it is
+                        # not appended to the typed line.
+                        c2=$(dd bs=1 count=1 2>/dev/null) || c2=""
+                        if [ "$c2" = "[" ]; then
+                            dd bs=1 count=1 2>/dev/null >/dev/null || true
+                        fi
+                        ;;
+                    "$CR")
+                        if [ "$line" = "/model" ]; then
+                            if [ "$submit_seen" -eq 0 ]; then
+                                # The slash-autocomplete popup eats the first
+                                # Enter: the menu stays open with `/model` still
+                                # in the box, exactly like the real CLI.
+                                submit_seen=1
+                                menu=1
+                            else
+                                # The second Enter opens the picker.
+                                mode=picker
+                                menu=0
+                                expanded=0
+                                focus=0
                                 focus_toggle=0
-                            elif [ "$focus" -gt 0 ]; then
-                                focus=$(( focus - 1 ))
-                                if [ "$focus" -lt "$scroll" ]; then
-                                    scroll=$focus
-                                fi
+                                scroll=0
+                                draw_picker
+                                continue
                             fi
-                            ;;
-                    esac
-                    ;;
-                "$CR")
-                    if [ "$expanded" -eq 0 ]; then
-                        if [ "$focus_toggle" -eq 1 ]; then
-                            expanded=1
-                            focus=0
-                            scroll=0
+                        elif [ "$line" = "/exit" ]; then
+                            print_exit
+                            exit 0
+                        fi
+                        ;;
+                    *)
+                        line="${line}${c}"
+                        menu=0
+                        ;;
+                esac
+                draw_idle
+            else
+                case "$c" in
+                    "$ESC")
+                        c2=$(dd bs=1 count=1 2>/dev/null) || continue
+                        if [ "$c2" != "[" ]; then
+                            # A bare Esc leaves the picker without selecting.
+                            mode=idle
+                            line=""
+                            submit_seen=0
+                            draw_idle
+                            continue
+                        fi
+                        c3=$(dd bs=1 count=1 2>/dev/null) || continue
+                        case "$c3" in
+                            B)
+                                if [ "$expanded" -eq 0 ]; then
+                                    focus_toggle=1
+                                elif [ "$focus" -lt "$N" ]; then
+                                    focus=$(( focus + 1 ))
+                                    if [ "$focus" -ge $(( scroll + V )) ]; then
+                                        scroll=$(( focus - V + 1 ))
+                                    fi
+                                fi
+                                ;;
+                            A)
+                                if [ "$expanded" -eq 0 ]; then
+                                    focus_toggle=0
+                                elif [ "$focus" -gt 0 ]; then
+                                    focus=$(( focus - 1 ))
+                                    if [ "$focus" -lt "$scroll" ]; then
+                                        scroll=$focus
+                                    fi
+                                fi
+                                ;;
+                        esac
+                        draw_picker
+                        ;;
+                    "$CR")
+                        if [ "$expanded" -eq 0 ]; then
+                            if [ "$focus_toggle" -eq 1 ]; then
+                                expanded=1
+                                focus=0
+                                scroll=0
+                            else
+                                printf 'freebuff: Enter on a model row starts a session and spends Freebucks\n' >&2
+                                exit 1
+                            fi
+                        elif [ "$focus" -eq "$N" ]; then
+                            expanded=0
+                            focus_toggle=0
                         else
                             printf 'freebuff: Enter on a model row starts a session and spends Freebucks\n' >&2
                             exit 1
                         fi
-                    elif [ "$focus" -eq "$N" ]; then
-                        expanded=0
-                        focus_toggle=0
-                    else
-                        printf 'freebuff: Enter on a model row starts a session and spends Freebucks\n' >&2
-                        exit 1
-                    fi
-                    ;;
-                q|Q)
-                    exit 0
-                    ;;
-            esac
-            draw
+                        draw_picker
+                        ;;
+                    q|Q)
+                        exit 0
+                        ;;
+                esac
+            fi
         done
         ;;
 esac

@@ -297,8 +297,14 @@ fn parse_takes_hours(text: &str) -> Option<u32> {
 /// One model entry on the splash, collapsed or in the expanded list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRow {
-    /// Display name: the text between the focus marker and the first ` · `.
+    /// Display name: the text before the first tagline separator (` · ` or the
+    /// ` • <effort>` form freebuff 0.2.29 renders). The ` • <effort>` suffix is
+    /// NOT part of the name.
     pub name: String,
+    /// Section the row appeared under — the last `UNLIMITED`/`OPTIMIZED`/
+    /// `POWERFUL` header before it, or [`ModelSection::Unknown`] for the flat
+    /// pickers that render no section labels.
+    pub section: ModelSection,
     /// True when the row carries the `›` focus marker.
     pub focused: bool,
     /// The `Freebucks/hr` line inside the same box, if visible (an 80x24
@@ -308,11 +314,26 @@ pub struct ModelRow {
 
 /// Parse the model rows out of a splash screen (collapsed or expanded).
 /// A model row is a `│`-bordered row whose inner text starts with `›`
-/// (focused) or directly with the name (unfocused) and holds the name before
-/// the first ` · `. Rows mentioning Freebucks are cost lines, not names.
+/// (focused) or directly with the name (unfocused) and carries a tagline
+/// separator (` · `, or the ` • <effort>` form). Cost lines (they mention
+/// `Freebucks`) and chrome (no separator) are not names. The v0.2.29 `/model`
+/// picker is SCROLLED, so the first visible row can be the CENTERED
+/// continuation of a box whose name scrolled off (`3x · Recommended · …`); a
+/// name starts with a letter, which rejects those.
 pub fn model_rows(rows: &[String]) -> Vec<ModelRow> {
     let mut out = Vec::new();
+    let mut section = ModelSection::Unknown;
     for (i, row) in rows.iter().enumerate() {
+        // Section labels are borderless UPPERCASE rows; they set the section for
+        // the model rows that follow.
+        let framed = strip_frame(row);
+        if is_toggle_line(&framed) {
+            continue;
+        }
+        if let Some(sec) = section_from_header(&framed) {
+            section = sec;
+            continue;
+        }
         let Some(inner) = box_inner(row) else {
             continue;
         };
@@ -323,11 +344,11 @@ pub fn model_rows(rows: &[String]) -> Vec<ModelRow> {
         if body.contains("Freebucks") {
             continue;
         }
-        let Some(sep) = body.find(" · ") else {
+        if !(body.contains(" · ") || body.contains(" • ")) {
             continue;
-        };
-        let name = body[..sep].trim();
-        if name.is_empty() {
+        }
+        let name = model_name(body);
+        if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
             continue;
         }
         // Cost line: first "Freebucks/hr" row further down inside the same box.
@@ -346,7 +367,8 @@ pub fn model_rows(rows: &[String]) -> Vec<ModelRow> {
             }
         }
         out.push(ModelRow {
-            name: name.to_string(),
+            name,
+            section,
             focused,
             cost_line,
         });
@@ -471,11 +493,24 @@ pub fn parse_catalog(rows: &[String]) -> ModelCatalog {
             }
             if !in_box {
                 // First content row of a box. It is a model only when the row
-                // has a tagline separator after the name; an input box,
-                // paste chip or slash-menu box has none and is skipped whole.
+                // carries a tagline separator (` · ` or its ` • <effort>` form);
+                // an input box, paste chip, slash-menu box or a square-bordered
+                // CHROME box (e.g. the info box's `⎘ Copy invite link  Learn
+                // More ↵`, which has a double space but no tagline) has none and
+                // is skipped whole. The v0.2.29 `/model` picker also draws a
+                // promo/ad box inside it, so this keeps an ad out of the catalog.
                 let (focused, body) = strip_focus(inner);
+                if !(body.contains(" · ") || body.contains(" • ")) {
+                    in_box = true;
+                    box_is_model = false;
+                    continue;
+                }
                 let name = model_name(body);
-                if name.is_empty() || name.len() == body.len() {
+                // A name starts with a letter. A scrolled picker can leave only
+                // a box's CENTERED continuation row visible (`3x · Recommended ·
+                // …`), whose derived "name" starts with a digit: that is not a
+                // model, so it is not reported as one.
+                if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
                     in_box = true;
                     box_is_model = false;
                     continue;
@@ -1196,6 +1231,13 @@ mod tests {
             // The 2026-10-16 live run's hours gate: freebuff v0.2.29 bills in
             // hours and refused the turn. VERBATIM frame from that run.
             "0229-real-hours-gate-120x40" => fixture!("0229-real-hours-gate-120x40"),
+            // VERBATIM 120x40 frames captured from the 2026-10-17 live probe of
+            // freebuff v0.2.29 (real-derived): the startup screen with NO model
+            // picker, and the `/model` picker it opens. See 0229-real-NOTE.md.
+            "0229-real-startup-no-picker-120x40" => fixture!("0229-real-startup-no-picker-120x40"),
+            "0229-real-slash-model-picker-120x40" => {
+                fixture!("0229-real-slash-model-picker-120x40")
+            }
             "0227-synthetic-wrapped-input-120x40" => {
                 fixture!("0227-synthetic-wrapped-input-120x40")
             }
@@ -1404,6 +1446,7 @@ mod tests {
             .enumerate()
             .map(|(i, n)| ModelRow {
                 name: n.to_string(),
+                section: ModelSection::Unknown,
                 focused: Some(i) == focused,
                 cost_line: None,
             })
@@ -2197,6 +2240,7 @@ mod tests {
         let rows: Vec<ModelRow> = (0..13)
             .map(|i| ModelRow {
                 name: format!("Model {i:02}"),
+                section: ModelSection::Unknown,
                 focused: i == 0,
                 cost_line: None,
             })
@@ -2338,5 +2382,75 @@ mod tests {
             "│ low│".to_string(),
         ];
         assert_eq!(input_box_text(&rows).as_deref(), Some("low"));
+    }
+
+    // --- Real freebuff v0.2.29: no startup picker + the `/model` picker ------
+    //
+    // The 2026-10-17 live probe: freebuff 0.2.29 boots STRAIGHT to the idle
+    // input box with a model already selected (NO startup picker); the model
+    // picker is opened by the `/model` command, and it opens as a full
+    // SCROLLABLE list (sections, no `See all`/`Show fewer` toggle). Both frames
+    // below are VERBATIM from that probe.
+
+    #[test]
+    fn v0229_real_startup_frame_is_idle_not_a_picker() {
+        let rows = load_fixture("0229-real-startup-no-picker-120x40");
+        // The startup screen has no model picker: it is the idle/input state
+        // whose status row carries `/model to change`.
+        assert_eq!(classify(&rows), ScreenState::Idle);
+        assert_eq!(
+            active_model(&rows),
+            Some(("Nemotron 3.5 Lightning".to_string(), None))
+        );
+        // There is genuinely no picker on this screen.
+        assert_eq!(parse_catalog(&rows).entries.len(), 0);
+        assert!(model_rows(&rows).is_empty());
+        assert_eq!(advertised_model_count(&rows), None);
+    }
+
+    #[test]
+    fn v0229_real_slash_model_picker_parses_sections_and_names() {
+        let rows = load_fixture("0229-real-slash-model-picker-120x40");
+        assert_eq!(classify(&rows), ScreenState::ModelList);
+        let catalog = parse_catalog(&rows);
+        assert_eq!(catalog.advertised, None, "the /model picker has no See-all");
+        let got: Vec<(&str, ModelSection)> = catalog
+            .entries
+            .iter()
+            .map(|e| (e.display_name.as_str(), e.section))
+            .collect();
+        // The ` • <effort>` suffix is stripped; section headers are sections.
+        assert_eq!(
+            got,
+            vec![
+                ("Nemotron 3.5 Lightning", ModelSection::Unlimited),
+                ("Glyph Cluster", ModelSection::Unlimited),
+                ("Solar Pro 4", ModelSection::Unlimited),
+                ("Solar Mini 4", ModelSection::Unlimited),
+                ("DeepSeek V4.1 Flash", ModelSection::Optimized),
+            ]
+        );
+        // The `/model` picker prints no `Freebucks/hr` figure.
+        assert!(catalog.entries.iter().all(|e| e.price_per_hour.is_none()));
+        // The chrome (info box, `↑↓ choose model …` footer) is not a model.
+        for e in &catalog.entries {
+            assert!(!e.display_name.contains("Copy invite link"));
+            assert!(!e.display_name.contains("choose model"));
+        }
+    }
+
+    /// A scrolled picker can leave only a box's CENTERED continuation row
+    /// visible (`3x · Recommended · …`), whose derived "name" is `3x`. That is
+    /// not a model and must not be reported as one.
+    #[test]
+    fn v0229_scrolled_continuation_row_is_not_a_model() {
+        let rows = vec![
+            "│               3x · Recommended · May use data for AI training                │"
+                .to_string(),
+            "│                            Get 7x usage for $5 →                             │"
+                .to_string(),
+            "↓  See all 13 models".to_string(),
+        ];
+        assert!(parse_catalog(&rows).entries.is_empty());
     }
 }

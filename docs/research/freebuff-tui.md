@@ -182,3 +182,37 @@ never choose `Take over`.
   no signals, and the real Bun binary survives SIGHUP from the closing PTY.
 - Splash → Idle takes ~2.3 s; a trivial turn 3–7 s; Esc cancel is honoured
   in < 0.4 s and the next prompt works in the same session.
+
+## v0.2.29 — NO startup picker; `/model` opens the picker (probed 2026-10-17)
+
+freebuff **0.2.29 has no startup model picker**: it boots straight to the idle
+input box with a model ALREADY selected and `/model to change` in the status
+row. A driver that waits for a splash waits forever. `blink --list-models` now
+opens the picker by COMMAND.
+
+- **Open it:** type `/model` into the input box and submit. Typing must only be
+  submitted once the box positively shows `/model`: freebuff's first MESSAGE
+  starts a billed session, so a stray keystroke is expensive. The enumeration
+  path never types a message.
+- **The first Enter is swallowed.** `/` pops a slash-autocomplete menu rendered
+  INSIDE the input box (`/model   Choose the model for your next message`); the
+  first Enter lands on the menu, not the command. Submit, re-read, submit again
+  (bounded). The same swallow is why `/exit` + Enter never left freebuff.
+- **A burst typed the instant Idle appears is LOST.** freebuff paints its idle
+  screen a beat before it starts reading input and flushes the input queue on
+  init; re-type (bounded) until the box shows the command.
+- **The picker is a full SCROLLABLE list, not the collapsed splash.** UPPERCASE
+  section labels (`UNLIMITED · …`, `OPTIMIZED · …`, `POWERFUL · …`), one model
+  per SQUARE box with a ` • <effort>` suffix and a ` · ` tagline, and a
+  `↑↓ choose model · Tab reasoning · Enter select · Esc cancel` footer. There is
+  **no `See all` / `Show fewer` toggle** — so the guarded toggle walk is not
+  used here, and the list is read by scrolling with Down.
+- **No `Freebucks/hr` price is shown at all.** `UNLIMITED` is the free tier
+  (`price_per_hour: 0`); other sections show a multiplier (`2x`, `3x`…) or
+  `Paid plan`, which the JSON reports as an unknown price, never a guess.
+- **A promo/ad box (ROUNDED `╭…╮`) is drawn inside the picker.** Model boxes are
+  SQUARE. Scrolling can leave only a box's centered continuation row visible
+  (`3x · Recommended`), which is not a model.
+- Real frames kept as fixtures: `tests/fixtures/screens/0229-real-startup-no-picker-120x40.txt`
+  and `0229-real-slash-model-picker-120x40.txt`.
+
