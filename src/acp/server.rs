@@ -22,11 +22,11 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 /// The prompt turn currently in flight: its cancel sender and task, tagged
 /// with a monotonically increasing generation.
 ///
-/// The tag is what makes reaping correct across sequential prompts. A
-/// completion is only allowed to clear the slot when the generation it
-/// observed still identifies the current turn; a stale completion must never
-/// null a newer turn's cancel sender, or `session/cancel` would silently find
-/// nothing and the turn would run to `end_turn`.
+/// The tag is defensive hardening, not the fix for any observed failure: the
+/// current `select!` loop cannot actually let a stale completion clear a newer
+/// turn's slot, because only one arm runs per iteration and the reap future is
+/// rebuilt each time. Tying the reap to an identity makes that invariant
+/// explicit so a future reorder or a second reaper cannot regress it silently.
 struct InFlight {
     generation: u64,
     cancel: watch::Sender<bool>,
@@ -836,9 +836,10 @@ mod tests {
         shutdown_serve(client_w, client_r, serve).await;
     }
 
-    /// Structural assertion (no timing): a completion tagged with an older
-    /// generation must not clear a newer turn's slot. This is the guard that
-    /// keeps `session/cancel` connected across sequential prompts.
+    /// Structural assertion (no timing) for the defensive identity guard: a
+    /// completion tagged with an older generation must not clear a newer
+    /// turn's slot. It pins the invariant, not a fix for an observed failure —
+    /// see the `InFlight` doc comment.
     #[tokio::test]
     async fn a_stale_completion_cannot_clear_a_newer_turn() {
         let (c1, _r1) = watch::channel(false);
