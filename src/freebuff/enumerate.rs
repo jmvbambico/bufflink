@@ -15,7 +15,7 @@
 
 use crate::freebuff::screen::{
     classify, input_box_is_empty, input_box_is_exactly, model_rows, nav_ring,
-    toggle_row_has_focus_marker, ModelRow, ModelSection, ScreenState,
+    toggle_row_has_focus_marker, ModelRow, ModelSection, ScreenState, TAKE_OVER_ERROR,
 };
 use crate::pty::{Key, Pty};
 use anyhow::{anyhow, Result};
@@ -463,6 +463,7 @@ fn is_terminal_state(state: &ScreenState) -> bool {
         ScreenState::AlreadyRunning
             | ScreenState::HoursGate { .. }
             | ScreenState::FreebucksGate { .. }
+            | ScreenState::TakeOver
             | ScreenState::Login
             | ScreenState::KickedOut
             | ScreenState::SessionEnded
@@ -484,6 +485,7 @@ fn gate_error(state: &ScreenState) -> Option<anyhow::Error> {
         ScreenState::FreebucksGate { message } => {
             Some(anyhow!("freebuff: not enough Freebucks — {message}"))
         }
+        ScreenState::TakeOver => Some(anyhow!("{}", TAKE_OVER_ERROR)),
         ScreenState::Login => Some(anyhow!(
             "freebuff needs an interactive login: run `freebuff` once in a terminal and log in, then retry"
         )),
@@ -497,51 +499,56 @@ fn gate_error(state: &ScreenState) -> Option<anyhow::Error> {
     }
 }
 
-/// Spend/commit keywords that mark a row as a start-or-spend confirmation when
-/// it is paired (in the SAME row) with an Enter affordance. Lowercase: matched
-/// against a lowercased row.
-const SPEND_KEYWORDS: &[&str] = &[
-    "confirm",
-    "spend",
-    "wallet",
-    "freebucks",
-    "hours",
-    "plans",
-    "retry",
-    "a new session",
-];
-
-/// Whether `row` is a start/spend CONFIRMATION — a row that pairs an Enter
-/// affordance with spend/session language, i.e. pressing Enter would START or
-/// SPEND a billed session.
+/// Whether `row` carries freebuff's MODAL AFFORDANCE: an `Enter: <action>` and
+/// an `Esc: <action>` on the SAME row.
 ///
-/// Matched by SHAPE, not by one exact phrase: freebuff 0.2.x words these
-/// several ways (`... Enter to confirm.`, `Enter uses N from your wallet`,
-/// `Enter: retry  Esc: back to draft`, `Press Enter to continue in a new
-/// session`), so a confirmation worded differently must still be caught.
+/// This is the idiom BOTH live modal interstitials use — the hours gate
+/// (`Enter: retry  Esc: back to draft`) and the free-plan take-over modal
+/// (`Enter: take over  Esc: back to draft`). It is STRUCTURAL: it catches either
+/// modal regardless of wording, and it does NOT match ordinary transcript prose
+/// such as `Enter to retry`, the idle placeholder `Enter a coding task or / for
+/// commands`, or the info line `Your first message starts the session.` — none
+/// of which carries an `Esc:` affordance. It replaces an earlier spend-KEYWORD
+/// list, which missed `take over` (no spend word) and false-matched transcript
+/// `retry`.
 ///
-/// The match is ROW-LOCAL and requires BOTH parts, which is exactly what keeps
-/// the healthy idle screen out: its placeholder `Enter a coding task or / for
-/// commands` has an Enter but no spend keyword, while its info line `Your first
-/// message starts the session.` has session language but no Enter. Fail-closed:
-/// a false abort is correct, a false pass spends money.
-fn is_confirmation_row(row: &str) -> bool {
-    // The affordance is always rendered `Enter` (or `ENTER`, as on the login
-    // gate); matched case-SENSITIVELY so a lowercase `enter` inside a word
-    // (`after-enter`, `center`) is not read as one.
-    if !(row.contains("Enter") || row.contains("ENTER")) {
-        return false;
-    }
-    let lower = row.to_lowercase();
-    SPEND_KEYWORDS.iter().any(|k| lower.contains(k))
+/// Matched PER ROW, not screen-wide. Both observed modals render the two
+/// affordances on one physical row and they are short (32 / 36 chars), so they
+/// do not wrap even at 80 columns; per-row matching is far less prone to false
+/// hits than a screen-wide `Enter:`-anywhere + `Esc:`-anywhere check, which would
+/// flag any screen carrying the two in unrelated places. The all-fixtures scan
+/// (`no_healthy_fixture_reads_as_a_confirmation`) proves no healthy frame is
+/// flagged by it.
+///
+/// NOTE: this is a BACKSTOP, not the primary guard. What actually protects the
+/// user is the SUBMIT ALLOWLIST in [`submit_step`]: Enter is sent ONLY when the
+/// state is [`ScreenState::Idle`] AND the bottom-most rounded box holds EXACTLY
+/// `/model`. Every interstitial captured so far REPLACES the input box (a
+/// square-bordered modal, with no rounded box at all), so [`input_box_is_exactly`]
+/// already fails closed on them. Do not weaken the allowlist believing this
+/// detector covers it.
+fn is_modal_affordance_row(row: &str) -> bool {
+    has_affordance(row, "Enter") && has_affordance(row, "Esc")
 }
 
-/// A modal confirmation that would START or SPEND if Enter were pressed, or
-/// `None`: the first row that pairs an Enter affordance with spend/commit
-/// language (see [`is_confirmation_row`]).
+/// Whether `row` renders a `<key>: <action>` affordance: the key, a colon, then a
+/// non-empty action. `key` is matched case-sensitively as freebuff renders it
+/// (`Enter` / `Esc`), so a lowercase token inside another word is not read as one.
+fn has_affordance(row: &str, key: &str) -> bool {
+    let marker = format!("{key}:");
+    match row.find(&marker) {
+        Some(i) => !row[i + marker.len()..].trim_start().is_empty(),
+        None => false,
+    }
+}
+
+/// A modal interstitial that would commit if Enter were pressed (take over, or
+/// the hours gate's retry), or `None`: the first row carrying freebuff's modal
+/// affordance (see [`is_modal_affordance_row`]). A fail-closed BACKSTOP — see the
+/// note there.
 fn confirmation_text(rows: &[String]) -> Option<String> {
     rows.iter()
-        .find(|r| is_confirmation_row(r))
+        .find(|r| is_modal_affordance_row(r))
         .map(|r| r.trim().to_string())
 }
 
@@ -1117,6 +1124,7 @@ mod tests {
             }
             "0229-real-picker-tail-120x40" => fixture!("0229-real-picker-tail-120x40"),
             "0229-real-slash-popup-120x40" => fixture!("0229-real-slash-popup-120x40"),
+            "0229-real-take-over-modal-120x40" => fixture!("0229-real-take-over-modal-120x40"),
             _ => panic!("unknown fixture: {name}"),
         };
         content.lines().map(|s| s.to_string()).collect()
@@ -1823,15 +1831,16 @@ mod tests {
         );
     }
 
-    /// `confirmation_text` fires on the resume prompt's `a new session`, and is
-    /// deliberately blind to the idle info line (`Your first message starts the
-    /// session.`) that is present on the REAL startup screen — otherwise every
-    /// enumeration would abort before it began.
+    /// `confirmation_text` fires on freebuff's modal affordance — an
+    /// `Enter: <action>` and an `Esc: <action>` on one row — and is deliberately
+    /// blind to the idle info line (`Your first message starts the session.`)
+    /// that is present on the REAL startup screen: otherwise every enumeration
+    /// would abort before it began.
     #[test]
-    fn confirmation_text_detects_resume_prompt_but_not_the_idle_info_line() {
+    fn confirmation_text_detects_modal_affordance_but_not_the_idle_info_line() {
         assert_eq!(
-            confirmation_text(&["Press Enter to continue in a new session".to_string()]).as_deref(),
-            Some("Press Enter to continue in a new session")
+            confirmation_text(&["Enter: retry  Esc: back to draft".to_string()]).as_deref(),
+            Some("Enter: retry  Esc: back to draft")
         );
         let startup = load_fixture("0229-real-startup-no-picker-120x40");
         // The idle info box literally says "starts the session".
@@ -1846,55 +1855,61 @@ mod tests {
         );
     }
 
-    /// The confirmation detector matches by SHAPE — an Enter affordance AND a
-    /// spend/commit keyword in the SAME row — so a confirmation worded
-    /// differently from the resume prompt still fires (finding: one exact
-    /// phrase let a differently-worded start/spend confirmation through, and
-    /// Enter would have ACCEPTED it). The healthy idle lines must NOT fire.
+    /// The detector matches by freebuff's AFFORDANCE IDIOM — an `Enter: <action>`
+    /// AND an `Esc: <action>` on one row — so BOTH live modals fire (the hours
+    /// gate and the free-plan take-over modal) regardless of wording, while
+    /// ordinary transcript prose and the healthy idle lines do not. It replaced a
+    /// spend-KEYWORD list that missed `take over` and false-matched `retry`.
     #[test]
-    fn confirmation_detector_matches_by_shape_but_not_healthy_lines() {
+    fn confirmation_detector_matches_modal_affordances_not_transcript_prose() {
         for row in [
-            "Ends this session and starts a new one for 5 Freebucks. Enter to confirm.",
-            "Today's Freebucks are spent. Enter uses 5 from your wallet to start.",
-            "Claim earned Freebucks on admission, then spend 5 for this session. Enter to confirm.",
-            "Balance unavailable. Enter may spend wallet Freebucks to start this hour.",
-            "Enter: retry  Esc: back to draft",
-            "Press Enter to continue in a new session",
-            "Not enough Freebucks — 5 Freebucks/hr against 0 left. Enter opens plans.",
+            // The two REAL modal affordances captured live (2026-10-16/17).
+            "│ Enter: retry  Esc: back to draft                     │",
+            "│ Enter: take over  Esc: back to draft                 │",
         ] {
             assert!(
-                is_confirmation_row(row),
-                "must be read as a confirmation: {row:?}"
+                is_modal_affordance_row(row),
+                "must be read as a modal affordance: {row:?}"
             );
         }
-        // Fail-closed in BOTH directions: an Enter with NO spend keyword, or
-        // spend language with NO Enter, must never fire.
+        // Fail-closed in BOTH directions: an `Enter:` with no `Esc:`, an `Esc:`
+        // with no `Enter:`, and ordinary prose with no colon affordance must
+        // never fire — including the transcript-style `Enter to retry` the old
+        // keyword detector false-matched on `retry`.
         for row in [
+            "Enter to retry",
             "│  ▍Enter a coding task or / for commands  │",
             "│ Your first message starts the session. │",
+            "Press Enter to continue in a new session",
+            "Not enough Freebucks — 5 Freebucks/hr against 0 left. Enter opens plans.",
             "↑↓ choose model · Tab reasoning · Enter select · Esc cancel",
+            "Enter: retry",
+            "Esc: back to draft",
             "│ 25/25 Freebucks remaining │",
             "│ 3/5 hours remaining │",
             "📋 Pasted text (5,001 chars)",
         ] {
-            assert!(!is_confirmation_row(row), "must NOT match: {row:?}");
+            assert!(!is_modal_affordance_row(row), "must NOT match: {row:?}");
         }
     }
 
     /// Guard against a false positive that would break enumeration OUTRIGHT:
-    /// across EVERY screen fixture, only the frames that genuinely offer to
-    /// start/spend may read as a confirmation. The idle/picker/transcript
-    /// frames — including the real idle screens whose info box carries
-    /// `Freebucks`/`hours` copy on rows that have no Enter — must not.
+    /// across EVERY screen fixture, only the frames carrying freebuff's modal
+    /// affordance may read as a confirmation. With the per-row affordance
+    /// detector that is EXACTLY the two real modal interstitials — the hours
+    /// gate and the free-plan take-over modal — both of which classify as
+    /// terminal gates first (so this is only a fail-closed backstop). The
+    /// idle/picker/transcript frames — including the real idle screens whose info
+    /// box carries `Freebucks`/`hours` copy and the resume/gate screens whose
+    /// `Enter ...` has no `Esc:` affordance — must not.
     #[test]
     fn no_healthy_fixture_reads_as_a_confirmation() {
-        // Fixtures that ARE start/spend confirmations, or a gate whose Enter
-        // affordance commits (they classify as gates first, so this is only a
-        // fail-closed backstop).
+        // Fixtures that render freebuff's `Enter: x  Esc: y` modal affordance.
+        // Both are terminal gates (the hours gate and the take-over modal), so
+        // this list is a fail-closed backstop, not the thing that protects money.
         const EXPECTED: &[&str] = &[
-            "session-ended-120x40.txt",
-            "freebucks-gate-80x24.txt",
             "0229-real-hours-gate-120x40.txt",
+            "0229-real-take-over-modal-120x40.txt",
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/screens");
         let mut scanned = 0usize;
@@ -2163,11 +2178,38 @@ mod tests {
             .to_string();
         assert!(err.contains("not enough hours"), "{err}");
 
-        let confirm = vec!["Press Enter to continue in a new session".to_string()];
+        let confirm = vec!["Enter: take over  Esc: back to draft".to_string()];
         let err = submit_step(&classify(&confirm), &confirm, "/model")
-            .expect_err("a confirmation must not authorise Enter")
+            .expect_err("a modal affordance must not authorise Enter")
             .to_string();
-        assert!(err.contains("a new session"), "{err}");
+        assert!(err.contains("take over"), "{err}");
+    }
+
+    /// BLOCKING: the free-plan take-over modal (a session is held ELSEWHERE; the
+    /// free plan shares one session slot across CLI and Desktop) is a terminal
+    /// gate. Enumeration must FAIL FAST with the actionable error and press
+    /// NOTHING on it — Enter would take over the other session, which AGENTS.md
+    /// forbids. The modal has NO rounded input box, so the allowlist already
+    /// fails closed; the gate turns the silent timeout into an actionable error.
+    #[test]
+    fn submit_step_refuses_on_the_take_over_modal() {
+        let rows = load_fixture("0229-real-take-over-modal-120x40");
+        let state = classify(&rows);
+        assert_eq!(
+            state,
+            ScreenState::TakeOver,
+            "the free-plan take-over modal must classify as its gate"
+        );
+        // Keyed on the modal's distinctive copy, not a bare `Take over`.
+        assert!(gate_error(&state).is_some(), "TakeOver is a terminal gate");
+        // No bottom-most ROUNDED box: the allowlist alone already fails closed.
+        assert_eq!(crate::freebuff::screen::input_box_text(&rows), None);
+        assert!(!input_box_is_exactly(&rows, "/model"));
+        let err = submit_step(&state, &rows, "/model")
+            .expect_err("the take-over modal must not authorise Enter")
+            .to_string();
+        assert!(err.contains("active elsewhere"), "{err}");
+        assert!(err.contains("will not choose `Take over`"), "{err}");
     }
 
     /// Fail closed: anything that is not POSITIVELY the idle screen — a repaint

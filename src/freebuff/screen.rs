@@ -32,6 +32,17 @@ pub enum ScreenState {
     },
     /// "Freebuff is already running" dialog with Take over / Exit buttons.
     AlreadyRunning,
+    /// Free-plan TAKE-OVER modal: freebuff's free tier shares ONE session slot
+    /// across CLI and Desktop, so when a session is active ELSEWHERE (no local
+    /// freebuff process) it renders a modal reading `Limited access without a
+    /// subscription allows one session across CLI and Desktop. Take over to stop
+    /// the other session and use it here.` with an `Enter: take over  Esc: back
+    /// to draft` affordance. Taking over would steal the other session, which
+    /// AGENTS.md forbids (`docs/research/freebuff-tui.md`: never choose `Take
+    /// over`), so this is a terminal gate: never press Enter — fail fast with an
+    /// actionable error. Captured frame:
+    /// `tests/fixtures/screens/0229-real-take-over-modal-120x40.txt`.
+    TakeOver,
     /// Interactive login gate: "Press ENTER to login ...". A hard precondition
     /// the agent must NOT satisfy itself — the human logs in (AGENTS.md: never
     /// reuse credentials, never auto-dismiss an interstitial).
@@ -51,9 +62,19 @@ pub enum ScreenState {
 /// Key pressed to accept the model splash (Enter).
 pub const SPLASH_ACCEPT_KEY: &str = "\r";
 
+/// Operator error for the free-plan take-over modal ([`ScreenState::TakeOver`]).
+/// bufflink must NEVER press Enter here (`docs/research/freebuff-tui.md`: never
+/// choose `Take over`), so both the driver and enumeration surface this instead
+/// of waiting out a timeout. Shared so the two paths cannot describe the gate
+/// differently, and so the message always states (a) a session is active
+/// elsewhere, (b) bufflink will not take it over, and (c) what the user can do.
+pub const TAKE_OVER_ERROR: &str = "freebuff: a freebuff session is active elsewhere — the free plan shares one session \
+slot across CLI and Desktop, and no local freebuff process is running here. bufflink will not choose `Take over`; \
+close the other freebuff session (or take over manually in freebuff), then retry";
+
 /// Classify the current screen state from a list of text rows (ANSI already stripped).
 pub fn classify(rows: &[String]) -> ScreenState {
-    // Precedence: FreebucksGate > HoursGate > AlreadyRunning > Login > SessionEnded > KickedOut > Busy > ModelList > ModelSplash > Idle > Booting > Unknown
+    // Precedence: FreebucksGate > HoursGate > TakeOver > AlreadyRunning > Login > SessionEnded > KickedOut > Busy > ModelList > ModelSplash > Idle > Booting > Unknown
     //
     // Both terminal gates sit ahead of the picker states (ModelList/ModelSplash):
     // a gate renders modally over the session — and can render OVER the picker
@@ -94,6 +115,22 @@ pub fn classify(rows: &[String]) -> ScreenState {
                 hours,
                 message,
             };
+        }
+    }
+
+    // Check for the free-plan TAKE-OVER modal. freebuff's free tier shares ONE
+    // session slot across CLI and Desktop, so a session active ELSEWHERE (no
+    // local freebuff process) renders a modal offering `Enter: take over  Esc:
+    // back to draft`. Taking over would steal the other session, which AGENTS.md
+    // forbids, so this is a terminal gate — bufflink presses nothing and fails
+    // fast. Keyed on the modal's distinctive copy (the "take over" affordance
+    // alone is too generic); no healthy screen carries it. This sits ahead of
+    // the picker/Idle states because the modal REPLACES the input box.
+    for row in rows {
+        if row.contains("one session across CLI and Desktop")
+            || row.contains("Take over to stop the other")
+        {
+            return ScreenState::TakeOver;
         }
     }
 
@@ -1364,6 +1401,10 @@ mod tests {
             // The slash-command AUTOCOMPLETE popup, captured live right after
             // typing `/model` (before any Enter).
             "0229-real-slash-popup-120x40" => fixture!("0229-real-slash-popup-120x40"),
+            // VERBATIM-derived 120x40 frame of the free-plan TAKE-OVER modal,
+            // captured from the 2026-10-17 live run when a session was held on
+            // another device (the free plan shares one session slot).
+            "0229-real-take-over-modal-120x40" => fixture!("0229-real-take-over-modal-120x40"),
             "0227-synthetic-wrapped-input-120x40" => {
                 fixture!("0227-synthetic-wrapped-input-120x40")
             }
@@ -2050,6 +2091,47 @@ mod tests {
                 "{name} must not be the hours gate"
             );
         }
+    }
+
+    // --- free-plan TAKE-OVER modal (0229) ---------------------------------
+    //
+    // The 2026-10-17 live failure: a freebuff session was active ELSEWHERE (the
+    // free plan shares one session slot across CLI and Desktop; no local process
+    // was running), so freebuff showed a modal nothing classified and the prompt
+    // waited out the full 30 s timeout. AGENTS.md forbids taking over
+    // (`docs/research/freebuff-tui.md`), so it is a terminal gate. The fixture is
+    // the frame from that run.
+
+    #[test]
+    fn v0229_real_take_over_modal_classifies_as_take_over() {
+        let rows = load_fixture("0229-real-take-over-modal-120x40");
+        assert_eq!(classify(&rows), ScreenState::TakeOver);
+        // The distinctive copy is really on the frame, or this cannot bite.
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("one session across CLI and Desktop")));
+        // It is NOT the idle screen: the modal REPLACED the rounded input box.
+        assert!(!matches!(classify(&rows), ScreenState::Idle));
+        assert_eq!(input_box_text(&rows), None);
+        assert!(active_model(&rows).is_some());
+    }
+
+    /// The bare `Take over` button (the LOCAL already-running dialog) or a stray
+    /// `Enter: take over` affordance must NOT be read as the free-plan modal on
+    /// its own: the gate is keyed on the modal's distinctive copy.
+    #[test]
+    fn v0229_take_over_button_alone_is_not_the_free_plan_modal() {
+        let rows = vec![
+            "Freebuff is already running".to_string(),
+            "Only one freebuff instance is allowed at a time.".to_string(),
+            "  Take over    Exit".to_string(),
+        ];
+        assert_eq!(classify(&rows), ScreenState::AlreadyRunning);
+        // A stray affordance with no modal copy does not classify as the modal.
+        assert_ne!(
+            classify(&["Enter: take over  Esc: back to draft".to_string()]),
+            ScreenState::TakeOver
+        );
     }
 
     #[test]

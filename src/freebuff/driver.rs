@@ -24,6 +24,7 @@ use crate::freebuff::screen::{
     active_model, check_active_model, classify, input_box_is_empty, input_box_shows,
     input_box_text, match_model, model_rows, nav_ring, pasted_chip_chars, plan_select_step,
     prompt_visible, resolve_model_id, ModelMatch, ScreenState, SelectStep, SPLASH_ACCEPT_KEY,
+    TAKE_OVER_ERROR,
 };
 use crate::freebuff::settings::{settings_path, SettingsPin};
 use crate::freebuff::transcript::{diff, parse_messages, Block, Cursor, Delta, Message};
@@ -154,6 +155,7 @@ fn is_terminal_gate(state: &ScreenState) -> bool {
         state,
         ScreenState::HoursGate { .. }
             | ScreenState::FreebucksGate { .. }
+            | ScreenState::TakeOver
             | ScreenState::AlreadyRunning
             | ScreenState::Login
             | ScreenState::KickedOut
@@ -192,6 +194,7 @@ fn terminal_gate_error(state: &ScreenState, manicode_dir: &Path) -> Option<anyho
         ScreenState::FreebucksGate { message } => {
             Some(anyhow!("freebuff: not enough Freebucks — {}", message))
         }
+        ScreenState::TakeOver => Some(anyhow!("{}", TAKE_OVER_ERROR)),
         ScreenState::AlreadyRunning => {
             let owner_pid = instance_owner(manicode_dir)
                 .map(|(_, pid)| pid.to_string())
@@ -1033,6 +1036,16 @@ impl FreebuffBackend {
                     let _ = pty.kill().await;
                     return Err(terminal_gate_error(&state, &self.manicode_dir())
                         .expect("FreebucksGate is terminal (see is_terminal_gate)"));
+                }
+                ScreenState::TakeOver => {
+                    // The free plan shares one session slot across CLI and
+                    // Desktop: a session is active ELSEWHERE. bufflink never
+                    // presses Enter on this modal (AGENTS.md forbids taking
+                    // over), so fail fast with the actionable error.
+                    info!("startup: free-plan take-over modal detected");
+                    let _ = pty.kill().await;
+                    return Err(terminal_gate_error(&state, &self.manicode_dir())
+                        .expect("TakeOver is terminal (see is_terminal_gate)"));
                 }
                 ScreenState::AlreadyRunning => {
                     info!("startup: already running dialog detected");
@@ -2500,6 +2513,51 @@ mod tests {
         );
     }
 
+    /// The free plan shares one session slot across CLI and Desktop. When a
+    /// session is held ELSEWHERE (no local freebuff process), freebuff shows the
+    /// take-over modal. Startup must fail FAST on it — never press Enter (AGENTS.md
+    /// forbids taking over), never burn the whole startup timeout — with an error
+    /// that says a session is active elsewhere, that bufflink will not take it
+    /// over, and what the user can do.
+    #[tokio::test]
+    async fn t20_startup_fails_fast_on_take_over_modal() {
+        let tmp = test_temp_dir();
+        let temp_dir = tmp.0.clone();
+        let cfg = test_config(&temp_dir, Some("take-over"));
+        let backend = FreebuffBackend::new(cfg);
+
+        let start = Instant::now();
+        let result = backend.new_session(temp_dir.clone()).await;
+        let elapsed = start.elapsed();
+
+        let err = result
+            .expect_err("startup must fail on the take-over modal")
+            .to_string();
+        assert!(
+            err.contains("active elsewhere"),
+            "must state the session is held elsewhere: {err}"
+        );
+        assert!(
+            err.contains("will not choose `Take over`"),
+            "must state bufflink will not take over: {err}"
+        );
+        assert!(
+            err.contains("close the other freebuff session")
+                && err.contains("take over manually in freebuff"),
+            "must say what the user can do: {err}"
+        );
+        assert!(
+            !err.contains("startup timeout"),
+            "must fail fast, not time out: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "fast-fail should be well under the {elapsed:?} it took"
+        );
+
+        backend.shutdown().await;
+    }
+
     /// Fail-fast guard for the v0.3.1 no-auth signature. The log line cannot
     /// prove a single cause (a second freebuff instance produces the same
     /// lines), so the error states what was OBSERVED and the checks to make,
@@ -2638,6 +2696,7 @@ mod tests {
             ScreenState::FreebucksGate {
                 message: "Not enough Freebucks — 5 Freebucks/hr against 0 left.".to_string(),
             },
+            ScreenState::TakeOver,
             ScreenState::AlreadyRunning,
             ScreenState::Login,
             ScreenState::KickedOut,

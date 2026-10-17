@@ -112,6 +112,30 @@ Only one freebuff instance is allowed at a time.
 EOF
 }
 
+# Print the free-plan TAKE-OVER modal. The free tier shares ONE session slot
+# across CLI and Desktop, so a session active ELSEWHERE (no local freebuff
+# process) renders this modal. bufflink must NEVER press Enter here (AGENTS.md
+# forbids taking over), so it is a terminal gate that fails fast. Mirrors the
+# real interstitial captured on 2026-10-17 (v0.2.29) — the frame is kept as
+# tests/fixtures/screens/0229-real-take-over-modal-120x40.txt.
+print_take_over() {
+    cat <<'EOF'
+ ┌───────────────────────────────────────────────────────────────┐
+ │ May use data for AI training                                     │
+ │ Your first message starts the session.                           │
+ │ Some models aren't available on this connection                  │
+ │ 2 day streak                                                     │
+ └───────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Limited access without a subscription allows one session across CLI and Desktop. Take over to stop the other│
+│ session and use it here.                                                                                    │
+│ Enter: take over  Esc: back to draft                                                                        │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Solar Pro 4 · /private/var/folders/kl/8t4rp31969n3ts1h9_xm09k80000gn/T/blink-e2e-00000-abc · /model to change · Chat: New chat
+ ← for history · ? for help
+EOF
+}
+
 # Print idle screen
 print_idle() {
     cat <<EOF
@@ -299,6 +323,13 @@ case "${FAKE_FREEBUFF_MODE:-}" in
     running)
         print_already_running
         # Block forever
+        while true; do sleep 1; done
+        ;;
+    take-over)
+        print_take_over
+        # Block forever: the real modal waits for Enter/Esc, which bufflink must
+        # NOT send — Enter would take over the other session (AGENTS.md forbids
+        # it). bufflink must fail fast on this gate instead.
         while true; do sleep 1; done
         ;;
     no-auth)
