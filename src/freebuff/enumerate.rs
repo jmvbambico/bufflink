@@ -14,7 +14,7 @@
 //! name is dropped from the plain output (and flagged on stderr / in `--json`).
 
 use crate::freebuff::screen::{
-    classify, input_box_is_empty, input_box_is_exactly, model_rows, nav_ring, slash_popup_shows,
+    active_model, classify, input_box_is_empty, input_box_is_exactly, model_rows, nav_ring,
     toggle_row_has_focus_marker, ModelRow, ModelSection, ScreenState,
 };
 use crate::pty::{Key, Pty};
@@ -28,10 +28,6 @@ const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SETTLE: Duration = Duration::from_millis(300);
 /// Max Down presses before giving up (prevents an infinite scroll walk).
 const MAX_DOWN_PRESSES: u32 = 100;
-/// Max `/model` submissions when opening the picker. freebuff pops a
-/// slash-autocomplete menu on `/` that can swallow the first Enter, so the
-/// submit is nudged — bounded, so it can never loop.
-const MAX_MODEL_SUBMITS: u32 = 3;
 /// Max times `/model` is typed before giving up. freebuff flushes its input
 /// queue when it finishes initialising, so the first attempt can vanish; a
 /// single re-type covers it, and the bound keeps a wedged TUI from looping.
@@ -659,42 +655,58 @@ async fn type_and_confirm_command(pty: &Pty, cmd: &str, deadline: Instant) -> Re
     ))
 }
 
-/// The action the `/model` submit loop may take next. A value, so every path is
+/// The action the `/model` submit may take. A value, so every path is
 /// assertable without a live PTY — the same shape as [`ToggleStep`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubmitStep {
     /// A picker is already on screen: stop WITHOUT pressing anything.
     Opened,
-    /// Positively the idle input box still showing the command: Enter is safe.
+    /// Positively the idle input box showing the command: Enter is safe.
     Enter,
 }
 
-/// Decide whether the `already_entered`-th Enter may be sent, from a FRESHLY
-/// read screen.
+/// Whether a screen POSITIVELY shows freebuff's idle input box, so the single
+/// `/model` submit may be pressed.
+///
+/// freebuff 0.2.29's idle-with-typed-text screen keeps the FREEBUFF banner and
+/// drops the input placeholder, so [`classify`] cannot reach
+/// [`ScreenState::Idle`] and reports [`ScreenState::Booting`] instead (measured
+/// live 2026-10-17 against 0.2.29: with `blink` driving it, after typing
+/// `/model` the classification was `Booting`, the box held exactly `/model`, and
+/// the picker opened on the next Enter). The positive evidence that the screen is
+/// the idle input box — and not a half-painted frame — is a live session STATUS
+/// ROW ([`active_model`]); a `Booting` frame with no status row authorises
+/// nothing, so the guard still fails closed on an empty repaint.
+fn is_idle_input_screen(state: &ScreenState, rows: &[String]) -> bool {
+    match state {
+        ScreenState::Idle => true,
+        ScreenState::Booting => active_model(rows).is_some(),
+        _ => false,
+    }
+}
+
+/// Decide whether the ONE `/model` submit may be sent, from a FRESHLY read
+/// screen.
 ///
 /// `Err` means "press nothing": the caller Esc's and aborts with this error.
 ///
-/// Two separate hazards, both money-safety:
+/// Two hazards, both money-safety:
 ///
-/// * A blind Enter. The loop presses Enter and only then reads, so a picker that
-///   renders in between receives that Enter on its focused MODEL row — where
-///   Enter STARTS A BILLED SESSION, before [`toggle_walk_next`] governs anything.
+/// * A blind Enter. A picker that has rendered receives it on its focused MODEL
+///   row — where Enter STARTS A BILLED SESSION, before [`toggle_walk_next`]
+///   governs anything.
 /// * A SUBSTRING match. `input_box_shows` is a contains match, so a box holding
 ///   `foo/model` would be "confirmed" and submitted as a MESSAGE, which starts a
 ///   billed session. The box must hold EXACTLY the command
 ///   ([`input_box_is_exactly`]).
 ///
-/// The FIRST Enter is the legitimate submit: Idle, box exactly the command. A
-/// REPEAT (`already_entered >= 1`) needs those PLUS positive evidence that the
-/// autocomplete popup which swallowed the first Enter is still on screen
-/// ([`slash_popup_shows`]) — a nudge is never sent merely because the picker is
-/// not up yet. Anything else fails closed.
-fn submit_step(
-    state: &ScreenState,
-    rows: &[String],
-    cmd: &str,
-    already_entered: u32,
-) -> Result<SubmitStep> {
+/// Exactly ONE Enter is ever sent. `pty.key` only WRITES the key — it does not
+/// wait for freebuff to consume it — so a repeat guarded on a screen snapshot
+/// could still be delivered AFTER the first Enter opened the picker, landing on
+/// a focused model row and starting a billed session. There is deliberately no
+/// repeat path here (see [`open_picker_via_slash_model`]); anything that cannot
+/// be verified fails closed.
+fn submit_step(state: &ScreenState, rows: &[String], cmd: &str) -> Result<SubmitStep> {
     if matches!(state, ScreenState::ModelSplash | ScreenState::ModelList) {
         return Ok(SubmitStep::Opened);
     }
@@ -706,9 +718,9 @@ fn submit_step(
             "freebuff: refusing to confirm a screen that would start a session: {line}"
         ));
     }
-    if *state != ScreenState::Idle {
+    if !is_idle_input_screen(state, rows) {
         return Err(anyhow!(
-            "freebuff: the screen is no longer the idle input box ({state:?}); Enter was NOT sent \
+            "freebuff: the screen is not the idle input box ({state:?}); Enter was NOT sent \
              — Enter on an unrecognised screen could start a billed session"
         ));
     }
@@ -718,35 +730,32 @@ fn submit_step(
              (leftover text would submit a MESSAGE, which starts a billed session)"
         ));
     }
-    if already_entered > 0 && !slash_popup_shows(rows) {
-        return Err(anyhow!(
-            "freebuff: the picker has not opened and the slash-command popup is NOT on screen, \
-             so no further Enter was sent — a blind nudge could land on a picker's model row and \
-             start a billed session (see docs/research/freebuff-tui.md)"
-        ));
-    }
     Ok(SubmitStep::Enter)
 }
 
-/// Type `/model` into the idle input box and submit it, opening the picker.
+/// Type `/model` into the idle input box and submit it with a SINGLE Enter,
+/// opening the picker.
 ///
 /// Hazards, all handled explicitly because this can SPEND the user's money:
 ///
 /// * A malformed submission would send a plain MESSAGE, and freebuff's first
 ///   message STARTS A BILLED SESSION. The box must be EMPTY before typing and
 ///   hold EXACTLY `/model` before submitting ([`input_box_is_exactly`], never the
-///   substring [`input_box_shows`]) — re-confirmed before EVERY Enter by
-///   [`submit_step`].
+///   substring [`input_box_shows`]) — re-confirmed by [`submit_step`].
 /// * freebuff renders its idle screen a beat before it starts reading input and
 ///   FLUSHES the input queue when it finishes initialising, so a burst typed the
 ///   instant Idle appears is silently lost (measured live against 0.2.29: the
 ///   box still showed the placeholder after typing). The command is therefore
 ///   re-typed, bounded, and the box is cleared deterministically and
 ///   re-verified empty before each retry ([`type_and_confirm_command`]).
-/// * freebuff pops a slash-autocomplete menu on `/` that can SWALLOW the first
-///   Enter (documented in `docs/research/freebuff-tui.md`). ONE repeat Enter is
-///   allowed, and only while that popup is positively on screen
-///   ([`slash_popup_shows`]) — never as a blind nudge.
+/// * A REPEAT Enter is NEVER sent. `pty.key` only WRITES the key — it does not
+///   wait for freebuff to consume it — so a repeat guarded on a screen snapshot
+///   can be delivered AFTER the first Enter opened the picker, where it lands on
+///   a focused MODEL row and starts a billed session. Measured live against
+///   0.2.29 (4/4 attempts, one per round of a single session): the picker opens
+///   on the FIRST Enter — the autocomplete popup does NOT swallow it — so no
+///   repeat is needed. If the picker does not open, this fails LOUDLY instead of
+///   nudging again.
 ///
 /// No model row is ever Entered here, so nothing is selected or billed.
 async fn open_picker_via_slash_model(pty: &Pty, deadline: Instant) -> Result<()> {
@@ -756,61 +765,51 @@ async fn open_picker_via_slash_model(pty: &Pty, deadline: Instant) -> Result<()>
     // would start a session.
     type_and_confirm_command(pty, MODEL_COMMAND, deadline).await?;
 
-    let mut entered = 0u32;
-    while entered < MAX_MODEL_SUBMITS {
-        if Instant::now() >= deadline {
-            return Err(anyhow!("freebuff enumeration deadline expired"));
+    // Re-read and classify IMMEDIATELY before pressing Enter. The picker may
+    // have rendered since we typed; a blind Enter would land on its focused
+    // MODEL row and start a billed session.
+    let snap = pty.screen();
+    match submit_step(&classify(&snap.rows), &snap.rows, MODEL_COMMAND) {
+        Ok(SubmitStep::Opened) => return Ok(()),
+        Ok(SubmitStep::Enter) => {}
+        Err(err) => {
+            let _ = pty.key(Key::Escape).await;
+            return Err(err);
         }
-
-        // Re-read and classify IMMEDIATELY before pressing Enter, every time. The
-        // picker may have rendered since the last wait; a blind Enter would land
-        // on its focused MODEL row and start a billed session.
-        let snap = pty.screen();
-        match submit_step(&classify(&snap.rows), &snap.rows, MODEL_COMMAND, entered) {
-            Ok(SubmitStep::Opened) => return Ok(()),
-            Ok(SubmitStep::Enter) => {}
-            Err(err) => {
-                let _ = pty.key(Key::Escape).await;
-                return Err(err);
-            }
-        }
-
-        pty.key(Key::Enter).await?;
-        entered += 1;
-
-        // Give the picker or the autocomplete popup a bounded moment to render,
-        // then let the next iteration re-read. A timeout here just means "not
-        // open yet".
-        //
-        // NB: read-then-write over a PTY cannot be made atomic, so a picker that
-        // renders in the microseconds between the read above and this Enter is
-        // not eliminated — it is only reachable on a REPEAT Enter, which
-        // `submit_step` allows solely while the popup is still on screen, i.e.
-        // while the picker demonstrably is not.
-        let open_window =
-            Duration::from_secs(3).min(deadline.saturating_duration_since(Instant::now()));
-        if open_window.is_zero() {
-            return Err(anyhow!("freebuff enumeration deadline expired"));
-        }
-        let _ = pty
-            .wait_for(
-                |s| {
-                    matches!(
-                        classify(&s.rows),
-                        ScreenState::ModelSplash | ScreenState::ModelList
-                    )
-                },
-                open_window,
-            )
-            .await;
-        tokio::time::sleep(SETTLE).await;
     }
 
-    let _ = pty.key(Key::Escape).await;
-    Err(anyhow!(
-        "freebuff: the model picker did not open after submitting /model {MAX_MODEL_SUBMITS} \
-         time(s); the slash command may have changed — see docs/research/freebuff-tui.md"
-    ))
+    // Exactly ONE Enter — never a repeat.
+    pty.key(Key::Enter).await?;
+
+    // Give the picker a bounded moment to render. A timeout is a LOUD failure,
+    // NOT a reason to send another Enter: a queued second Enter could be
+    // delivered after this one opened the picker and land on a model row.
+    let open_window =
+        Duration::from_secs(3).min(deadline.saturating_duration_since(Instant::now()));
+    if open_window.is_zero() {
+        return Err(anyhow!("freebuff enumeration deadline expired"));
+    }
+    let opened = pty
+        .wait_for(
+            |s| {
+                matches!(
+                    classify(&s.rows),
+                    ScreenState::ModelSplash | ScreenState::ModelList
+                )
+            },
+            open_window,
+        )
+        .await;
+    if opened.is_err() {
+        let _ = pty.key(Key::Escape).await;
+        return Err(anyhow!(
+            "freebuff: the model picker did not open after submitting /model once; no repeat \
+             Enter is sent, because a queued second Enter could land on a model row and start a \
+             billed session — see docs/research/freebuff-tui.md"
+        ));
+    }
+    tokio::time::sleep(SETTLE).await;
+    Ok(())
 }
 
 /// Enumerate the model catalog by driving `pty` through freebuff's picker.
@@ -1901,7 +1900,7 @@ mod tests {
         }
     }
 
-    // --- `/model` submit-loop safety: no blind Enter ------------------------
+    // --- `/model` submit safety: exactly one Enter, no blind nudge ----------
 
     /// A screen that is POSITIVELY the idle input box holding `box_text`.
     fn idle_rows(box_text: &str) -> Vec<String> {
@@ -1913,16 +1912,35 @@ mod tests {
         ]
     }
 
-    /// The FIRST Enter is the legitimate submit, and it is returned only for a
-    /// confirmed idle screen whose box holds EXACTLY the command. Leftover text
-    /// that merely CONTAINS the command must never authorise a keystroke — that
-    /// is how a stray MESSAGE, which starts a billed session, gets submitted.
+    /// The real 0.2.29 idle-with-typed-text layout (verbatim shape from the
+    /// 2026-10-17 live probe): FREEBUFF banner + info box + input box + a status
+    /// row that carries `/model to change` and NO `✕ End session`.
+    fn real_typed_idle_rows(box_text: &str) -> Vec<String> {
+        vec![
+            " ███████████                        ██                 ▄████  ▄██".to_string(),
+            " ┌──────────────────────────────────────────────────────────┐".to_string(),
+            " │ Your first message starts the session.                   │".to_string(),
+            " │ Some models aren't available on this connection          │".to_string(),
+            " └──────────────────────────────────────────────────────────┘".to_string(),
+            "╭──────────────────────────────────────────────────────────╮".to_string(),
+            "│  /model      Choose the model for your next message      │".to_string(),
+            format!("│  ▍{box_text}                                              │"),
+            "╰──────────────────────────────────────────────────────────╯".to_string(),
+            " GLM 5.3 Flash • high · /private/tmp · /model to change · Chat: New chat".to_string(),
+            " ← for history · ? for help".to_string(),
+        ]
+    }
+
+    /// The single Enter is returned only for a confirmed idle screen whose box
+    /// holds EXACTLY the command. Leftover text that merely CONTAINS the command
+    /// must never authorise a keystroke — that is how a stray MESSAGE, which
+    /// starts a billed session, gets submitted.
     #[test]
     fn submit_step_enters_only_on_a_confirmed_idle_box_holding_exactly_the_command() {
         let rows = idle_rows("/model");
         assert_eq!(classify(&rows), ScreenState::Idle);
         assert!(matches!(
-            submit_step(&classify(&rows), &rows, "/model", 0),
+            submit_step(&classify(&rows), &rows, "/model"),
             Ok(SubmitStep::Enter)
         ));
 
@@ -1939,16 +1957,49 @@ mod tests {
             let rows = idle_rows(box_text);
             assert!(matches!(classify(&rows), ScreenState::Idle), "{box_text:?}");
             assert!(
-                submit_step(&classify(&rows), &rows, "/model", 0).is_err(),
+                submit_step(&classify(&rows), &rows, "/model").is_err(),
                 "box {box_text:?} must NOT authorise Enter"
             );
         }
     }
 
-    /// The race this fixes: the picker rendered before the loop came back round.
-    /// The step must be `Opened`, i.e. the caller returns WITHOUT pressing
-    /// anything — a blind Enter here would land on the picker's focused MODEL
-    /// row (Enter on a model row starts a session and spends Freebucks).
+    /// The real 0.2.29 idle-with-typed-text screen classifies as `Booting` (the
+    /// banner is up and the placeholder is gone), yet it IS the idle input box:
+    /// a live session status row plus a box holding exactly the command. It must
+    /// authorise the single Enter — otherwise `--list-models` can never submit
+    /// `/model` against the real CLI. A `Booting` frame with NO status row (a
+    /// half-painted repaint) must still fail closed.
+    #[test]
+    fn submit_step_accepts_the_real_typed_idle_screen_but_not_a_bare_booting_frame() {
+        let rows = real_typed_idle_rows("/model");
+        assert_eq!(
+            classify(&rows),
+            ScreenState::Booting,
+            "the real typed screen must classify as Booting for this guard to bite"
+        );
+        assert!(
+            active_model(&rows).is_some(),
+            "a live status row is present"
+        );
+        assert!(input_box_is_exactly(&rows, "/model"));
+        assert!(matches!(
+            submit_step(&classify(&rows), &rows, "/model"),
+            Ok(SubmitStep::Enter)
+        ));
+
+        // A Booting frame with no status row authorises nothing.
+        let bare = vec![" ██████".to_string()];
+        assert_eq!(classify(&bare), ScreenState::Booting);
+        assert!(
+            submit_step(&classify(&bare), &bare, "/model").is_err(),
+            "a bare Booting frame must not authorise Enter"
+        );
+    }
+
+    /// The picker rendered before the read: the step must be `Opened`, i.e. the
+    /// caller returns WITHOUT pressing anything — a keypress here would land on
+    /// the picker's focused MODEL row (Enter on a model row starts a session and
+    /// spends Freebucks).
     #[test]
     fn submit_step_stops_without_pressing_when_a_picker_is_already_up() {
         for name in [
@@ -1961,65 +2012,27 @@ mod tests {
                 matches!(state, ScreenState::ModelSplash | ScreenState::ModelList),
                 "{name}: {state:?}"
             );
-            for prior in [0u32, 1] {
-                assert!(
-                    matches!(
-                        submit_step(&state, &rows, "/model", prior),
-                        Ok(SubmitStep::Opened)
-                    ),
-                    "{name} (entered={prior}): a picker already on screen must never \
-                     authorise a keypress"
-                );
-            }
+            assert!(
+                matches!(submit_step(&state, &rows, "/model"), Ok(SubmitStep::Opened)),
+                "{name}: a picker already on screen must never authorise a keypress"
+            );
         }
     }
 
-    /// A REPEAT Enter needs positive evidence that the popup which swallowed the
-    /// first one is still on screen. Without the popup, a nudge would be blind:
-    /// the picker may be rendering right now, and Enter would land on its model
-    /// row. Structural, not timing-based.
+    /// A gate or a start/spend confirmation aborts (Esc + a loud error) instead
+    /// of being confirmed.
     #[test]
-    fn submit_step_refuses_a_repeat_enter_without_popup_evidence() {
-        // The real popup frame: typed command + menu chrome.
-        let popup = load_fixture("0229-real-slash-popup-120x40");
-        assert_eq!(classify(&popup), ScreenState::Idle);
-        assert!(input_box_is_exactly(&popup, "/model"));
-        assert!(slash_popup_shows(&popup));
-        // First submit: allowed (it is the legitimate submit).
-        assert!(matches!(
-            submit_step(&classify(&popup), &popup, "/model", 0),
-            Ok(SubmitStep::Enter)
-        ));
-        // Repeat: allowed ONLY because the popup is still there.
-        assert!(matches!(
-            submit_step(&classify(&popup), &popup, "/model", 1),
-            Ok(SubmitStep::Enter)
-        ));
-
-        // Same idle box, command still exact, but the popup is CLOSED and the
-        // picker has not opened: a nudge here would be blind.
-        let closed = idle_rows("/model");
-        assert!(submit_step(&classify(&closed), &closed, "/model", 0).is_ok());
-        let err = submit_step(&classify(&closed), &closed, "/model", 1)
-            .expect_err("a repeat Enter without popup evidence must be refused")
-            .to_string();
-        assert!(err.contains("popup"), "{err}");
-    }
-
-    /// A gate or a start/spend confirmation appearing between nudges aborts
-    /// (Esc + a loud error) instead of being confirmed.
-    #[test]
-    fn submit_step_aborts_on_a_gate_or_a_confirmation_between_nudges() {
+    fn submit_step_aborts_on_a_gate_or_a_confirmation() {
         let gate =
             vec!["│ Not enough hours for MiMo Fast: an hour on it takes 2 hours. │".to_string()];
         assert!(matches!(classify(&gate), ScreenState::HoursGate { .. }));
-        let err = submit_step(&classify(&gate), &gate, "/model", 0)
+        let err = submit_step(&classify(&gate), &gate, "/model")
             .expect_err("a gate must not authorise Enter")
             .to_string();
         assert!(err.contains("not enough hours"), "{err}");
 
         let confirm = vec!["Press Enter to continue in a new session".to_string()];
-        let err = submit_step(&classify(&confirm), &confirm, "/model", 0)
+        let err = submit_step(&classify(&confirm), &confirm, "/model")
             .expect_err("a confirmation must not authorise Enter")
             .to_string();
         assert!(err.contains("a new session"), "{err}");
@@ -2032,23 +2045,24 @@ mod tests {
         let empty: Vec<String> = Vec::new();
         assert_eq!(classify(&empty), ScreenState::Booting);
         assert!(
-            submit_step(&classify(&empty), &empty, "/model", 0).is_err(),
+            submit_step(&classify(&empty), &empty, "/model").is_err(),
             "an empty/repainting screen must never authorise Enter"
         );
 
         let unknown = vec!["some prose".to_string()];
         assert_eq!(classify(&unknown), ScreenState::Unknown);
         assert!(
-            submit_step(&classify(&unknown), &unknown, "/model", 0).is_err(),
+            submit_step(&classify(&unknown), &unknown, "/model").is_err(),
             "an unrecognised screen must never authorise Enter"
         );
     }
 
-    /// Structural end-to-end proof, independent of the swallow timing: with the
-    /// autocomplete swallow DISABLED the FIRST Enter opens the picker, so any
-    /// further nudge lands on its focused MODEL row — where the fake exits 1
-    /// (exactly what it does for a model-row Enter). The catalog must still come
-    /// back complete, proving the loop pressed nothing after the picker opened.
+    /// Structural end-to-end proof: the fake opens the picker on the FIRST
+    /// Enter, so any further nudge lands on its focused MODEL row — where the
+    /// fake exits 1 (exactly what it does for a model-row Enter). The catalog
+    /// must still come back complete, proving the picker-entry path pressed
+    /// nothing after the picker opened. Guards against a nudge being
+    /// reintroduced.
     #[tokio::test]
     async fn enumerate_never_nudges_enter_once_the_picker_is_open() -> anyhow::Result<()> {
         let _env_guard = ENV_LOCK.lock().await;
@@ -2061,11 +2075,9 @@ mod tests {
         let prev_manicode = env::var("BLINK_MANICODE_DIR").ok();
         let prev_lines = env::var("LINES").ok();
         let prev_mode = env::var("FAKE_FREEBUFF_MODE").ok();
-        let prev_swallow = env::var("FAKE_FREEBUFF_NO_SWALLOW").ok();
         env::set_var("BLINK_MANICODE_DIR", &manicode);
         env::set_var("LINES", "40");
         env::set_var("FAKE_FREEBUFF_MODE", "list");
-        env::set_var("FAKE_FREEBUFF_NO_SWALLOW", "1");
 
         let result = (async {
             let pty = Pty::spawn(PtyConfig {
@@ -2098,10 +2110,6 @@ mod tests {
             Some(v) => env::set_var("FAKE_FREEBUFF_MODE", v),
             None => env::remove_var("FAKE_FREEBUFF_MODE"),
         }
-        match prev_swallow {
-            Some(v) => env::set_var("FAKE_FREEBUFF_NO_SWALLOW", v),
-            None => env::remove_var("FAKE_FREEBUFF_NO_SWALLOW"),
-        }
         let _ = std::fs::remove_dir_all(&manicode);
 
         let catalog = result?;
@@ -2109,6 +2117,85 @@ mod tests {
             catalog.len(),
             10,
             "every model must still be read, with no stray nudge after the picker opened"
+        );
+        Ok(())
+    }
+
+    /// STRUCTURAL guard: the picker-entry path writes EXACTLY ONE Enter.
+    ///
+    /// `pty.key(Enter)` only WRITES the key; it does not wait for freebuff to
+    /// consume it. A repeat guarded on a screen snapshot could therefore still be
+    /// delivered AFTER the previous Enter opened the picker — landing on a
+    /// focused MODEL row and starting a billed session. The fake records every
+    /// Enter it receives while idle, i.e. by the picker-entry path (in-picker
+    /// Enters from the toggle walk are governed separately and are not logged);
+    /// the recorded sequence must contain exactly one. Structural, not
+    /// timing-based: it asserts the recorded key sequence.
+    #[tokio::test]
+    async fn picker_entry_path_writes_exactly_one_enter() -> anyhow::Result<()> {
+        let _env_guard = ENV_LOCK.lock().await;
+        let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake-freebuff/fake-freebuff.sh");
+        let base =
+            std::env::temp_dir().join(format!("blink-enumerate-oneenter-{}", std::process::id()));
+        let manicode = base.join("manicode");
+        let keylog = base.join("keys.log");
+        std::fs::create_dir_all(&manicode)?;
+
+        let prev_manicode = env::var("BLINK_MANICODE_DIR").ok();
+        let prev_lines = env::var("LINES").ok();
+        let prev_mode = env::var("FAKE_FREEBUFF_MODE").ok();
+        let prev_keylog = env::var("FAKE_FREEBUFF_KEYLOG").ok();
+        env::set_var("BLINK_MANICODE_DIR", &manicode);
+        env::set_var("LINES", "40");
+        env::set_var("FAKE_FREEBUFF_MODE", "list");
+        env::set_var("FAKE_FREEBUFF_KEYLOG", &keylog);
+
+        let result = (async {
+            let pty = Pty::spawn(PtyConfig {
+                program: fake.to_string_lossy().to_string(),
+                args: vec![],
+                cwd: Some(manicode.clone()),
+                env: vec![],
+                cols: 120,
+                rows: 40,
+            })
+            .await
+            .map_err(|e| anyhow!("spawn fake: {e:#}"))?;
+            let catalog = tokio::time::timeout(Duration::from_secs(20), enumerate_catalog(&pty))
+                .await
+                .map_err(|_| anyhow!("enumeration timed out"))??;
+            let _ = pty.kill().await;
+            Ok::<_, anyhow::Error>(catalog)
+        })
+        .await;
+
+        match prev_manicode {
+            Some(v) => env::set_var("BLINK_MANICODE_DIR", v),
+            None => env::remove_var("BLINK_MANICODE_DIR"),
+        }
+        match prev_lines {
+            Some(v) => env::set_var("LINES", v),
+            None => env::remove_var("LINES"),
+        }
+        match prev_mode {
+            Some(v) => env::set_var("FAKE_FREEBUFF_MODE", v),
+            None => env::remove_var("FAKE_FREEBUFF_MODE"),
+        }
+        match prev_keylog {
+            Some(v) => env::set_var("FAKE_FREEBUFF_KEYLOG", v),
+            None => env::remove_var("FAKE_FREEBUFF_KEYLOG"),
+        }
+
+        let catalog = result?;
+        assert_eq!(catalog.len(), 10, "the catalog must still be read");
+
+        let log = std::fs::read_to_string(&keylog).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&base);
+        let enters = log.lines().filter(|l| *l == "idle-enter").count();
+        assert_eq!(
+            enters, 1,
+            "the picker-entry path must write EXACTLY ONE Enter; recorded key log:\n{log}"
         );
         Ok(())
     }

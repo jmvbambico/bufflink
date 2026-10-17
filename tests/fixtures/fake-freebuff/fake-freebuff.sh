@@ -406,13 +406,18 @@ case "${FAKE_FREEBUFF_MODE:-}" in
         # 0.2.29 flow, modelled from the live probe (2026-10-17): freebuff boots
         # STRAIGHT to the idle input box with a model already selected — there is
         # NO startup picker — and the model picker is opened by SUBMITTING the
-        # `/model` command. The fake mirrors that, including the slash-
-        # autocomplete popup that SWALLOWS the first Enter (documented in
-        # docs/research/freebuff-tui.md): idle -> `/model` (first Enter eaten) ->
-        # picker, driven with Up/Down and Enter.
+        # `/model` command. The slash-autocomplete popup is RENDERED while typing
+        # but does NOT swallow the Enter: the picker opens on the FIRST Enter
+        # (measured live 4/4 against 0.2.29; the old "first Enter is eaten" note
+        # was a misdiagnosis of the same-burst trailing-Enter quirk). idle ->
+        # `/model` -> picker, driven with Up/Down and Enter.
         #
         # Enter on a model row is an Enter-guard violation, so the fake exits 1
         # to prove blink never sends Enter on a model row.
+        #
+        # When FAKE_FREEBUFF_KEYLOG names a file, every Enter received while idle
+        # (i.e. by the picker-entry path) is appended to it as `idle-enter`, so a
+        # test can assert that path writes AT MOST ONE Enter.
         #
         # POSIX sh has no arrays and the shebang is #!/bin/sh (dash on Ubuntu):
         # keep the ten model display names, in order, as a newline-delimited
@@ -445,9 +450,13 @@ Gemini 3.8 Flash'
         ESC=$(printf '\033')
         CR=$(printf '\r')
         BS=$(printf '\177')
+        keylog() {
+            if [ -n "${FAKE_FREEBUFF_KEYLOG:-}" ]; then
+                printf '%s\n' "$1" >> "$FAKE_FREEBUFF_KEYLOG"
+            fi
+        }
         line=""
         mode=idle
-        submit_seen=0      # idle: has the first (swallowed) Enter been sent?
         menu=0             # idle: is the slash-autocomplete popup shown?
         expanded=0
         focus=0            # 0..N-1 model index; N = the toggle row (expanded only)
@@ -547,28 +556,20 @@ Gemini 3.8 Flash'
                         esac
                         ;;
                     "$CR")
+                        keylog idle-enter
                         if [ "$line" = "/model" ]; then
-                            if [ "$submit_seen" -eq 0 ] && [ "${FAKE_FREEBUFF_NO_SWALLOW:-0}" -ne 1 ]; then
-                                # The slash-autocomplete popup eats the first
-                                # Enter: the menu stays open with `/model` still
-                                # in the box, exactly like the real CLI.
-                                submit_seen=1
-                                menu=1
-                            else
-                                # The (second) Enter opens the picker. With
-                                # FAKE_FREEBUFF_NO_SWALLOW=1 the FIRST Enter opens
-                                # it, so a caller that nudges Enter again while
-                                # the picker is already up hits a model row and
-                                # the fake exits 1 below.
-                                mode=picker
-                                menu=0
-                                expanded=0
-                                focus=0
-                                focus_toggle=0
-                                scroll=0
-                                draw_picker
-                                continue
-                            fi
+                            # The FIRST Enter opens the picker: the popup does
+                            # NOT swallow it. A caller that nudges Enter again
+                            # while the picker is already up hits a model row and
+                            # the fake exits 1 below.
+                            mode=picker
+                            menu=0
+                            expanded=0
+                            focus=0
+                            focus_toggle=0
+                            scroll=0
+                            draw_picker
+                            continue
                         elif [ "$line" = "/exit" ]; then
                             print_exit
                             exit 0
@@ -593,7 +594,6 @@ Gemini 3.8 Flash'
                             # A bare Esc leaves the picker without selecting.
                             mode=idle
                             line=""
-                            submit_seen=0
                             draw_idle
                             continue
                         fi

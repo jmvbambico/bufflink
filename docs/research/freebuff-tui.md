@@ -176,10 +176,12 @@ never choose `Take over`.
 - The chat directory is created at **launch** (splash accept), before the
   first prompt; `chat-messages.json` appears only after the first turn.
 - Typing `/exit` + Enter from the bridge did **not** exit freebuff within 3 s
-  in any of the three runs (it did in the manual tmux probe). Suspect the
-  slash-autocomplete popup swallows the first Enter. The bridge falls back to
-  SIGTERM/SIGKILL on the child's **process group**: the npm launcher forwards
-  no signals, and the real Bun binary survives SIGHUP from the closing PTY.
+  in any of the three runs (it did in the manual tmux probe). The Enter was
+  written in the SAME burst as the text, which freebuff does not submit (see the
+  v0.2.29 note below: the first Enter is NOT swallowed when it is its own
+  write). The bridge falls back to SIGTERM/SIGKILL on the child's **process
+  group**: the npm launcher forwards no signals, and the real Bun binary
+  survives SIGHUP from the closing PTY.
 - Splash → Idle takes ~2.3 s; a trivial turn 3–7 s; Esc cancel is honoured
   in < 0.4 s and the next prompt works in the same session.
 
@@ -194,25 +196,33 @@ opens the picker by COMMAND.
   submitted once the box positively shows `/model`: freebuff's first MESSAGE
   starts a billed session, so a stray keystroke is expensive. The enumeration
   path never types a message.
-- **The first Enter is swallowed.** `/` pops a slash-autocomplete menu rendered
-  INSIDE the input box, ABOVE the typed line (`/model      Choose the model for
-  your next message`), from the first character typed; the first Enter lands on
-  the menu, not the command. Submit, re-read, submit again (bounded). The same
-  swallow is why `/exit` + Enter never left freebuff. Popup frame kept as
+- **The first Enter is NOT swallowed.** `/` pops a slash-autocomplete menu
+  rendered INSIDE the input box, ABOVE the typed line (`/model      Choose the
+  model for your next message`), from the first character typed — but submitting
+  `/model` opens the picker on the FIRST Enter. Measured live 2026-10-17 against
+  0.2.29 (4/4 attempts, one per round of a single session): type `/model`, send
+  ONE Enter, the picker opens. The earlier "first Enter is swallowed" note was a
+  misdiagnosis of the same-burst quirk — a trailing Enter written in the SAME
+  burst as the text does not submit, and blink sends the Enter as its own write
+  after the box is confirmed. That quirk is why `/exit` + Enter in one burst
+  never left freebuff. Popup frame kept as
   `tests/fixtures/screens/0229-real-slash-popup-120x40.txt`. The popup is
   detected by a `/command` followed by 2+ spaces and a description; the typed
   line itself has no description, so a CLOSED popup is never mistaken for one.
-- **Every nudge must re-check the screen FIRST.** The picker can render between
-  the wait window expiring and the next nudge; an Enter sent blind then lands
-  inside the open picker, on its focused MODEL row, and starts a billed session
-  before any toggle guard governs it. Enter is sent only after a freshly read
-  screen is positively the idle input box holding EXACTLY `/model`; anything else
-  fails closed. A REPEAT Enter additionally requires the popup to still be on
-  screen — never "the picker is not up yet".
-  Read-then-write over a PTY cannot be made atomic, so the residual exposure is
-  a picker that renders in the microseconds between the read and the Enter: it
-  is reachable only on a repeat, i.e. only while the popup demonstrably still
-  holds the command-entry UI. It is reduced, not eliminated.
+- **EXACTLY ONE Enter — never a repeat.** `pty.key` only WRITES a key; it does
+  not wait for freebuff to consume it (`pty.key(Enter)` returns as soon as the
+  bytes are written). A repeat guarded on a screen snapshot can therefore be
+  delivered AFTER the first Enter opened the picker, landing on its focused MODEL
+  row and starting a billed session — so no repeat is sent at all. Enter is sent
+  only after a freshly read screen POSITIVELY shows the idle input box holding
+  EXACTLY `/model` (never the substring `input_box_shows`); anything else fails
+  closed. If the picker does not open on that one Enter, `--list-models` fails
+  loudly (og falls back to its own list) rather than nudging again.
+- **The idle-with-typed-text screen classifies as `Booting`, not `Idle`.** The
+  banner is up and the input placeholder is gone, so `classify` cannot reach
+  `Idle`; the positive idle evidence the submit path uses is a live session
+  STATUS ROW (`active_model`) plus the box holding exactly the command. A
+  `Booting` frame with no status row (a half-painted repaint) still fails closed.
 - **Verify the box by EQUALITY, not substring.** `input_box_shows` is a contains
   match (it prefix-matches a long prompt), so a box holding `foo/model` or
   `/model/model` passes it — and submitting that sends a MESSAGE, which starts a

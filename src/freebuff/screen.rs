@@ -1212,11 +1212,10 @@ pub fn input_box_is_exactly(rows: &[String], cmd: &str) -> bool {
 ///
 /// The popup renders INSIDE the input box, above the typed text, as
 /// `/command   Description` rows (captured live from 0.2.29:
-/// `/model      Choose the model for your next message`). It is the ONLY
-/// documented reason a first Enter is swallowed
-/// (`docs/research/freebuff-tui.md`), so it is the positive evidence a REPEAT
-/// Enter requires — a repeat must never be sent merely because "the picker is
-/// not up yet".
+/// `/model      Choose the model for your next message`). It is chrome the TUI
+/// draws in the box, not typed content, so [`input_box_is_exactly`] skips those
+/// rows. It does NOT swallow the Enter (measured live 2026-10-17 — see
+/// `docs/research/freebuff-tui.md`).
 pub fn slash_popup_shows(rows: &[String]) -> bool {
     let Some(text) = input_box_text(rows) else {
         return false;
