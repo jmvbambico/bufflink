@@ -380,6 +380,9 @@ case "${FAKE_FREEBUFF_MODE:-}" in
             printf '\033[2J\033[H'
             print_idle
             printf '\033[2A\033[4C'
+            # Typed text REPLACES the placeholder (see the note in idle_prompt
+            # below), so the caller can verify the box holds exactly a command.
+            printf '\033[K'
             read -r line || return 1
             printf '\n\n'
             ESC=$(printf '\033')
@@ -409,6 +412,9 @@ case "${FAKE_FREEBUFF_MODE:-}" in
             printf '\033[2J\033[H'
             print_idle
             printf '\033[2A\033[4C'
+            # Typed text REPLACES the placeholder (see the note in idle_prompt
+            # below), so the caller can verify the box holds exactly a command.
+            printf '\033[K'
             read -r line || return 1
             printf '\n\n'
             ESC=$(printf '\033')
@@ -679,6 +685,123 @@ Gemini 3.8 Flash'
             fi
         done
         ;;
+    exit-tui|exit-flush|exit-busy)
+        # 0.2.x idle TUI as an APP: raw mode, no tty echo, and the input box is
+        # DRAWN by this script — so typed text is visible on the screen only once
+        # the app renders it, exactly like the real CLI. This is the mode that
+        # exercises bufflink's type-and-confirm discipline at shutdown (a blind
+        # `/exit` + Enter leaves the freebuff session held server-side).
+        #
+        #   FAKE_FREEBUFF_FLUSH_BYTES  how many TYPED bytes are silently DROPPED,
+        #     never rendered, before the TUI starts rendering them — freebuff
+        #     flushes its input queue (the same flush that loses a first
+        #     `/model`). Default: 5 in `exit-flush`, i.e. exactly one `/exit`
+        #     burst, so a caller that types once and then presses Enter blind
+        #     exits nothing; 0 in `exit-tui`/`exit-busy`. `all` drops every
+        #     typed byte, i.e. a queue that never drains.
+        #   FAKE_FREEBUFF_BUSY_TRIGGER  a path: once that file exists the TUI
+        #     draws its busy status row, and a bare Esc returns it to the idle
+        #     box — the screen bufflink must Esc first before it can exit.
+        #   FAKE_FREEBUFF_KEYLOG  a path: every key received is appended as
+        #     `esc` | `enter` | `bs` | `char:<c>`, so a test can assert the exact
+        #     key sequence AND that Enter is never sent onto an unconfirmed box.
+        #
+        # POSIX sh only: no arrays, no `[[ ]]`, no `$'\x1b'`.
+        ESC=$(printf '\033')
+        CR=$(printf '\r')
+        BS=$(printf '\177')
+        case "$FAKE_FREEBUFF_MODE" in
+            exit-flush)
+                FLUSH_LEFT="${FAKE_FREEBUFF_FLUSH_BYTES:-5}"
+                ;;
+            *)
+                FLUSH_LEFT="${FAKE_FREEBUFF_FLUSH_BYTES:-0}"
+                ;;
+        esac
+        line=""
+        busy=0
+
+        exit_keylog() {
+            if [ -n "${FAKE_FREEBUFF_KEYLOG:-}" ]; then
+                printf '%s\n' "$1" >> "$FAKE_FREEBUFF_KEYLOG"
+            fi
+        }
+
+        # The idle frame the 0.2.29 probe captured: session status row plus the
+        # rounded input box. `busy` replaces it with the busy status row, which
+        # `classify` matches BEFORE Idle.
+        draw_exit_tui() {
+            printf '\033[2J\033[H'
+            printf 'Freebuff will run commands on your behalf to help you build.\r\n'
+            printf '\r\n'
+            printf 'Directory %s\r\n' "$CWD"
+            printf '\r\n'
+            printf 'GLM 5.3 Flash · 59m left · 16.4K (2%%)      ✕ End session\r\n'
+            if [ "$busy" -eq 1 ]; then
+                printf 'thinking... 1s  ■ Esc\r\n'
+            fi
+            printf '╭──────────────────────────────────────────────────────╮\r\n'
+            if [ -n "$line" ]; then
+                printf '│  ▍%s  │\r\n' "$line"
+            else
+                printf '│  ▍Enter a coding task or / for commands  │\r\n'
+            fi
+            printf '╰──────────────────────────────────────────────────────╯\r\n'
+        }
+
+        stty raw -echo 2>/dev/null || true
+        # min 0 time 1: a read returns after 0.1 s with no byte, so the busy
+        # trigger is polled without a blocking read (there is no `read -t` in
+        # POSIX sh).
+        stty min 0 time 1 2>/dev/null || true
+        draw_exit_tui
+        while true; do
+            c=$(dd bs=1 count=1 2>/dev/null) || break
+            if [ -z "$c" ]; then
+                if [ "$busy" -eq 0 ] \
+                    && [ -n "${FAKE_FREEBUFF_BUSY_TRIGGER:-}" ] \
+                    && [ -f "$FAKE_FREEBUFF_BUSY_TRIGGER" ]; then
+                    busy=1
+                    draw_exit_tui
+                fi
+                continue
+            fi
+            case "$c" in
+                "$ESC")
+                    exit_keylog esc
+                    if [ "$busy" -eq 1 ]; then
+                        busy=0
+                    fi
+                    draw_exit_tui
+                    ;;
+                "$BS")
+                    exit_keylog bs
+                    line=$(printf '%s' "$line" | sed 's/.$//')
+                    draw_exit_tui
+                    ;;
+                "$CR")
+                    exit_keylog enter
+                    if [ "$line" = "/exit" ]; then
+                        print_exit
+                        exit 0
+                    fi
+                    line=""
+                    draw_exit_tui
+                    ;;
+                *)
+                    exit_keylog "char:$c"
+                    if [ "$FLUSH_LEFT" = "all" ]; then
+                        : # the queue never drains: the byte is lost to the TUI
+                    elif [ "$FLUSH_LEFT" -gt 0 ] 2>/dev/null; then
+                        FLUSH_LEFT=$((FLUSH_LEFT - 1))
+                    else
+                        line="${line}${c}"
+                    fi
+                    draw_exit_tui
+                    ;;
+            esac
+        done
+        ;;
 esac
 
 # Normal mode: print splash and wait for Enter
@@ -709,6 +832,12 @@ idle_prompt() {
         stty sane 2>/dev/null || true
     else
         printf '\033[2A\033[4C'
+        # freebuff REPLACES the placeholder with what you type. Cooked-mode echo
+        # can only OVERWRITE, so the line is cleared first: without it the box
+        # shows the typed text glued to the placeholder, and a caller that
+        # requires the box to hold EXACTLY a command (bufflink's `/exit`
+        # confirmation before Enter) can never see it.
+        printf '\033[K'
         read -r line || return 1
     fi
     printf '\n\n'

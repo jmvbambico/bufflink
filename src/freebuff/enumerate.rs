@@ -665,7 +665,16 @@ async fn ensure_input_box_empty(pty: &Pty, deadline: Instant) -> Result<bool> {
 ///   a box like `foo/model` or `/model/model` would otherwise pass and be
 ///   submitted as a message. A retry clears deterministically again first, so
 ///   leftovers can never accumulate.
-async fn type_and_confirm_command(pty: &Pty, cmd: &str, deadline: Instant) -> Result<()> {
+///
+/// Shared with `FreebuffBackend::shutdown`, which types `/exit` through it for
+/// the same reason `/model` is typed through it: freebuff flushes its input
+/// queue, so a command typed once can vanish, and Enter must never be pressed
+/// onto a box that does not positively hold it.
+pub(crate) async fn type_and_confirm_command(
+    pty: &Pty,
+    cmd: &str,
+    deadline: Instant,
+) -> Result<()> {
     for _ in 0..MAX_TYPE_ATTEMPTS {
         if Instant::now() >= deadline {
             return Err(anyhow!("freebuff enumeration deadline expired"));

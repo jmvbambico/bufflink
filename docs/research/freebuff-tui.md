@@ -95,7 +95,9 @@ entry and fails loudly when it does not match the request.
 - `freebuff-instance-owner.json` (`{instanceId, pid}`) is written when the
   splash is accepted, **never removed**; a stale pid does not block the next
   start. On SIGTERM the bridge should type `/exit` and give it ~3 s before
-  killing the child (omnigent's SIGTERM→SIGKILL budget is 5 s).
+  killing the child (omnigent's SIGTERM→SIGKILL budget is 5 s). The `/exit` must
+  be CONFIRMED in the input box before the Enter — a blind `/exit` can be
+  flushed away and strand the session (see the bridge-runs note below).
 
 ## Approvals — there are none in this build
 
@@ -177,10 +179,25 @@ never choose `Take over`.
 - The chat directory is created at **launch** (splash accept), before the
   first prompt; `chat-messages.json` appears only after the first turn.
 - Typing `/exit` + Enter from the bridge did **not** exit freebuff within 3 s
-  in any of the three runs (it did in the manual tmux probe). The Enter was
-  written in the SAME burst as the text, which freebuff does not submit (see the
-  v0.2.29 note below: the first Enter is NOT swallowed when it is its own
-  write). The bridge falls back to SIGTERM/SIGKILL on the child's **process
+  in any of the three runs (it did in the manual tmux probe). The popup was
+  blamed then, and the Enter written in the SAME burst as the text after that —
+  the popup does **not** swallow Enter (v0.2.29 note below). The likelier cause
+  is freebuff's **input-queue flush**: it paints the idle screen a beat before it
+  starts reading input and flushes whatever arrived in between, the same flush
+  that loses a first `/model` (measured live 2026-10-17). A flushed `/exit`
+  vanishes, the Enter then submits nothing, `wait_exit` times out and the pty is
+  killed — with the session still held server-side. Nothing verified the command
+  had landed, because shutdown typed and Entered blind.
+  **Consequence — a STRANDED session.** freebuff's free plan allows ONE session
+  slot shared across CLI and Desktop, so a session the backend still holds locks
+  the user out of their own account until it expires, and it shows up only as the
+  `Take over` modal on their next launch (observed 2026-10-17: exactly that,
+  after a bridge run). Fixed by typing `/exit` through the same type-and-confirm
+  discipline `/model` uses — the box must hold EXACTLY `/exit`
+  (`input_box_is_exactly`) before ONE Enter, bounded by `exit_timeout` — and by
+  warning LOUDLY, naming the single shared slot and `freebuff` → `Take over`, on
+  every path that cannot confirm it or that kills the child.
+  The bridge falls back to SIGTERM/SIGKILL on the child's **process
   group**: the npm launcher forwards no signals, and the real Bun binary
   survives SIGHUP from the closing PTY.
 - Splash → Idle takes ~2.3 s; a trivial turn 3–7 s; Esc cancel is honoured
@@ -205,8 +222,10 @@ opens the picker by COMMAND.
   ONE Enter, the picker opens. The earlier "first Enter is swallowed" note was a
   misdiagnosis of the same-burst quirk — a trailing Enter written in the SAME
   burst as the text does not submit, and blink sends the Enter as its own write
-  after the box is confirmed. That quirk is why `/exit` + Enter in one burst
-  never left freebuff. Popup frame kept as
+  after the box is confirmed. A blind `/exit` + Enter in one burst never left
+  freebuff — and the likelier reason is the input-queue flush, not the popup or
+  the burst (see the 2026-09-20 note above), which is why shutdown now verifies
+  the box holds exactly `/exit` before Enter. Popup frame kept as
   `tests/fixtures/screens/0229-real-slash-popup-120x40.txt`. The popup is
   detected by a `/command` followed by 2+ spaces and a description; the typed
   line itself has no description, so a CLOSED popup is never mistaken for one.
