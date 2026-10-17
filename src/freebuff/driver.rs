@@ -2956,17 +2956,57 @@ mod tests {
         }
     }
 
+    // The capture subscriber writes into whichever buffer the EMITTING thread
+    // has installed, and drops the event when that thread has none.
+    thread_local! {
+        static INSTALLED_SINK: std::cell::RefCell<Option<Arc<std::sync::Mutex<Vec<u8>>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     /// A `tracing` writer that keeps every event in a buffer, so a test can
-    /// assert on the logs a path actually emitted. `set_default` installs a
-    /// THREAD-LOCAL dispatcher, and `#[tokio::test]` runs the current-thread
-    /// runtime, so everything the backend emits while the guard is alive lands
-    /// here.
+    /// assert on the logs a path actually emitted.
+    ///
+    /// The subscriber that writes here is installed ONCE for the whole test
+    /// binary, not per test through a thread-local `set_default`: `tracing`
+    /// caches whether a callsite is enabled in a PROCESS-WIDE interest cache,
+    /// and that cache can disable a callsite for the very thread that installed
+    /// the capture. The first `warn!` on a callsite registers it, and if that
+    /// registration happens on a thread with no subscriber while this process
+    /// has a single live dispatcher, tracing resolves the interest against THAT
+    /// thread's default — the no-op `NoSubscriber` — and caches
+    /// `Interest::never()` for the callsite process-wide. Every later `warn!` on
+    /// it then short-circuits before consulting any dispatcher, so a
+    /// thread-local capture silently reads an EMPTY buffer. With one
+    /// process-wide subscriber and no scoped dispatcher anywhere, interest
+    /// resolves against it on every thread, so the capture cannot be disabled
+    /// behind a test's back.
+    ///
+    /// The sink stays PER-THREAD rather than one shared buffer, so a test
+    /// asserting on logs cannot pick up a concurrent test's warnings. The trade
+    /// is that only the emitting thread's events are captured — which is the
+    /// thread `shutdown` emits them on.
     #[derive(Clone, Default)]
     struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
 
-    impl std::io::Write for LogBuf {
+    impl LogBuf {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    /// `MakeWriter` for the process-wide capture subscriber.
+    struct SinkWriter;
+
+    impl std::io::Write for SinkWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            // `try_with`: tracing can run during thread teardown, and a sink
+            // write must never be the thing that panics.
+            let _ = INSTALLED_SINK.try_with(|sink| {
+                let sink = sink.borrow();
+                if let Some(inner) = sink.as_ref() {
+                    inner.lock().unwrap().extend_from_slice(buf);
+                }
+            });
             Ok(buf.len())
         }
 
@@ -2975,28 +3015,84 @@ mod tests {
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
-        type Writer = LogBuf;
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SinkWriter {
+        type Writer = SinkWriter;
 
         fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
+            SinkWriter
         }
     }
 
-    impl LogBuf {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+    /// Installs the warnings-only capture subscriber, once per test binary.
+    fn install_capture_subscriber() {
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(SinkWriter)
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            // The error can only mean another global subscriber is already
+            // installed: then nothing is captured, and the tests that assert on
+            // logs fail loudly instead of silently passing on an empty buffer.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            // `set_global_default` does NOT re-evaluate callsites, so one
+            // registered before this point is still cached as
+            // `Interest::never()` and would skip every event for the rest of the
+            // process. Rebuild the cache now that the subscriber is in place.
+            tracing::callsite::rebuild_interest_cache();
+        });
+    }
+
+    /// Captures, into `buf`, every warning the CURRENT THREAD emits until the
+    /// returned guard is dropped.
+    fn capture_warnings(buf: &LogBuf) -> CaptureGuard {
+        install_capture_subscriber();
+        let previous = INSTALLED_SINK.with(|sink| sink.borrow_mut().replace(buf.0.clone()));
+        CaptureGuard(previous)
+    }
+
+    /// Puts the thread's previous sink back when the test is done with the
+    /// buffer, so a later test on the same thread starts clean.
+    struct CaptureGuard(Option<Arc<std::sync::Mutex<Vec<u8>>>>);
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            // `try_with`: a guard can be dropped during thread teardown.
+            let _ = INSTALLED_SINK.try_with(|sink| *sink.borrow_mut() = self.0.take());
         }
     }
 
-    /// Warnings-only subscriber writing into `buf`.
-    fn capture_warnings(buf: &LogBuf) -> tracing::subscriber::DefaultGuard {
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::set_default(subscriber)
+    /// One callsite, for the capture regression test below.
+    fn probe_warning() {
+        tracing::warn!("PROBE-CALLSITE");
+    }
+
+    /// The capture must survive the interleaving that reddened CI: a callsite
+    /// whose FIRST hit is on another thread — one that installed no sink — must
+    /// still reach the buffer of the test that installed the capture.
+    ///
+    /// A thread-local `set_default` fails this: the foreign registration caches
+    /// `Interest::never()` process-wide and the test's own `warn!` is then
+    /// skipped, which reads as an empty buffer.
+    #[test]
+    fn capture_survives_a_callsite_first_hit_on_another_thread() {
+        let logs = LogBuf::default();
+        let _guard = capture_warnings(&logs);
+
+        std::thread::spawn(probe_warning).join().unwrap();
+        assert!(
+            logs.text().is_empty(),
+            "another thread's event must not land in this thread's buffer: {}",
+            logs.text()
+        );
+
+        probe_warning();
+        assert!(
+            logs.text().contains("PROBE-CALLSITE"),
+            "the capture must not be defeated by another thread's first hit: {}",
+            logs.text()
+        );
     }
 
     /// The fake's key log, one key per line (`exit-tui` modes only).
