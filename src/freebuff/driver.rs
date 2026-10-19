@@ -64,15 +64,15 @@ pub struct DriverConfig {
     pub settle_timeout: Duration,
     /// Time to wait after Enter for freebuff to go busy or consume the paste (default: 30s, env: BLINK_SUBMIT_TIMEOUT_S).
     pub submit_timeout: Duration,
-    /// Idle-exit window after a completed turn (default: None = disabled, env:
+    /// Idle-exit window after a completed turn (default: 60s, env:
     /// BLINK_IDLE_EXIT_S).
     ///
-    /// Unset, `0` or an unparseable value all mean DISABLED, leaving behaviour
-    /// byte-for-byte unchanged. When set to a positive number of seconds,
-    /// `blink` starts a timer each time a turn COMPLETES; if no ACP request
-    /// arrives before it expires it shuts the backend down cleanly and exits,
-    /// releasing freebuff's single free-plan session slot. The timer only runs
-    /// between turns and is never armed while one is in flight.
+    /// Unset defaults to 60s. `0` or an unparseable value disable it, leaving
+    /// behaviour byte-for-byte unchanged. When set to a positive number of
+    /// seconds, `blink` starts a timer each time a turn COMPLETES; if no ACP
+    /// request arrives before it expires it shuts the backend down cleanly and
+    /// exits, releasing freebuff's single free-plan session slot. The timer only
+    /// runs between turns and is never armed while one is in flight.
     pub idle_exit: Option<Duration>,
     /// Model to use (default: None -> freebuff's default, env: BLINK_MODEL).
     /// freebuff 0.2.x has no boot picker; bufflink pins this value into
@@ -266,12 +266,15 @@ fn parse_startup_timeout(raw: Option<&str>) -> Duration {
     }
 }
 
-/// Parse `BLINK_IDLE_EXIT_S`. `None` (unset), `0` and any unparseable value all
-/// mean DISABLED, which is the default: a client that never opts in must see no
-/// behaviour change. A malformed value warns and disables — it never panics and
-/// never silently enables a timeout the operator did not ask for.
+/// Parse `BLINK_IDLE_EXIT_S`. Unset defaults to 60s (self-reap enabled by
+/// default). `0` disables. Any unparseable value (non-integer, negative, float)
+/// warns and disables — it never panics and never silently enables a timeout the
+/// operator did not ask for.
 fn parse_idle_exit(raw: Option<&str>) -> Option<Duration> {
-    let raw = raw?;
+    let raw = match raw {
+        None => return Some(Duration::from_secs(60)),
+        Some(r) => r,
+    };
     match raw.parse::<u64>() {
         Ok(0) => None,
         Ok(secs) => Some(Duration::from_secs(secs)),
@@ -1527,8 +1530,8 @@ impl Backend for FreebuffBackend {
         }
     }
 
-    /// The opt-in idle window from `BLINK_IDLE_EXIT_S`; `None` (the default)
-    /// means the ACP server never arms the idle timer.
+    /// The idle window from `BLINK_IDLE_EXIT_S`; `None` disables the idle
+    /// timer (default is 60s).
     fn idle_exit(&self) -> Option<Duration> {
         self.cfg.idle_exit
     }
@@ -3624,9 +3627,9 @@ mod tests {
 
     #[test]
     fn idle_exit_env_parsing_table() {
-        // Unset and 0 both disable the feature: the only two ways a client
-        // that does not want an idle exit can express it.
-        assert_eq!(parse_idle_exit(None), None);
+        // Unset defaults to 60s (self-reap on by default).
+        assert_eq!(parse_idle_exit(None), Some(Duration::from_secs(60)));
+        // Explicit 0 disables.
         assert_eq!(parse_idle_exit(Some("0")), None);
         // A valid value is parsed into a window.
         assert_eq!(parse_idle_exit(Some("1")), Some(Duration::from_secs(1)));
@@ -3684,6 +3687,19 @@ mod tests {
 
         let cfg = DriverConfig::from_env();
         assert_eq!(cfg.idle_exit, Some(Duration::from_secs(9999)));
+    }
+
+    #[test]
+    fn unset_idle_exit_defaults_to_60s() {
+        // Guard hermeticity: remove the var if present.
+        let previous = std::env::var_os("BLINK_IDLE_EXIT_S");
+        std::env::remove_var("BLINK_IDLE_EXIT_S");
+        let _restore = EnvRestore {
+            key: "BLINK_IDLE_EXIT_S",
+            previous,
+        };
+        let cfg = DriverConfig::from_env();
+        assert_eq!(cfg.idle_exit, Some(Duration::from_secs(60)));
     }
 
     #[test]
