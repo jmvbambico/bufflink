@@ -106,7 +106,8 @@ a freebuff UI change is a one-module fix.
 
 Environment: `BLINK_FREEBUFF_BIN` (default `freebuff`),
 `BLINK_STARTUP_TIMEOUT_S` (25), `BLINK_TURN_TIMEOUT_S` (900),
-`BLINK_SETTLE_TIMEOUT_S` (5), `BLINK_MANICODE_DIR` (`~/.config/manicode`),
+`BLINK_SETTLE_TIMEOUT_S` (5), `BLINK_IDLE_EXIT_S` (unset = disabled),
+`BLINK_MANICODE_DIR` (`~/.config/manicode`),
 `BLINK_DUMP_SCREEN` (unset), `RUST_LOG` (logs go to stderr; stdout is JSON-RPC
 only). `BLINK_DUMP_SCREEN` is a file path; when set, a startup timeout writes
 the raw screen there — every physical row with its exact length and trailing
@@ -118,6 +119,16 @@ synchronous write on the timeout path, which can delay the error past the nomina
 budget if the destination is slow. The startup budget defaults to 25 s so it expires inside the client's
 hard-coded 30 s `session/new` deadline, with room to report why a slow splash
 never settled.
+
+`BLINK_IDLE_EXIT_S` is an opt-in idle exit. **Unset (the default), `0`, or an
+unparseable value disables it**, so existing sessions behave exactly as before.
+When set to a positive number of seconds, `blink` starts a timer each time a
+turn completes; if no ACP request arrives before it expires, it shuts the
+backend down through the same clean path SIGTERM uses and exits — releasing the
+single freebuff session slot instead of holding it until the client reaps the
+process. The timer never runs while a turn is in flight: it is armed only
+between turns, and any incoming request resets it. A malformed value logs a
+warning naming the variable and stays disabled.
 
 `BLINK_MODEL` pins the model picked on freebuff's splash: a name or id
 fragment (`deepseek/deepseek-v4.1-flash`, `glm-5.3-flash`, `mimo-2.5`),

@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use bufflink::acp::{serve, Backend};
+use bufflink::acp::{serve, Backend, ServeExit};
 use bufflink::freebuff::enumerate::{
     enumerate_catalog, plain_model_ids, unmapped_warning, CatalogEntry,
 };
@@ -129,8 +129,20 @@ async fn run_serve() -> Result<()> {
 
     tokio::select! {
         result = serve_fut => {
-            // serve() already calls backend.shutdown() on EOF
-            result
+            match result {
+                // The idle loop already ran `backend.shutdown()`, exactly as
+                // the EOF and signal paths do. Exit explicitly because the
+                // blocking stdin reader thread would otherwise keep the runtime
+                // alive — the same reason the signal arms below exit instead of
+                // returning.
+                Ok(ServeExit::IdleExit) => {
+                    tracing::info!("shutdown complete; exiting");
+                    std::process::exit(0);
+                }
+                // serve() already calls backend.shutdown() on EOF.
+                Ok(ServeExit::Eof) => Ok(()),
+                Err(e) => Err(e),
+            }
         }
         _ = sigterm.recv() => {
             tracing::info!("received SIGTERM, shutting down");
