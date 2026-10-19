@@ -9,5 +9,5 @@ mod server;
 mod types;
 
 pub use backend::{Backend, UpdateSink};
-pub use server::serve;
+pub use server::{serve, ServeExit};
 pub use types::*;

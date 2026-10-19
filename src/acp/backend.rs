@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -51,4 +52,15 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Tear down the backend. Must return within ~3 s (stdin EOF / SIGTERM).
     fn shutdown(&self) -> impl Future<Output = ()> + Send;
+
+    /// Idle-exit window after a completed turn, or `None` (the default) to
+    /// disable it.
+    ///
+    /// Read once when the ACP server starts. `Some(d)` means: after a prompt
+    /// turn completes, with no turn in flight, the server shuts down if no ACP
+    /// request arrives within `d`. The default keeps every backend that does not
+    /// opt in byte-for-byte unchanged.
+    fn idle_exit(&self) -> Option<Duration> {
+        None
+    }
 }

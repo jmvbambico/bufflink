@@ -19,6 +19,18 @@ use crate::acp::types::{
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
+/// Why the ACP serve loop stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeExit {
+    /// stdin reached EOF: the client closed the connection. The backend has
+    /// already been shut down.
+    Eof,
+    /// The opt-in idle-exit window expired between turns. The backend has
+    /// already been shut down; the caller should terminate the process through
+    /// its normal exit path.
+    IdleExit,
+}
+
 /// The prompt turn currently in flight: its cancel sender and task, tagged
 /// with a monotonically increasing generation.
 ///
@@ -51,7 +63,7 @@ pub async fn serve<B: Backend>(
     backend: Arc<B>,
     reader: impl AsyncBufRead + Unpin + Send,
     writer: impl AsyncWrite + Unpin + Send + 'static,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ServeExit> {
     let (out_tx, mut out_rx) = mpsc::channel::<Outgoing>(64);
 
     let mut writer = writer;
@@ -80,13 +92,24 @@ async fn run_loop<B: Backend>(
     backend: Arc<B>,
     reader: impl AsyncBufRead + Unpin + Send,
     out_tx: mpsc::Sender<Outgoing>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ServeExit> {
     let mut lines = reader.lines();
     let mut session_id: Option<String> = None;
     let mut in_flight: Option<InFlight> = None;
     let mut next_generation: u64 = 0;
 
+    // Opt-in idle exit. `None` (the default) leaves the loop exactly as it was.
+    let idle_exit = backend.idle_exit();
+    // Armed only once a turn has COMPLETED: a client that opens a session and
+    // pauses before its first prompt is not surprised by an exit.
+    let mut idle_armed = false;
+
     loop {
+        // A turn is in flight from the moment `session/prompt` is dispatched
+        // until its spawned task is reaped, so gating the timer on
+        // `in_flight.is_none()` makes a mid-turn fire impossible.
+        let idle_enabled = idle_armed && in_flight.is_none();
+
         tokio::select! {
             biased;
 
@@ -110,7 +133,7 @@ async fn run_loop<B: Backend>(
                         info!("ACP stdin EOF");
                         finish_in_flight(&mut in_flight).await;
                         backend.shutdown().await;
-                        return Ok(());
+                        return Ok(ServeExit::Eof);
                     }
                     Err(e) => {
                         warn!(error = %e, "ACP read error");
@@ -140,6 +163,28 @@ async fn run_loop<B: Backend>(
                         "completed prompt was superseded by a newer turn; keeping its cancel sender"
                     );
                 }
+                // A turn completed, so the idle window may now run.
+                idle_armed = true;
+            }
+
+            // The idle timer. A fresh sleep is created on every loop iteration,
+            // so any incoming line (whose arm runs, then loops) resets the
+            // countdown. When disabled it awaits a future that never completes.
+            _ = async {
+                match idle_exit {
+                    Some(window) if idle_enabled => tokio::time::sleep(window).await,
+                    _ => std::future::pending::<()>().await,
+                }
+            } => {
+                let window = idle_exit.expect("idle arm completes only when a window is set");
+                info!(
+                    idle_secs = window.as_secs(),
+                    "BLINK_IDLE_EXIT_S fired: no ACP request within {:?} of the last completed \
+                     turn; shutting down to release the freebuff session slot",
+                    window
+                );
+                backend.shutdown().await;
+                return Ok(ServeExit::IdleExit);
             }
         }
     }
@@ -497,6 +542,8 @@ mod tests {
         prompt_error: Option<String>,
         /// Extra delay before completing a normal prompt.
         prompt_delay: Option<Duration>,
+        /// Opt-in idle-exit window.
+        idle_exit: Option<Duration>,
         last_cancel_seen: bool,
     }
 
@@ -604,6 +651,10 @@ mod tests {
                 self.state.lock().unwrap().shutdowns += 1;
             }
         }
+
+        fn idle_exit(&self) -> Option<Duration> {
+            self.state.lock().unwrap().idle_exit
+        }
     }
 
     async fn collect_lines(mut reader: impl AsyncBufRead + Unpin, n: usize) -> Vec<Value> {
@@ -678,7 +729,7 @@ mod tests {
     async fn shutdown_serve(
         client_w: DuplexWrite,
         client_r: DuplexRead,
-        serve: tokio::task::JoinHandle<anyhow::Result<()>>,
+        serve: tokio::task::JoinHandle<anyhow::Result<ServeExit>>,
     ) {
         drop(client_w);
         drop(client_r);
@@ -989,5 +1040,143 @@ mod tests {
             .expect("serve join")
             .expect("serve error");
         assert_eq!(backend.state().shutdowns, 1);
+    }
+
+    /// Unset (the default) must be behaviour-for-behaviour the old loop: no
+    /// window, no exit, however long the client waits after a turn.
+    #[tokio::test]
+    async fn idle_exit_is_disabled_when_the_window_is_none() {
+        let backend = FakeBackend::new("s1");
+        let (mut client_w, mut client_r, server_r, server_w) = open_pipe();
+        let serve = tokio::spawn(serve(backend, server_r, server_w));
+
+        write_line(&mut client_w, init_req(1)).await;
+        write_line(&mut client_w, session_new(2, "/tmp")).await;
+        write_line(&mut client_w, prompt_req(3, "s1", "hi")).await;
+        let _ = collect_lines(&mut client_r, 3).await;
+
+        sleep(Duration::from_millis(200)).await;
+        assert!(!serve.is_finished(), "idle exit must be off when unset");
+
+        shutdown_serve(client_w, client_r, serve).await;
+    }
+
+    /// A set window starts after a turn COMPLETES and shuts the backend down
+    /// through the same path EOF uses.
+    #[tokio::test]
+    async fn idle_exit_fires_after_a_completed_turn() {
+        let backend = FakeBackend::new("s1").with(|st| {
+            st.idle_exit = Some(Duration::from_millis(100));
+        });
+        let (mut client_w, mut client_r, server_r, server_w) = open_pipe();
+        let serve = tokio::spawn(serve(Arc::clone(&backend), server_r, server_w));
+
+        write_line(&mut client_w, init_req(1)).await;
+        write_line(&mut client_w, session_new(2, "/tmp")).await;
+        write_line(&mut client_w, prompt_req(3, "s1", "hi")).await;
+        let _ = collect_lines(&mut client_r, 3).await;
+
+        let ended = timeout(Duration::from_secs(2), serve)
+            .await
+            .expect("idle exit did not fire")
+            .expect("serve join")
+            .expect("serve error");
+        assert_eq!(ended, ServeExit::IdleExit);
+        assert_eq!(backend.state().shutdowns, 1);
+    }
+
+    /// The window does not begin at session creation: only a COMPLETED turn
+    /// arms it.
+    #[tokio::test]
+    async fn idle_exit_is_not_armed_before_the_first_completed_turn() {
+        let backend = FakeBackend::new("s1").with(|st| {
+            st.idle_exit = Some(Duration::from_millis(100));
+        });
+        let (mut client_w, mut client_r, server_r, server_w) = open_pipe();
+        let serve = tokio::spawn(serve(Arc::clone(&backend), server_r, server_w));
+
+        write_line(&mut client_w, init_req(1)).await;
+        write_line(&mut client_w, session_new(2, "/tmp")).await;
+        let _ = collect_lines(&mut client_r, 2).await;
+
+        sleep(Duration::from_millis(250)).await;
+        assert!(
+            !serve.is_finished(),
+            "the idle timer must not run before any turn completes"
+        );
+
+        write_line(&mut client_w, prompt_req(3, "s1", "hi")).await;
+        let _ = collect_lines(&mut client_r, 1).await;
+        let ended = timeout(Duration::from_secs(2), serve)
+            .await
+            .expect("idle exit did not fire after the first turn")
+            .expect("serve join")
+            .expect("serve error");
+        assert_eq!(ended, ServeExit::IdleExit);
+    }
+
+    /// The safety property: a turn that outlasts the window many times over
+    /// must NOT be killed by it. The timer is armed only once the turn's task
+    /// has completed, so this cannot fire mid-turn.
+    #[tokio::test]
+    async fn idle_exit_never_fires_while_a_turn_is_in_flight() {
+        let backend = FakeBackend::new("s1").with(|st| {
+            st.idle_exit = Some(Duration::from_millis(100));
+            st.prompt_delay = Some(Duration::from_millis(500));
+        });
+        let (mut client_w, mut client_r, server_r, server_w) = open_pipe();
+        let serve = tokio::spawn(serve(Arc::clone(&backend), server_r, server_w));
+
+        write_line(&mut client_w, init_req(1)).await;
+        write_line(&mut client_w, session_new(2, "/tmp")).await;
+        write_line(&mut client_w, prompt_req(3, "s1", "long")).await;
+        let _ = collect_lines(&mut client_r, 2).await;
+
+        // Four windows into a 500 ms turn: a mid-turn timer would have fired.
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            !serve.is_finished(),
+            "the idle timer fired while a turn was in flight"
+        );
+
+        let ended = timeout(Duration::from_secs(3), serve)
+            .await
+            .expect("idle exit did not fire after the turn completed")
+            .expect("serve join")
+            .expect("serve error");
+        assert_eq!(ended, ServeExit::IdleExit);
+    }
+
+    /// An incoming request resets the countdown: a client that keeps talking is
+    /// never reaped.
+    #[tokio::test]
+    async fn an_incoming_request_resets_the_idle_timer() {
+        let backend = FakeBackend::new("s1").with(|st| {
+            st.idle_exit = Some(Duration::from_millis(500));
+        });
+        let (mut client_w, mut client_r, server_r, server_w) = open_pipe();
+        let serve = tokio::spawn(serve(Arc::clone(&backend), server_r, server_w));
+
+        write_line(&mut client_w, init_req(1)).await;
+        write_line(&mut client_w, session_new(2, "/tmp")).await;
+        write_line(&mut client_w, prompt_req(3, "s1", "hi")).await;
+        let _ = collect_lines(&mut client_r, 3).await;
+
+        // Each request lands well inside the window; without a reset the timer
+        // would have fired after the first 500 ms.
+        for id in 10..13 {
+            sleep(Duration::from_millis(100)).await;
+            write_line(&mut client_w, init_req(id)).await;
+            let lines = collect_lines(&mut client_r, 1).await;
+            assert_eq!(lines[0]["id"], id);
+        }
+        assert!(!serve.is_finished(), "requests must keep the session alive");
+
+        let ended = timeout(Duration::from_secs(3), serve)
+            .await
+            .expect("idle exit did not fire once the client went quiet")
+            .expect("serve join")
+            .expect("serve error");
+        assert_eq!(ended, ServeExit::IdleExit);
     }
 }

@@ -64,6 +64,16 @@ pub struct DriverConfig {
     pub settle_timeout: Duration,
     /// Time to wait after Enter for freebuff to go busy or consume the paste (default: 30s, env: BLINK_SUBMIT_TIMEOUT_S).
     pub submit_timeout: Duration,
+    /// Idle-exit window after a completed turn (default: None = disabled, env:
+    /// BLINK_IDLE_EXIT_S).
+    ///
+    /// Unset, `0` or an unparseable value all mean DISABLED, leaving behaviour
+    /// byte-for-byte unchanged. When set to a positive number of seconds,
+    /// `blink` starts a timer each time a turn COMPLETES; if no ACP request
+    /// arrives before it expires it shuts the backend down cleanly and exits,
+    /// releasing freebuff's single free-plan session slot. The timer only runs
+    /// between turns and is never armed while one is in flight.
+    pub idle_exit: Option<Duration>,
     /// Model to use (default: None -> freebuff's default, env: BLINK_MODEL).
     /// freebuff 0.2.x has no boot picker; bufflink pins this value into
     /// `freebuffModel` in the manicode `settings.json` before launch and
@@ -96,6 +106,7 @@ impl DriverConfig {
             parse_submit_timeout(std::env::var("BLINK_SUBMIT_TIMEOUT_S").ok().as_deref());
         let startup_timeout =
             parse_startup_timeout(std::env::var("BLINK_STARTUP_TIMEOUT_S").ok().as_deref());
+        let idle_exit = parse_idle_exit(std::env::var("BLINK_IDLE_EXIT_S").ok().as_deref());
         let model = std::env::var("BLINK_MODEL")
             .ok()
             .map(|s| s.trim().to_string())
@@ -117,6 +128,7 @@ impl DriverConfig {
             exit_timeout: Duration::from_secs(3),
             settle_timeout: Duration::from_secs(settle_timeout_secs),
             submit_timeout,
+            idle_exit,
             model,
             dump_screen,
         }
@@ -251,6 +263,25 @@ fn parse_startup_timeout(raw: Option<&str>) -> Duration {
         Duration::from_secs(2)
     } else {
         Duration::from_secs(secs)
+    }
+}
+
+/// Parse `BLINK_IDLE_EXIT_S`. `None` (unset), `0` and any unparseable value all
+/// mean DISABLED, which is the default: a client that never opts in must see no
+/// behaviour change. A malformed value warns and disables — it never panics and
+/// never silently enables a timeout the operator did not ask for.
+fn parse_idle_exit(raw: Option<&str>) -> Option<Duration> {
+    let raw = raw?;
+    match raw.parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(_) => {
+            warn!(
+                value = %raw,
+                "BLINK_IDLE_EXIT_S is not a whole number of seconds; idle exit disabled"
+            );
+            None
+        }
     }
 }
 
@@ -1496,6 +1527,12 @@ impl Backend for FreebuffBackend {
         }
     }
 
+    /// The opt-in idle window from `BLINK_IDLE_EXIT_S`; `None` (the default)
+    /// means the ACP server never arms the idle timer.
+    fn idle_exit(&self) -> Option<Duration> {
+        self.cfg.idle_exit
+    }
+
     /// End the session: Esc a busy screen, type `/exit` and CONFIRM it reached
     /// the input box before Enter, wait for the child, then kill its whole
     /// process group, then restore the settings pin.
@@ -1759,6 +1796,9 @@ mod tests {
         cfg.poll_interval = Duration::from_millis(100);
         cfg.exit_timeout = Duration::from_secs(2);
         cfg.submit_timeout = Duration::from_secs(10);
+        // Keep tests hermetic: a developer's BLINK_IDLE_EXIT_S must not shorten
+        // a test's own session.
+        cfg.idle_exit = None;
         cfg
     }
 
@@ -3580,6 +3620,70 @@ mod tests {
         assert_eq!(parse_startup_timeout(Some("0")), Duration::from_secs(2));
         assert_eq!(parse_startup_timeout(Some("1")), Duration::from_secs(2));
         assert_eq!(parse_startup_timeout(Some("2")), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn idle_exit_env_parsing_table() {
+        // Unset and 0 both disable the feature: the only two ways a client
+        // that does not want an idle exit can express it.
+        assert_eq!(parse_idle_exit(None), None);
+        assert_eq!(parse_idle_exit(Some("0")), None);
+        // A valid value is parsed into a window.
+        assert_eq!(parse_idle_exit(Some("1")), Some(Duration::from_secs(1)));
+        assert_eq!(
+            parse_idle_exit(Some("3600")),
+            Some(Duration::from_secs(3600))
+        );
+    }
+
+    #[test]
+    fn malformed_idle_exit_is_disabled_and_warns() {
+        let logs = LogBuf::default();
+        let guard = capture_warnings(&logs);
+
+        assert_eq!(parse_idle_exit(Some("nope")), None);
+        assert_eq!(parse_idle_exit(Some("-5")), None);
+        assert_eq!(parse_idle_exit(Some("1.5")), None);
+
+        drop(guard);
+        let text = logs.text();
+        assert!(
+            text.contains("BLINK_IDLE_EXIT_S"),
+            "the warning must name the variable: {text}"
+        );
+        assert!(
+            text.contains("idle exit disabled"),
+            "the warning must say the feature stayed off: {text}"
+        );
+    }
+
+    /// Restores an environment variable on drop, so a failed assertion cannot
+    /// leak it into another test in the same process.
+    struct EnvRestore {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn from_env_reads_blink_idle_exit_s_into_the_config_field() {
+        let previous = std::env::var_os("BLINK_IDLE_EXIT_S");
+        std::env::set_var("BLINK_IDLE_EXIT_S", "9999");
+        let _restore = EnvRestore {
+            key: "BLINK_IDLE_EXIT_S",
+            previous,
+        };
+
+        let cfg = DriverConfig::from_env();
+        assert_eq!(cfg.idle_exit, Some(Duration::from_secs(9999)));
     }
 
     #[test]
