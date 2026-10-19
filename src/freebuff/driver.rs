@@ -1740,7 +1740,12 @@ mod tests {
     use super::*;
     use crate::freebuff::settings::backup_path;
     use std::env;
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    // Serialises tests that mutate the process-wide environment, because the
+    // test harness runs them in parallel threads and env vars are global.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
     use tokio::sync::mpsc;
     use tokio::time::timeout;
 
@@ -3678,6 +3683,7 @@ mod tests {
 
     #[test]
     fn from_env_reads_blink_idle_exit_s_into_the_config_field() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var_os("BLINK_IDLE_EXIT_S");
         std::env::set_var("BLINK_IDLE_EXIT_S", "9999");
         let _restore = EnvRestore {
@@ -3691,6 +3697,7 @@ mod tests {
 
     #[test]
     fn unset_idle_exit_defaults_to_60s() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Guard hermeticity: remove the var if present.
         let previous = std::env::var_os("BLINK_IDLE_EXIT_S");
         std::env::remove_var("BLINK_IDLE_EXIT_S");
